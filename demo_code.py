@@ -12,6 +12,7 @@ import numpy as np
 import torch.nn.functional as F
 import copy
 from collections import OrderedDict
+import os
 
 # import os
 # os.environ['TORCH_HOME'] = '/root/models'
@@ -123,6 +124,7 @@ class DecoupledGatedSVDConv2d(nn.Module):
         self.head_num = head_num
         self.use_uncompressed_gate = use_uncompressed_gate
         self.gate = nn.Linear(gate_input_dim, head_num)
+        self._last_gating_probs = None
 
     def forward(self, x):
         batch_size = x.shape[0]
@@ -135,9 +137,17 @@ class DecoupledGatedSVDConv2d(nn.Module):
             gate_feat = torch.mean(compressed, dim=(2, 3))
 
         gating_scores = self.gate(gate_feat)
-        gating_weights = F.softmax(gating_scores, dim=-1).view(batch_size, 1, 1, 1, self.head_num)
+        gating_probs = F.softmax(gating_scores, dim=-1)
+        self._last_gating_probs = gating_probs
+        gating_weights = gating_probs.view(batch_size, 1, 1, 1, self.head_num)
         out = torch.sum(gating_weights * expert_outputs, dim=-1)
         return out
+
+    def load_balance_loss(self):
+        if self._last_gating_probs is None:
+            return None
+        mean_probs = self._last_gating_probs.mean(dim=0)
+        return (mean_probs * mean_probs).sum() * self.head_num
 
 class ResNet18SVD(nn.Module):
     def __init__(self, num_classes=10):
@@ -334,34 +344,41 @@ class ResNet18HeteroSVD(nn.Module):
             chol_c = torch.linalg.cholesky(covariances[name])
             whitened_weight = self._whiten_weight_channelwise(weight, chol_c)
             weight_flat = whitened_weight.view(whitened_weight.shape[0], -1)
-            _, s, v_h = torch.linalg.svd(weight_flat, full_matrices=False)
-            sigma_sum = s.sum().clamp_min(1e-12)
-            p = (s / sigma_sum).clamp_min(1e-12)
+            u, s, v_h = torch.linalg.svd(weight_flat, full_matrices=False)
+            s_sq = s ** 2
+            sigma_sum = s_sq.sum().clamp_min(1e-12)
+            p = (s_sq / sigma_sum).clamp_min(1e-12)
             entropy = -(p * torch.log(p)).sum().item()
             entropies[name] = entropy
             max_ranks[name] = s.numel()
             svd_cache[name] = {
+                'u': u,
                 's': s,
                 'v_h': v_h,
+                'chol_c': chol_c,
             }
         return entropies, max_ranks, svd_cache
 
-    def _allocate_ranks_by_entropy(self, entropies, max_ranks, budget_ratio=0.35, min_rank=1):
+    def _allocate_ranks_by_entropy(self, entropies, max_ranks, budget_ratio=0.35, min_rank=8, temperature=1.5):
         layer_names = list(entropies.keys())
         total_max = sum(max_ranks[name] for name in layer_names)
         budget = int(max(len(layer_names) * min_rank, round(total_max * budget_ratio)))
         budget = min(budget, total_max)
 
-        entropy_sum = sum(entropies[name] for name in layer_names)
-        if entropy_sum <= 0:
-            raw = {name: budget / len(layer_names) for name in layer_names}
+        n_layers = len(layer_names)
+        floor_budget = n_layers * min_rank
+        remaining_budget = max(0, budget - floor_budget)
+
+        smoothed = {name: entropies[name] ** (1.0 / max(temperature, 1e-6)) for name in layer_names}
+        smoothed_sum = sum(smoothed[name] for name in layer_names)
+        if smoothed_sum <= 0:
+            raw = {name: remaining_budget / n_layers for name in layer_names}
         else:
-            raw = {name: (entropies[name] / entropy_sum) * budget for name in layer_names}
+            raw = {name: (smoothed[name] / smoothed_sum) * remaining_budget for name in layer_names}
 
         ranks = {}
         for name in layer_names:
-            ranks[name] = int(round(raw[name]))
-            ranks[name] = max(min_rank, ranks[name])
+            ranks[name] = min_rank + int(round(raw[name]))
             ranks[name] = min(max_ranks[name], ranks[name])
 
         current_total = sum(ranks.values())
@@ -389,25 +406,27 @@ class ResNet18HeteroSVD(nn.Module):
                     break
         return ranks
 
-    def _replace_conv_with_hetero_svd(self, module, rank, head_num, cov, r_min):
+    def _replace_conv_with_hetero_svd(self, module, rank, head_num, r_min, svd_pack):
         if not isinstance(module, nn.Conv2d):
             return module
 
         weight = module.weight.data
         c_out, c_in, k_h, k_w = weight.shape
 
-        chol_c = torch.linalg.cholesky(cov)
-        whitened_weight = self._whiten_weight_channelwise(weight, chol_c)
-        weight_flat = whitened_weight.view(c_out, -1)
-        u, s, v_h = torch.linalg.svd(weight_flat, full_matrices=False)
+        u = svd_pack['u']
+        s = svd_pack['s']
+        v_h = svd_pack['v_h']
+        chol_c = svd_pack['chol_c']
 
         rank = max(1, min(rank, s.numel()))
         u_trunc = u[:, :rank]
         s_trunc = s[:rank]
         v_h_trunc = v_h[:rank, :]
 
+        s_sqrt = torch.sqrt(torch.clamp(s_trunc, min=1e-12))
         whiten_inv = torch.linalg.inv(chol_c)
-        v_4d = v_h_trunc.view(rank, c_in, k_h, k_w)
+        v_scaled = torch.diag(s_sqrt) @ v_h_trunc
+        v_4d = v_scaled.view(rank, c_in, k_h, k_w)
         v_perm = v_4d.permute(0, 2, 3, 1).reshape(-1, c_in)
         v_unwhiten = v_perm.matmul(whiten_inv)
         conv1_weight = v_unwhiten.view(rank, k_h, k_w, c_in).permute(0, 3, 1, 2).contiguous()
@@ -418,7 +437,10 @@ class ResNet18HeteroSVD(nn.Module):
         conv2_list = nn.ModuleList()
         for _ in range(head_num):
             conv2 = nn.Conv2d(rank, c_out, kernel_size=1, stride=1, padding=0, bias=True)
-            conv2.weight.data = (u_trunc @ torch.diag(s_trunc) / head_num).view(c_out, rank, 1, 1)
+            base_weight = (u_trunc @ torch.diag(s_sqrt) / head_num).view(c_out, rank, 1, 1)
+            noise_scale = 0.01 * base_weight.std().clamp_min(1e-12)
+            noise = torch.randn_like(base_weight) * noise_scale
+            conv2.weight.data = base_weight + noise
             if module.bias is not None:
                 conv2.bias.data = module.bias.data.clone() / head_num
             conv2_list.append(conv2)
@@ -427,10 +449,16 @@ class ResNet18HeteroSVD(nn.Module):
         gate_input_dim = c_in if use_uncompressed_gate else rank
         return DecoupledGatedSVDConv2d(conv1, conv2_list, gate_input_dim, head_num, use_uncompressed_gate)
 
-    def apply_hetero_svd(self, calib_loader, head_num=2, budget_ratio=0.35, r_min=4, max_calib_batches=5):
+    def apply_hetero_svd(self, calib_loader, head_num=2, budget_ratio=0.35, r_min=4, min_rank=8, temperature=1.5, max_calib_batches=5):
         covariances = self._estimate_input_covariances(calib_loader, max_batches=max_calib_batches)
-        entropies, max_ranks, _ = self._compute_spectral_entropies(covariances)
-        rank_map = self._allocate_ranks_by_entropy(entropies, max_ranks, budget_ratio=budget_ratio, min_rank=1)
+        entropies, max_ranks, svd_cache = self._compute_spectral_entropies(covariances)
+        rank_map = self._allocate_ranks_by_entropy(
+            entropies,
+            max_ranks,
+            budget_ratio=budget_ratio,
+            min_rank=min_rank,
+            temperature=temperature,
+        )
 
         conv_layers = self._collect_conv_layers()
         for name, module in conv_layers.items():
@@ -439,8 +467,8 @@ class ResNet18HeteroSVD(nn.Module):
                 module,
                 rank=rank_map[name],
                 head_num=head_num,
-                cov=covariances[name],
                 r_min=r_min,
+                svd_pack=svd_cache[name],
             )
             setattr(parent, child_name, replaced)
 
@@ -507,6 +535,18 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, epochs=1
         print(f"Epoch {epoch + 1}, Loss: {total_loss / len(train_loader):.4f}, Test Accuracy: {test_accuracy:.2f}%")
     return train_losses, test_accuracies
 
+
+def compute_gating_load_balance_loss(model):
+    aux_losses = []
+    for module in model.modules():
+        if isinstance(module, DecoupledGatedSVDConv2d):
+            aux = module.load_balance_loss()
+            if aux is not None:
+                aux_losses.append(aux)
+    if len(aux_losses) == 0:
+        return None
+    return torch.stack(aux_losses).mean()
+
 def evaluate_model(model, test_loader, criterion):
     model.eval()
     correct = 0
@@ -523,7 +563,7 @@ def evaluate_model(model, test_loader, criterion):
             correct += (predicted == labels).sum().item()
     return 100 * correct / total
 
-def train_distillation(teacher_model, student_model, train_loader, test_loader, optimizer, temp=7, alpha=0.3, epochs=100):
+def train_distillation(teacher_model, student_model, train_loader, test_loader, optimizer, temp=7, alpha=0.3, epochs=100, aux_loss_weight=0.0):
     student_model.train()
     teacher_model.eval()
     train_losses = []
@@ -548,6 +588,10 @@ def train_distillation(teacher_model, student_model, train_loader, test_loader, 
                 F.softmax(teacher_outputs / temp, dim=1)
             )
             loss = alpha * student_loss + (1 - alpha) * temp * temp * distillation_loss
+            if aux_loss_weight > 0:
+                aux_loss = compute_gating_load_balance_loss(student_model)
+                if aux_loss is not None:
+                    loss = loss + aux_loss_weight * aux_loss
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
@@ -579,20 +623,30 @@ def train_svd_model(model, rank, head_num, train_loader, test_loader, criterion,
     return train_losses, test_accuracies
 
 
-def train_hetero_svd_model(model, train_loader, test_loader, criterion, head_num=2, budget_ratio=0.35, r_min=4, max_calib_batches=5, init_method=None, epochs=100, teacher_model=None):
+def train_hetero_svd_model(model, train_loader, test_loader, criterion, head_num=2, budget_ratio=0.35, r_min=4, min_rank=8, temperature=1.5, max_calib_batches=5, init_method=None, epochs=100, teacher_model=None, aux_loss_weight=0.01):
     model_svd = copy.deepcopy(model)
     rank_map = model_svd.apply_hetero_svd(
         calib_loader=train_loader,
         head_num=head_num,
         budget_ratio=budget_ratio,
         r_min=r_min,
+        min_rank=min_rank,
+        temperature=temperature,
         max_calib_batches=max_calib_batches,
     )
 
     if init_method == "distillation":
         model_svd = model_svd.to(device)
         optimizer_student = optim.Adam(model_svd.parameters(), lr=0.001)
-        train_losses, test_accuracies = train_distillation(teacher_model, model_svd, train_loader, test_loader, optimizer_student, epochs=epochs)
+        train_losses, test_accuracies = train_distillation(
+            teacher_model,
+            model_svd,
+            train_loader,
+            test_loader,
+            optimizer_student,
+            epochs=epochs,
+            aux_loss_weight=aux_loss_weight,
+        )
         return train_losses, test_accuracies, rank_map
 
     if init_method == 'kaiming':
@@ -602,15 +656,57 @@ def train_hetero_svd_model(model, train_loader, test_loader, criterion, head_num
 
     model_svd = model_svd.to(device)
     optimizer_svd = optim.Adam(model_svd.parameters(), lr=0.001)
-    train_losses, test_accuracies = train_model(model_svd, train_loader, test_loader, criterion, optimizer_svd, epochs=epochs)
+    train_losses = []
+    test_accuracies = []
+    model_svd.train()
+    for epoch in range(epochs):
+        total_loss = 0.0
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            optimizer_svd.zero_grad()
+            outputs = model_svd(inputs)
+            task_loss = criterion(outputs, labels)
+            loss = task_loss
+            if aux_loss_weight > 0:
+                aux_loss = compute_gating_load_balance_loss(model_svd)
+                if aux_loss is not None:
+                    loss = loss + aux_loss_weight * aux_loss
+            loss.backward()
+            optimizer_svd.step()
+            total_loss += loss.item()
+        test_accuracy = evaluate_model(model_svd, test_loader, criterion)
+        train_losses.append(total_loss / len(train_loader))
+        test_accuracies.append(test_accuracy)
+        print(f"Epoch {epoch + 1}, Loss: {total_loss / len(train_loader):.4f}, Test Accuracy: {test_accuracy:.2f}%")
     return train_losses, test_accuracies, rank_map
+
+
+def initialize_hetero_base_by_pretraining(hetero_model, train_loader, test_loader, criterion, epochs):
+    print("Preparing hetero base via pretraining...")
+    optimizer_hetero = optim.Adam(hetero_model.parameters(), lr=0.001)
+    train_model(hetero_model, train_loader, test_loader, criterion, optimizer_hetero, epochs=epochs)
+    return hetero_model
+
+
+def initialize_hetero_base_by_weight_copy(hetero_model, trained_model):
+    print("Preparing hetero base via weight copy from trained baseline model...")
+    hetero_model.resnet.load_state_dict(trained_model.resnet.state_dict())
+    return hetero_model
+
+
+def prepare_hetero_base_model(hetero_model, trained_model, train_loader, test_loader, criterion, epochs, mode="copy"):
+    if mode == "pretrain":
+        return initialize_hetero_base_by_pretraining(hetero_model, train_loader, test_loader, criterion, epochs)
+    if mode == "copy":
+        return initialize_hetero_base_by_weight_copy(hetero_model, trained_model)
+    raise ValueError(f"Unknown hetero initialization mode: {mode}")
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters())
 
 if __name__ == "__main__":
 
-    dataset_name = 'cifar10'
+    dataset_name = 'cifar100'
     epochs_num = 5
     train_loader, test_loader = get_dataloader(dataset_name)
 
@@ -657,8 +753,20 @@ if __name__ == "__main__":
     print("Training Original ResNet-18...")
     train_losses_original, test_accuracies_original = train_model(model, train_loader, test_loader, criterion, optimizer, epochs=epochs_num)
 
+    hetero_base_init_mode = "copy"
+    # Choose one of: "copy" or "pretrain"
+    hetero_model = prepare_hetero_base_model(
+        hetero_model=hetero_model,
+        trained_model=model,
+        train_loader=train_loader,
+        test_loader=test_loader,
+        criterion=criterion,
+        epochs=epochs_num,
+        mode=hetero_base_init_mode,
+    )
+
     ranks = [32]
-    head_nums = [1, 2]
+    head_nums = [1, 2, 3]
     init_methods = [None, 'distillation']
     results = {}
 
@@ -672,12 +780,12 @@ if __name__ == "__main__":
 
     hetero_results = {}
     hetero_configs = [
-        {'head_num': 1, 'budget_ratio': 0.35, 'r_min': 32, 'init_method': None},
-        {'head_num': 1, 'budget_ratio': 0.35, 'r_min': 32, 'init_method': 'distillation'},
-        {'head_num': 2, 'budget_ratio': 0.35, 'r_min': 32, 'init_method': None},
-        {'head_num': 2, 'budget_ratio': 0.35, 'r_min': 32, 'init_method': 'distillation'},
-        {'head_num': 3, 'budget_ratio': 0.35, 'r_min': 32, 'init_method': None},
-        {'head_num': 3, 'budget_ratio': 0.35, 'r_min': 32, 'init_method': 'distillation'},
+        {'head_num': 1, 'budget_ratio': 0.35, 'r_min': 4, 'min_rank': 8, 'temperature': 1.5, 'init_method': None},
+        {'head_num': 1, 'budget_ratio': 0.35, 'r_min': 4, 'min_rank': 8, 'temperature': 1.5, 'init_method': 'distillation'},
+        {'head_num': 2, 'budget_ratio': 0.35, 'r_min': 4, 'min_rank': 8, 'temperature': 1.5, 'init_method': None},
+        {'head_num': 2, 'budget_ratio': 0.35, 'r_min': 4, 'min_rank': 8, 'temperature': 1.5, 'init_method': 'distillation'},
+        {'head_num': 3, 'budget_ratio': 0.35, 'r_min': 4, 'min_rank': 8, 'temperature': 1.5, 'init_method': None},
+        {'head_num': 3, 'budget_ratio': 0.35, 'r_min': 4, 'min_rank': 8, 'temperature': 1.5, 'init_method': 'distillation'},
     ]
 
     for cfg in hetero_configs:
@@ -691,10 +799,13 @@ if __name__ == "__main__":
             head_num=cfg['head_num'],
             budget_ratio=cfg['budget_ratio'],
             r_min=cfg['r_min'],
+            min_rank=cfg['min_rank'],
+            temperature=cfg['temperature'],
             max_calib_batches=5,
             init_method=cfg['init_method'],
             epochs=epochs_num,
             teacher_model=teacher_model,
+            aux_loss_weight=0.01,
         )
         rank_stats = f"min_rank={min(rank_map.values())}, max_rank={max(rank_map.values())}, avg_rank={sum(rank_map.values()) / len(rank_map):.2f}"
         print(f"{key} rank allocation: {rank_stats}")
@@ -776,6 +887,8 @@ if __name__ == "__main__":
             head_num=cfg['head_num'],
             budget_ratio=cfg['budget_ratio'],
             r_min=cfg['r_min'],
+            min_rank=cfg['min_rank'],
+            temperature=cfg['temperature'],
             max_calib_batches=5,
         )
         hetero_params = count_parameters(model_tmp)
@@ -798,5 +911,8 @@ if __name__ == "__main__":
 
     fig.suptitle('InherNet Variants: Optimization and Generalization Curves', y=1.02, fontsize=14, fontweight='bold')
     fig.tight_layout(rect=[0, 0.08, 1, 0.98])
-    plt.savefig("result.png", dpi=300, bbox_inches='tight')
+    if not os.path.exists("results"):
+        os.makedirs("results")
+    # 图片包含dataset_name和epochs_num
+    plt.savefig(f"results/result_{dataset_name}_{epochs_num}.png", dpi=300, bbox_inches='tight')
     plt.show()
