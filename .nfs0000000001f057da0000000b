@@ -1,0 +1,396 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$PROJECT_DIR"
+
+BACKGROUND=0
+LOG_FILE=""
+PID_FILE="$PROJECT_DIR/run.pid"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+SUITE=""
+SCHEDULE="sequential"
+MAX_JOBS=2
+DATASET=""
+PAIR=""
+METHOD=""
+SINGLE_ARGS=()
+PRE_DASH_EXTRA=()
+SHARED_ARGS=()
+AFTER_DOUBLE_DASH=0
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  ./run.sh [--background] [--log-file PATH] --dataset DATASET --pair PAIR --method METHOD [demo_code.py args...]
+  ./run.sh --suite {baseline,comparison,all} --dataset DATASET --pair PAIR [--schedule {sequential,parallel}] [--max-jobs N] -- [shared demo_code.py args...]
+
+Launcher options:
+  --background           Single-run only. For suites, use: nohup ./run.sh ... &
+  --log-file PATH        Single-run only custom log path.
+  --suite NAME           Preset model suite: baseline, comparison, or all.
+                         Suite mode always targets one dataset/pair, not every registered pair.
+  --schedule MODE        Suite execution mode: sequential or parallel. Default: sequential.
+                         Parallel mode is advanced/experimental on a single-GPU machine.
+  --max-jobs N           Max concurrent jobs for suite parallel mode. Default: 2.
+                         Only used with --schedule parallel. On one GPU, sequential is recommended.
+  --                    Separator before shared demo_code.py args in suite mode.
+
+Examples:
+  ./run.sh --dataset cifar100 --pair resnet56_to_resnet20 --method hetero
+  ./run.sh --dataset cifar10 --pair resnet50_to_resnet18 --method teacher --smoke-test
+  ./run.sh --suite all --dataset cifar100 --pair resnet56_to_resnet20 --schedule sequential -- --epochs 5 --download
+  ./run.sh --suite comparison --dataset cifar100 --pair resnet56_to_resnet20 --schedule sequential -- --download
+  ./run.sh --suite comparison --dataset cifar100 --pair resnet56_to_resnet20 --schedule parallel --max-jobs 2 -- --download
+  ./run.sh --suite all --dataset cifar100 --pair resnet56_to_resnet20 --schedule parallel --max-jobs 2 -- --epochs 5 --download
+  PYTHON_BIN=/path/to/python ./run.sh --background --dataset cifar100 --pair vgg13_to_vgg8 --method inhernet --rank-preset large
+USAGE
+}
+
+suite_specs() {
+    case "$1" in
+        baseline)
+            printf '%s\n' \
+                $'01_teacher\tteacher\t' \
+                $'02_student\tstudent\t' \
+                $'03_student_kd\tstudent_kd\t'
+            ;;
+        comparison)
+            printf '%s\n' \
+                $'01_teacher\tteacher\t' \
+                $'02_student_kd\tstudent_kd\t' \
+                $'03_inhernet_small\tinhernet\t--rank-preset small' \
+                $'04_inhernet_large\tinhernet\t--rank-preset large' \
+                $'05_hetero\thetero\t'
+            ;;
+        all)
+            printf '%s\n' \
+                $'01_teacher\tteacher\t' \
+                $'02_student\tstudent\t' \
+                $'03_student_kd\tstudent_kd\t' \
+                $'04_inhernet_small\tinhernet\t--rank-preset small' \
+                $'05_inhernet_large\tinhernet\t--rank-preset large' \
+                $'06_hetero\thetero\t'
+            ;;
+        *)
+            echo "Unknown suite: $1" >&2
+            exit 1
+            ;;
+    esac
+}
+
+log_suite() {
+    local message="$1"
+    echo "$message" | tee -a "$SUITE_LOG"
+}
+
+detect_visible_gpu_count() {
+    if [[ -n "${CUDA_VISIBLE_DEVICES+x}" ]]; then
+        local devices="${CUDA_VISIBLE_DEVICES// /}"
+        if [[ -z "$devices" || "$devices" == "-1" ]]; then
+            echo "0"
+            return
+        fi
+        local count=0
+        local entry=""
+        IFS=',' read -r -a device_list <<< "$devices"
+        for entry in "${device_list[@]}"; do
+            if [[ -n "$entry" && "$entry" != "-1" ]]; then
+                ((count+=1))
+            fi
+        done
+        echo "$count"
+        return
+    fi
+
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        local count
+        count="$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || true)"
+        if [[ "$count" =~ ^[0-9]+$ ]]; then
+            echo "$count"
+            return
+        fi
+    fi
+
+    echo "unknown"
+}
+
+warn_if_parallel_on_single_gpu() {
+    local gpu_count="$1"
+    if [[ "$gpu_count" == "1" ]]; then
+        log_suite "Warning: --schedule parallel was requested, but only one visible GPU was detected. Sequential is the recommended and default mode on single-GPU setups; parallel remains available as an experimental option."
+        return
+    fi
+    if [[ "$gpu_count" == "unknown" ]]; then
+        log_suite "Warning: --schedule parallel was requested, but the number of visible GPUs could not be detected. Sequential is the recommended and default mode on single-GPU setups."
+    fi
+}
+
+build_child_command() {
+    local method_name="$1"
+    shift
+    CHILD_CMD=(
+        "$PYTHON_BIN"
+        -u
+        "$PROJECT_DIR/demo_code.py"
+        --dataset "$DATASET"
+        --pair "$PAIR"
+        --method "$method_name"
+        "$@"
+        "${SHARED_ARGS[@]}"
+    )
+}
+
+run_suite_step_sequential() {
+    local label="$1"
+    local method_name="$2"
+    local extra_args_string="$3"
+    local child_log="$SUITE_DIR/${label}.log"
+    local extra_args=()
+    if [[ -n "$extra_args_string" ]]; then
+        read -r -a extra_args <<< "$extra_args_string"
+    fi
+    build_child_command "$method_name" "${extra_args[@]}"
+    log_suite "[$label] Starting: ${CHILD_CMD[*]}"
+    env INHERNET_RUN_LOG="$child_log" "${CHILD_CMD[@]}" 2>&1 | tee "$child_log"
+    log_suite "[$label] Completed. Log: $child_log"
+}
+
+run_suite_step_background() {
+    local label="$1"
+    local method_name="$2"
+    local extra_args_string="$3"
+    local child_log="$SUITE_DIR/${label}.log"
+    local extra_args=()
+    if [[ -n "$extra_args_string" ]]; then
+        read -r -a extra_args <<< "$extra_args_string"
+    fi
+    build_child_command "$method_name" "${extra_args[@]}"
+    log_suite "[$label] Starting in parallel: ${CHILD_CMD[*]}"
+    env INHERNET_RUN_LOG="$child_log" "${CHILD_CMD[@]}" >"$child_log" 2>&1 &
+    local child_pid=$!
+    ACTIVE_PIDS+=("$child_pid")
+    PID_LABELS["$child_pid"]="$label"
+    PID_LOGS["$child_pid"]="$child_log"
+}
+
+wait_for_active_jobs() {
+    local pid=""
+    local label=""
+    local child_log=""
+    for pid in "${ACTIVE_PIDS[@]}"; do
+        label="${PID_LABELS[$pid]}"
+        child_log="${PID_LOGS[$pid]}"
+        if wait "$pid"; then
+            log_suite "[$label] Completed. Log: $child_log"
+        else
+            log_suite "[$label] Failed. Log: $child_log"
+            return 1
+        fi
+    done
+    ACTIVE_PIDS=()
+}
+
+while (($#)); do
+    if ((AFTER_DOUBLE_DASH)); then
+        SHARED_ARGS+=("$1")
+        shift
+        continue
+    fi
+
+    case "$1" in
+        --)
+            AFTER_DOUBLE_DASH=1
+            shift
+            ;;
+        --background)
+            BACKGROUND=1
+            shift
+            ;;
+        --log-file)
+            if (($# < 2)); then
+                echo "--log-file requires a path" >&2
+                exit 1
+            fi
+            LOG_FILE="$2"
+            shift 2
+            ;;
+        --suite)
+            if (($# < 2)); then
+                echo "--suite requires a value" >&2
+                exit 1
+            fi
+            SUITE="$2"
+            shift 2
+            ;;
+        --schedule)
+            if (($# < 2)); then
+                echo "--schedule requires a value" >&2
+                exit 1
+            fi
+            SCHEDULE="$2"
+            shift 2
+            ;;
+        --max-jobs)
+            if (($# < 2)); then
+                echo "--max-jobs requires a value" >&2
+                exit 1
+            fi
+            MAX_JOBS="$2"
+            shift 2
+            ;;
+        --dataset)
+            if (($# < 2)); then
+                echo "--dataset requires a value" >&2
+                exit 1
+            fi
+            DATASET="$2"
+            SINGLE_ARGS+=("$1" "$2")
+            shift 2
+            ;;
+        --pair)
+            if (($# < 2)); then
+                echo "--pair requires a value" >&2
+                exit 1
+            fi
+            PAIR="$2"
+            SINGLE_ARGS+=("$1" "$2")
+            shift 2
+            ;;
+        --method)
+            if (($# < 2)); then
+                echo "--method requires a value" >&2
+                exit 1
+            fi
+            METHOD="$2"
+            SINGLE_ARGS+=("$1" "$2")
+            shift 2
+            ;;
+        *)
+            SINGLE_ARGS+=("$1")
+            PRE_DASH_EXTRA+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$SUITE" && ${#SINGLE_ARGS[@]} -eq 0 && ${#SHARED_ARGS[@]} -eq 0 ]]; then
+    usage
+    exit 1
+fi
+
+if [[ -n "$SUITE" ]]; then
+    case "$SCHEDULE" in
+        sequential|parallel) ;;
+        *)
+            echo "Unsupported --schedule value: $SCHEDULE" >&2
+            exit 1
+            ;;
+    esac
+    if ! [[ "$MAX_JOBS" =~ ^[0-9]+$ ]] || ((MAX_JOBS < 1)); then
+        echo "--max-jobs must be a positive integer" >&2
+        exit 1
+    fi
+    if ((BACKGROUND)); then
+        echo "--background is only supported for single runs. For suites, use: nohup ./run.sh ... &" >&2
+        exit 1
+    fi
+    if [[ -n "$LOG_FILE" ]]; then
+        echo "--log-file is only supported for single runs. Suite logs are written to a dedicated log directory." >&2
+        exit 1
+    fi
+    if [[ -z "$DATASET" || -z "$PAIR" ]]; then
+        echo "--dataset and --pair are required in suite mode" >&2
+        exit 1
+    fi
+    if [[ -n "$METHOD" ]]; then
+        echo "--method cannot be used together with --suite" >&2
+        exit 1
+    fi
+    if ((${#PRE_DASH_EXTRA[@]} > 0)); then
+        echo "In suite mode, shared demo_code.py arguments must appear after --" >&2
+        exit 1
+    fi
+
+    TIMESTAMP="$(date +"%Y%m%d_%H%M%S")"
+    SUITE_DIR="$PROJECT_DIR/logs/$DATASET/$PAIR/$SUITE/$TIMESTAMP"
+    mkdir -p "$SUITE_DIR"
+    SUITE_LOG="$SUITE_DIR/suite.log"
+    touch "$SUITE_LOG"
+
+    log_suite "Project: $PROJECT_DIR"
+    log_suite "Python: $PYTHON_BIN"
+    log_suite "Suite: $SUITE"
+    log_suite "Schedule: $SCHEDULE"
+    log_suite "Dataset: $DATASET"
+    log_suite "Pair: $PAIR"
+    log_suite "Log directory: $SUITE_DIR"
+    if ((${#SHARED_ARGS[@]} > 0)); then
+        log_suite "Shared args: ${SHARED_ARGS[*]}"
+    fi
+    if [[ "$SCHEDULE" == "parallel" ]]; then
+        GPU_COUNT="$(detect_visible_gpu_count)"
+        log_suite "Detected visible GPUs: $GPU_COUNT"
+        warn_if_parallel_on_single_gpu "$GPU_COUNT"
+    fi
+
+    mapfile -t SUITE_RUNS < <(suite_specs "$SUITE")
+    declare -a ACTIVE_PIDS=()
+    declare -A PID_LABELS=()
+    declare -A PID_LOGS=()
+
+    if [[ "$SCHEDULE" == "sequential" ]]; then
+        for spec in "${SUITE_RUNS[@]}"; do
+            IFS=$'\t' read -r label method_name extra_args_string <<< "$spec"
+            run_suite_step_sequential "$label" "$method_name" "$extra_args_string"
+        done
+        log_suite "Suite completed successfully."
+        exit 0
+    fi
+
+    stage_index=0
+    if ((${#SUITE_RUNS[@]} > 0)); then
+        IFS=$'\t' read -r first_label first_method first_extra <<< "${SUITE_RUNS[0]}"
+        if [[ "$first_method" == "teacher" ]]; then
+            run_suite_step_sequential "$first_label" "$first_method" "$first_extra"
+            stage_index=1
+        fi
+    fi
+
+    for ((i=stage_index; i<${#SUITE_RUNS[@]}; i++)); do
+        IFS=$'\t' read -r label method_name extra_args_string <<< "${SUITE_RUNS[$i]}"
+        run_suite_step_background "$label" "$method_name" "$extra_args_string"
+        if ((${#ACTIVE_PIDS[@]} >= MAX_JOBS)); then
+            wait_for_active_jobs
+        fi
+    done
+    if ((${#ACTIVE_PIDS[@]} > 0)); then
+        wait_for_active_jobs
+    fi
+    log_suite "Suite completed successfully."
+    exit 0
+fi
+
+TIMESTAMP="$(date +"%Y%m%d_%H%M%S")"
+LOG_DIR="$PROJECT_DIR/logs"
+mkdir -p "$LOG_DIR"
+if [[ -z "$LOG_FILE" ]]; then
+    LOG_FILE="$LOG_DIR/run_${TIMESTAMP}.log"
+fi
+mkdir -p "$(dirname "$LOG_FILE")"
+
+CMD=("$PYTHON_BIN" -u "$PROJECT_DIR/demo_code.py" "${SINGLE_ARGS[@]}" "${SHARED_ARGS[@]}")
+
+echo "Project: $PROJECT_DIR"
+echo "Python: $PYTHON_BIN"
+echo "Log: $LOG_FILE"
+echo "Command: ${CMD[*]}"
+
+if ((BACKGROUND)); then
+    nohup env INHERNET_RUN_LOG="$LOG_FILE" "${CMD[@]}" >"$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+    echo "Started in background"
+    echo "PID: $(cat "$PID_FILE")"
+else
+    env INHERNET_RUN_LOG="$LOG_FILE" "${CMD[@]}" 2>&1 | tee "$LOG_FILE"
+fi
