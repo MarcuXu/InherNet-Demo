@@ -20,26 +20,71 @@ usage() {
     cat <<'USAGE'
 Usage:
   ./run.sh [--background] [--log-file PATH] --dataset DATASET --pair PAIR --method METHOD [demo_code.py args...]
-  ./run.sh --suite {baseline,comparison,all} --dataset DATASET --pair PAIR -- [shared demo_code.py args...]
+  ./run.sh [--background] --suite {baseline,comparison,all} --dataset DATASET --pair PAIR -- [shared demo_code.py args...]
 
 Launcher options:
-  --background           Single-run only. Launch in the background with nohup.
+  --background           Launch the selected run in the background with nohup.
   --log-file PATH        Single-run only custom log path.
   --suite NAME           Serial preset suite: baseline, comparison, or all.
                          Suite mode always targets one dataset/pair, not every registered pair.
   --                    Separator before shared demo_code.py args in suite mode.
+                         Everything after -- is forwarded directly to demo_code.py.
+
+Command structure:
+  Single run:
+    Use --method when you want to train or test one specific model.
+  Suite run:
+    Use --suite when you want a preset collection of methods for one dataset/pair.
+    Example: --suite all runs every supported method for the chosen pair.
 
 Notes:
   Suite runs are always serial and train all requested models from scratch.
-  The old --schedule and --max-jobs options are no longer supported.
+  Shared options such as --epochs, --download, and --plot-mode must come after -- in suite mode.
 
 Examples:
-  ./run.sh --dataset cifar100 --pair resnet56_to_resnet20 --method hetero
-  ./run.sh --dataset cifar10 --pair resnet50_to_resnet18 --method teacher --smoke-test
-  ./run.sh --suite all --dataset cifar100 --pair resnet56_to_resnet20 -- --epochs 5 --download
-  ./run.sh --suite comparison --dataset cifar100 --pair resnet32_to_resnet8 -- --download
-  PYTHON_BIN=/path/to/python ./run.sh --background --dataset cifar100 --pair vgg13_to_vgg8 --method inhernet --rank-preset large
+  Train all models for one CIFAR-100 pair for 5 epochs:
+    ./run.sh --suite all --dataset cifar100 --pair resnet56_to_resnet20 -- --epochs 5 --download
+
+  Train only the comparison methods for one CIFAR-100 pair:
+    ./run.sh --suite comparison --dataset cifar100 --pair resnet32_to_resnet8 -- --download
+
+  Run one suite in the background with nohup-managed logs and PID reporting:
+    ./run.sh --background --suite all --dataset cifar100 --pair resnet56_to_resnet20 -- --epochs 5 --download
+
+  Run one CIFAR-100 method directly:
+    ./run.sh --dataset cifar100 --pair vgg13_to_vgg8 --method hetero --download
+
+  Quick CIFAR-10 single-model smoke test:
+    ./run.sh --dataset cifar10 --pair resnet50_to_resnet18 --method teacher --smoke-test --plot-mode none
+
+  Single run in the background with nohup-managed logging:
+    ./run.sh --background --dataset cifar100 --pair resnet56_to_resnet20 --method student_kd --download
+
+  Single run with a custom log path:
+    ./run.sh --log-file logs/custom_teacher.log --dataset cifar100 --pair resnet56_to_resnet20 --method teacher --download
+
+  If the dataset is already present locally, omit --download:
+    ./run.sh --dataset cifar100 --pair resnet56_to_resnet20 --method teacher
+
+  Use a different Python interpreter explicitly:
+    PYTHON_BIN=/path/to/python ./run.sh --dataset cifar100 --pair vgg13_to_vgg8 --method inhernet --rank-preset large --download
 USAGE
+}
+
+launch_background_job() {
+    local pid_file="$1"
+    local output_log="$2"
+    shift 2
+    local -a cmd=("$@")
+
+    mkdir -p "$(dirname "$pid_file")"
+    mkdir -p "$(dirname "$output_log")"
+
+    nohup "${cmd[@]}" >>"$output_log" 2>&1 &
+    local pid=$!
+    echo "$pid" >"$pid_file"
+    echo "PID: $pid"
+    echo "PID file: $pid_file"
 }
 
 while (($#)); do
@@ -132,10 +177,6 @@ if [[ -z "$SUITE" && -z "$METHOD" ]]; then
 fi
 
 if [[ -n "$SUITE" ]]; then
-    if ((BACKGROUND)); then
-        echo "--background is single-run only. For suites, wrap the whole command in nohup ... & if needed." >&2
-        exit 1
-    fi
     if [[ -n "$LOG_FILE" ]]; then
         echo "--log-file is single-run only in suite mode. demo_code.py manages suite.log and child logs." >&2
         exit 1
@@ -147,8 +188,9 @@ if [[ -n "$SUITE" ]]; then
 
     TIMESTAMP="$(date -u +%Y%m%d_%H%M%S)"
     SUITE_DIR="$PROJECT_DIR/logs/$DATASET/$PAIR/$SUITE/$TIMESTAMP"
+    SUITE_LOG_FILE="$SUITE_DIR/suite.log"
+    SUITE_PID_FILE="$SUITE_DIR/suite.pid"
     mkdir -p "$SUITE_DIR"
-    export INHERNET_SUITE_LOG_DIR="$SUITE_DIR"
 
     CMD=(
         "$PYTHON_BIN"
@@ -160,9 +202,23 @@ if [[ -n "$SUITE" ]]; then
         "${SHARED_ARGS[@]}"
     )
 
-    echo "Launching serial suite: ${CMD[*]}"
-    "${CMD[@]}"
-    echo "Suite logs: $SUITE_DIR"
+    if ((BACKGROUND)); then
+        echo "Starting serial suite in background."
+        launch_background_job \
+            "$SUITE_PID_FILE" \
+            "$SUITE_LOG_FILE" \
+            env \
+            INHERNET_SUITE_LOG_DIR="$SUITE_DIR" \
+            INHERNET_SUITE_BACKGROUND=1 \
+            "${CMD[@]}"
+        echo "Suite log directory: $SUITE_DIR"
+        echo "Suite log: $SUITE_LOG_FILE"
+    else
+        export INHERNET_SUITE_LOG_DIR="$SUITE_DIR"
+        echo "Launching serial suite: ${CMD[*]}"
+        "${CMD[@]}"
+        echo "Suite logs: $SUITE_DIR"
+    fi
     exit 0
 fi
 
@@ -191,10 +247,15 @@ CMD=(
 
 if ((BACKGROUND)); then
     echo "Starting in background. Logs: $LOG_FILE"
-    nohup env INHERNET_RUN_LOG="$LOG_FILE" "${CMD[@]}" >"$LOG_FILE" 2>&1 &
-    echo $! >"$PID_FILE"
-    echo "PID saved to $PID_FILE"
+    launch_background_job \
+        "$PID_FILE" \
+        "$LOG_FILE" \
+        env \
+        INHERNET_RUN_LOG="$LOG_FILE" \
+        "${CMD[@]}"
+    echo "Log file: $LOG_FILE"
 else
     echo "Running: ${CMD[*]}"
-    env INHERNET_RUN_LOG="$LOG_FILE" "${CMD[@]}" 2>&1 | tee "$LOG_FILE"
+    echo "Log file: $LOG_FILE"
+    env INHERNET_RUN_LOG="$LOG_FILE" "${CMD[@]}"
 fi

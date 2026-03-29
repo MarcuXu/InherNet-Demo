@@ -1,2 +1,6 @@
-data
-logs
+data/
+logs/
+.nfs*
+__pycache__/
+*.py[cod]
+run.pid
