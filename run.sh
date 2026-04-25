@@ -49,7 +49,7 @@ Examples:
     ./run.sh --suite comparison --dataset cifar100 --pair resnet32_to_resnet8 -- --download
 
   Run one suite in the background with nohup-managed logs and PID reporting:
-    ./run.sh --background --suite all --dataset cifar100 --pair resnet56_to_resnet20 -- --epochs 5 --download
+    ./run.sh --background --suite all --dataset cifar100 --pair resnet56_to_resnet20 -- --download
 
   Run one CIFAR-100 method directly:
     ./run.sh --dataset cifar100 --pair vgg13_to_vgg8 --method hetero --download

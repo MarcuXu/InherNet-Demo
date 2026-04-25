@@ -13,7 +13,7 @@ import torch.nn.functional as F
 import copy
 from collections import OrderedDict
 import os
-
+# This is the original code for the InherNet paper.
 # import os
 # os.environ['TORCH_HOME'] = '/root/models'
 

@@ -282,6 +282,8 @@ def validate_args(args: argparse.Namespace, pair_spec: Mapping[str, Any]) -> Non
     requested_methods = [args.method] if args.method is not None else [entry["method"] for entry in SUITE_SPECS[args.suite]]
     if "hetero" in requested_methods and args.compress_threshold <= args.min_rank:
         raise ValueError("--compress-threshold must be greater than --min-rank for hetero gating to use both branches.")
+    if "hetero" in requested_methods and args.hetero_expert_noise_scale < 0:
+        raise ValueError("--hetero-expert-noise-scale must be non-negative.")
     if args.suite is not None and args.rank is not None:
         raise ValueError("--rank cannot be used together with --suite because suite InherNet runs already define their own presets.")
     if "inhernet" in requested_methods:
@@ -319,7 +321,8 @@ def build_method_tag(
         tag = (
             f"heads_{head_num}_budget_{format_float_tag(args.budget_ratio)}_"
             f"min_{args.min_rank}_temp_{format_float_tag(args.hetero_temperature)}_"
-            f"thr_{args.compress_threshold}_calib_{args.max_calib_batches}"
+            f"thr_{args.compress_threshold}_calib_{args.max_calib_batches}_"
+            f"noise_{format_float_tag(args.hetero_expert_noise_scale)}"
         )
     else:
         raise ValueError(f"Unknown method: {method}")

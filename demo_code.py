@@ -518,6 +518,7 @@ def train_method_from_scratch(
                 temperature=args.hetero_temperature,
                 max_calib_batches=args.max_calib_batches,
                 svd_backend=svd_backend,
+                expert_noise_scale=args.hetero_expert_noise_scale,
             )
             rank_values = list(rank_map.values())
             avg_rank = sum(rank_values) / len(rank_values)
@@ -529,6 +530,7 @@ def train_method_from_scratch(
                 "hetero_temperature": args.hetero_temperature,
                 "max_calib_batches": args.max_calib_batches,
                 "aux_loss_weight": args.aux_loss_weight,
+                "hetero_expert_noise_scale": args.hetero_expert_noise_scale,
                 "rank_map": {name: int(rank) for name, rank in rank_map.items()},
                 "avg_rank": avg_rank,
                 "rank_min": min(rank_values),
@@ -654,6 +656,7 @@ def run_single_method_smoke_test(
             compress_threshold=args.compress_threshold,
             temperature=args.hetero_temperature,
             max_calib_batches=min(args.max_calib_batches, len(calib_loader)),
+            expert_noise_scale=args.hetero_expert_noise_scale,
         )
         output = model(sample)
         assert args.compress_threshold > args.min_rank
@@ -882,6 +885,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--hetero-temperature", type=float, default=1.4)
     parser.add_argument("--max-calib-batches", type=int, default=16)
     parser.add_argument("--aux-loss-weight", type=float, default=0.01)
+    parser.add_argument("--hetero-expert-noise-scale", type=float, default=0.01)
     parser.add_argument("--plot-mode", choices=["none", "single", "compare", "both"], default="both")
     parser.add_argument("--plot-root", default=str(PROJECT_DIR / "results"))
     parser.add_argument("--smoke-test", action="store_true")
