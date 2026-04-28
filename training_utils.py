@@ -594,9 +594,12 @@ def train_supervised(
     history = create_history_template()
     logger = logger or build_run_logger()
 
+    if settings.legacy_eval_sticky:
+        model.train()
     for epoch in range(settings.epochs):
         epoch_start = time.perf_counter()
-        model.train()
+        if not settings.legacy_eval_sticky:
+            model.train()
         running_objective = 0.0
         running_ce_loss = 0.0
         running_correct = 0
@@ -692,9 +695,12 @@ def train_distillation(
     run_label = run_label or phase
 
     teacher_model.eval()
+    if settings.legacy_eval_sticky:
+        student_model.train()
     for epoch in range(settings.epochs):
         epoch_start = time.perf_counter()
-        student_model.train()
+        if not settings.legacy_eval_sticky:
+            student_model.train()
         running_objective = 0.0
         running_ce_loss = 0.0
         running_correct = 0

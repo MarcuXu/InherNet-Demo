@@ -289,6 +289,8 @@ def build_run_metadata(
         "num_parameters": count_parameters(model),
         "train_settings": asdict(settings),
     }
+    if "model_profile" in pair_spec:
+        metadata["model_profile"] = str(pair_spec["model_profile"])
     if suite_name is not None:
         metadata["suite_name"] = suite_name
     if suite_label is not None:
@@ -359,6 +361,30 @@ def train_teacher_pretrain(
     return teacher_model, history
 
 
+def train_student_pretrain(
+    args: argparse.Namespace,
+    dataset_spec: DatasetSpec,
+    settings: TrainSettings,
+    device: torch.device,
+    logger: RunLogger,
+) -> tuple[nn.Module, dict[str, list[float]]]:
+    set_seed(args.seed)
+    train_loader, test_loader = build_training_dataloaders(args, settings, device)
+    student_model = build_pair_model(args.dataset, args.pair, "student", dataset_spec.num_classes).to(device)
+    logger.info("Training student source model from scratch for compressed-model initialization.")
+    history = train_supervised(
+        student_model,
+        train_loader,
+        test_loader,
+        settings,
+        device,
+        logger=logger,
+        phase="student_source_pretrain",
+    )
+    student_model.eval()
+    return student_model, history
+
+
 def train_method_from_scratch(
     args: argparse.Namespace,
     method: str,
@@ -369,6 +395,7 @@ def train_method_from_scratch(
     logger: RunLogger,
     *,
     teacher_model: nn.Module | None = None,
+    source_student_model: nn.Module | None = None,
     suite_name: str | None = None,
     suite_label: str | None = None,
     rank_preset_override: str | None = None,
@@ -377,6 +404,8 @@ def train_method_from_scratch(
     train_loader, test_loader = build_training_dataloaders(args, settings, device)
     config_tag = build_method_tag(method, args, pair_spec, settings, rank_preset_override)
     head_num = resolve_head_num(args, pair_spec, settings)
+    compressed_source = getattr(args, "compressed_source", "teacher")
+    compressed_train_mode = getattr(args, "compressed_train_mode", "distillation")
 
     if method == "teacher":
         model = build_pair_model(args.dataset, args.pair, "teacher", dataset_spec.num_classes).to(device)
@@ -438,22 +467,42 @@ def train_method_from_scratch(
             raise ValueError("inhernet requires an in-memory teacher model.")
         teacher_model = teacher_model.to(device)
         teacher_model.eval()
+        if compressed_source == "teacher":
+            dense_source_model = teacher_model
+            dense_source_role = "teacher"
+        elif compressed_source == "student":
+            if source_student_model is None:
+                raise ValueError("inhernet with --compressed-source student requires an in-memory source student model.")
+            dense_source_model = source_student_model.to(device)
+            dense_source_model.eval()
+            dense_source_role = "student"
+        else:
+            raise ValueError(f"Unsupported compressed source: {compressed_source}")
         rank = resolve_fixed_rank_with_override(args, pair_spec, rank_preset_override)
         dense_state_cpu = {
             name: tensor.detach().cpu().clone()
-            for name, tensor in teacher_model.state_dict().items()
+            for name, tensor in dense_source_model.state_dict().items()
         }
 
         def build_inhernet_model(svd_backend: str) -> tuple[nn.Module, dict[str, Any], str]:
             build_device = torch.device("cpu") if svd_backend == "cpu" else device
             model = GenericInherNet(
-                build_pair_model(args.dataset, args.pair, "teacher", dataset_spec.num_classes)
+                build_pair_model(args.dataset, args.pair, dense_source_role, dataset_spec.num_classes)
             ).to(build_device)
             model.load_dense_state_dict(dense_state_cpu)
             used_backend = model.apply_svd(rank=rank, head_num=head_num, svd_backend=svd_backend)
             if build_device != device:
                 model = model.to(device)
-            return model, {"rank": rank, "head_num": head_num, "compressed_from": "teacher"}, used_backend
+            return (
+                model,
+                {
+                    "rank": rank,
+                    "head_num": head_num,
+                    "compressed_from": dense_source_role,
+                    "compressed_train_mode": compressed_train_mode,
+                },
+                used_backend,
+            )
 
         model, inhernet_extra = build_validated_compressed_model(
             method=method,
@@ -463,8 +512,8 @@ def train_method_from_scratch(
             device=device,
             logger=logger,
             build_model=build_inhernet_model,
-            initial_svd_backend="cpu" if device.type == "cuda" else "auto",
-            retry_svd_backend=None,
+            initial_svd_backend=args.svd_backend,
+            retry_svd_backend="cpu" if args.svd_backend != "cpu" else None,
             gradient_clip_norm=5.0,
             detailed_check_batches=COMPRESSED_MODEL_DETAILED_CHECK_BATCHES,
         )
@@ -481,32 +530,53 @@ def train_method_from_scratch(
             extra=inhernet_extra,
         )
         logger.metadata(metadata)
-        history = train_distillation(
-            teacher_model,
-            model,
-            train_loader,
-            test_loader,
-            settings,
-            device,
-            gradient_clip_norm=5.0,
-            logger=logger,
-            run_label=method,
-            backend_label=str(inhernet_extra["svd_backend"]),
-            check_post_step_finiteness=True,
-            detailed_check_batches=COMPRESSED_MODEL_DETAILED_CHECK_BATCHES,
-        )
+        if compressed_train_mode == "supervised":
+            history = train_supervised(
+                model,
+                train_loader,
+                test_loader,
+                settings,
+                device,
+                logger=logger,
+            )
+        else:
+            history = train_distillation(
+                teacher_model,
+                model,
+                train_loader,
+                test_loader,
+                settings,
+                device,
+                gradient_clip_norm=5.0,
+                logger=logger,
+                run_label=method,
+                backend_label=str(inhernet_extra["svd_backend"]),
+                check_post_step_finiteness=True,
+                detailed_check_batches=COMPRESSED_MODEL_DETAILED_CHECK_BATCHES,
+            )
     elif method == "hetero":
         if teacher_model is None:
             raise ValueError("hetero requires an in-memory teacher model.")
         teacher_model = teacher_model.to(device)
         teacher_model.eval()
-        dense_state = teacher_model.state_dict()
+        if compressed_source == "teacher":
+            dense_source_model = teacher_model
+            dense_source_role = "teacher"
+        elif compressed_source == "student":
+            if source_student_model is None:
+                raise ValueError("hetero with --compressed-source student requires an in-memory source student model.")
+            dense_source_model = source_student_model.to(device)
+            dense_source_model.eval()
+            dense_source_role = "student"
+        else:
+            raise ValueError(f"Unsupported compressed source: {compressed_source}")
+        dense_state = dense_source_model.state_dict()
         dense_state_cpu = {name: tensor.detach().cpu().clone() for name, tensor in dense_state.items()}
 
         def build_hetero_model(svd_backend: str) -> tuple[nn.Module, dict[str, Any], str]:
             build_device = torch.device("cpu") if svd_backend == "cpu" else device
             model = GenericHeteroNet(
-                build_pair_model(args.dataset, args.pair, "teacher", dataset_spec.num_classes)
+                build_pair_model(args.dataset, args.pair, dense_source_role, dataset_spec.num_classes)
             ).to(build_device)
             model.load_dense_state_dict(dense_state_cpu if build_device.type == "cpu" else dense_state)
             rank_map, used_backend = model.apply_hetero_svd(
@@ -519,9 +589,13 @@ def train_method_from_scratch(
                 max_calib_batches=args.max_calib_batches,
                 svd_backend=svd_backend,
                 expert_noise_scale=args.hetero_expert_noise_scale,
+                compress_linear=args.hetero_compress_linear,
             )
             rank_values = list(rank_map.values())
             avg_rank = sum(rank_values) / len(rank_values)
+            target_layer_types = ["conv2d"]
+            if args.hetero_compress_linear:
+                target_layer_types.append("linear")
             extra = {
                 "head_num": head_num,
                 "budget_ratio": args.budget_ratio,
@@ -531,11 +605,14 @@ def train_method_from_scratch(
                 "max_calib_batches": args.max_calib_batches,
                 "aux_loss_weight": args.aux_loss_weight,
                 "hetero_expert_noise_scale": args.hetero_expert_noise_scale,
+                "hetero_compress_linear": args.hetero_compress_linear,
+                "target_layer_types": target_layer_types,
                 "rank_map": {name: int(rank) for name, rank in rank_map.items()},
                 "avg_rank": avg_rank,
                 "rank_min": min(rank_values),
                 "rank_max": max(rank_values),
-                "compressed_from": "teacher",
+                "compressed_from": dense_source_role,
+                "compressed_train_mode": compressed_train_mode,
             }
             if build_device != device:
                 model = model.to(device)
@@ -550,8 +627,8 @@ def train_method_from_scratch(
             logger=logger,
             build_model=build_hetero_model,
             aux_loss_weight=args.aux_loss_weight,
-            initial_svd_backend="cpu" if device.type == "cuda" else "auto",
-            retry_svd_backend=None,
+            initial_svd_backend=args.svd_backend,
+            retry_svd_backend="cpu" if args.svd_backend != "cpu" else None,
             gradient_clip_norm=5.0,
             detailed_check_batches=COMPRESSED_MODEL_DETAILED_CHECK_BATCHES,
         )
@@ -574,21 +651,32 @@ def train_method_from_scratch(
             extra=hetero_extra,
         )
         logger.metadata(metadata)
-        history = train_distillation(
-            teacher_model,
-            model,
-            train_loader,
-            test_loader,
-            settings,
-            device,
-            aux_loss_weight=args.aux_loss_weight,
-            gradient_clip_norm=5.0,
-            logger=logger,
-            run_label=method,
-            backend_label=str(hetero_extra["svd_backend"]),
-            check_post_step_finiteness=True,
-            detailed_check_batches=COMPRESSED_MODEL_DETAILED_CHECK_BATCHES,
-        )
+        if compressed_train_mode == "supervised":
+            history = train_supervised(
+                model,
+                train_loader,
+                test_loader,
+                settings,
+                device,
+                aux_loss_weight=args.aux_loss_weight,
+                logger=logger,
+            )
+        else:
+            history = train_distillation(
+                teacher_model,
+                model,
+                train_loader,
+                test_loader,
+                settings,
+                device,
+                aux_loss_weight=args.aux_loss_weight,
+                gradient_clip_norm=5.0,
+                logger=logger,
+                run_label=method,
+                backend_label=str(hetero_extra["svd_backend"]),
+                check_post_step_finiteness=True,
+                detailed_check_batches=COMPRESSED_MODEL_DETAILED_CHECK_BATCHES,
+            )
     else:
         raise ValueError(f"Unsupported method: {method}")
 
@@ -607,48 +695,57 @@ def run_single_method_smoke_test(
     pair_spec = get_pair_spec(dataset_name, pair_name)
     settings = resolve_train_settings(dataset_spec, args)
     head_num = resolve_head_num(args, pair_spec, settings)
-    sample = torch.randn(2, 3, 32, 32)
+    device = resolve_device(args.device)
+    sample = torch.randn(2, 3, 32, 32, device=device)
     calib_inputs = torch.randn(8, 3, 32, 32)
     calib_labels = torch.zeros(8, dtype=torch.long)
     calib_loader = DataLoader(TensorDataset(calib_inputs, calib_labels), batch_size=2, shuffle=False)
 
     if method == "teacher":
-        model = build_pair_model(dataset_name, pair_name, "teacher", dataset_spec.num_classes)
-        output = model(sample)
+        model = build_pair_model(dataset_name, pair_name, "teacher", dataset_spec.num_classes).to(device)
+        with torch.no_grad():
+            output = model(sample)
         return {"method": method, "shape": tuple(output.shape), "params": count_parameters(model)}
     if method == "student":
-        model = build_pair_model(dataset_name, pair_name, "student", dataset_spec.num_classes)
-        output = model(sample)
+        model = build_pair_model(dataset_name, pair_name, "student", dataset_spec.num_classes).to(device)
+        with torch.no_grad():
+            output = model(sample)
         return {"method": method, "shape": tuple(output.shape), "params": count_parameters(model)}
     if method == "student_kd":
-        teacher = build_pair_model(dataset_name, pair_name, "teacher", dataset_spec.num_classes)
-        student = build_pair_model(dataset_name, pair_name, "student", dataset_spec.num_classes)
-        teacher_out = teacher(sample)
-        student_out = student(sample)
+        teacher = build_pair_model(dataset_name, pair_name, "teacher", dataset_spec.num_classes).to(device)
+        student = build_pair_model(dataset_name, pair_name, "student", dataset_spec.num_classes).to(device)
+        with torch.no_grad():
+            teacher_out = teacher(sample)
+            student_out = student(sample)
         return {
             "method": method,
             "teacher_shape": tuple(teacher_out.shape),
             "student_shape": tuple(student_out.shape),
         }
     if method == "inhernet":
-        teacher = build_pair_model(dataset_name, pair_name, "teacher", dataset_spec.num_classes)
-        model = GenericInherNet(copy.deepcopy(teacher))
-        model.load_dense_state_dict(teacher.state_dict())
+        source_role = "student" if getattr(args, "compressed_source", "teacher") == "student" else "teacher"
+        dense_source = build_pair_model(dataset_name, pair_name, source_role, dataset_spec.num_classes).to(device)
+        model = GenericInherNet(copy.deepcopy(dense_source)).to(device)
+        model.load_dense_state_dict(dense_source.state_dict())
         rank = resolve_fixed_rank_with_override(args, pair_spec, rank_preset_override)
-        model.apply_svd(rank=rank, head_num=head_num)
-        output = model(sample)
+        svd_backend = model.apply_svd(rank=rank, head_num=head_num, svd_backend=args.svd_backend)
+        with torch.no_grad():
+            output = model(sample)
         return {
             "method": method,
             "shape": tuple(output.shape),
             "params": count_parameters(model),
             "rank": rank,
             "head_num": head_num,
+            "compressed_from": source_role,
+            "svd_backend": describe_svd_backend(svd_backend, device),
         }
     if method == "hetero":
-        teacher = build_pair_model(dataset_name, pair_name, "teacher", dataset_spec.num_classes)
-        model = GenericHeteroNet(copy.deepcopy(teacher))
-        model.load_dense_state_dict(teacher.state_dict())
-        rank_map, _ = model.apply_hetero_svd(
+        source_role = "student" if getattr(args, "compressed_source", "teacher") == "student" else "teacher"
+        dense_source = build_pair_model(dataset_name, pair_name, source_role, dataset_spec.num_classes).to(device)
+        model = GenericHeteroNet(copy.deepcopy(dense_source)).to(device)
+        model.load_dense_state_dict(dense_source.state_dict())
+        rank_map, svd_backend = model.apply_hetero_svd(
             calib_loader=calib_loader,
             head_num=head_num,
             budget_ratio=args.budget_ratio,
@@ -656,9 +753,12 @@ def run_single_method_smoke_test(
             compress_threshold=args.compress_threshold,
             temperature=args.hetero_temperature,
             max_calib_batches=min(args.max_calib_batches, len(calib_loader)),
+            svd_backend=args.svd_backend,
             expert_noise_scale=args.hetero_expert_noise_scale,
+            compress_linear=args.hetero_compress_linear,
         )
-        output = model(sample)
+        with torch.no_grad():
+            output = model(sample)
         assert args.compress_threshold > args.min_rank
         return {
             "method": method,
@@ -667,6 +767,8 @@ def run_single_method_smoke_test(
             "head_num": head_num,
             "rank_min": min(rank_map.values()),
             "rank_max": max(rank_map.values()),
+            "compressed_from": source_role,
+            "svd_backend": describe_svd_backend(svd_backend, device),
         }
     raise ValueError(f"Unknown method: {method}")
 
@@ -700,7 +802,13 @@ def run_single_method(args: argparse.Namespace) -> Path:
         )
     else:
         teacher_model, _ = train_teacher_pretrain(args, dataset_spec, settings, device, logger)
-        logger.info(f"Training {args.method} from scratch using the in-memory teacher.")
+        source_student_model = None
+        if args.method in {"inhernet", "hetero"} and args.compressed_source == "student":
+            source_student_model, _ = train_student_pretrain(args, dataset_spec, settings, device, logger)
+        logger.info(
+            f"Training {args.method} from scratch using compressed_source={args.compressed_source} "
+            "and the in-memory teacher for KD when requested."
+        )
         _, history, metadata = train_method_from_scratch(
             args,
             args.method,
@@ -710,6 +818,7 @@ def run_single_method(args: argparse.Namespace) -> Path:
             device,
             logger,
             teacher_model=teacher_model,
+            source_student_model=source_student_model,
         )
 
     plot_path = maybe_save_single_plot(plot_root, metadata, history, args.plot_mode, logger)
@@ -767,6 +876,7 @@ def run_suite(args: argparse.Namespace) -> Path:
     )
 
     teacher_model: nn.Module | None = None
+    source_student_model: nn.Module | None = None
     for spec in get_suite_run_specs(args.suite):
         label = str(spec["label"])
         method = str(spec["method"])
@@ -805,10 +915,17 @@ def run_suite(args: argparse.Namespace) -> Path:
                     suite_label=label,
                     rank_preset_override=rank_preset_override,
                 )
-                del model
+                if args.compressed_source == "student":
+                    source_student_model = model
+                else:
+                    del model
             else:
                 if teacher_model is None:
                     raise RuntimeError("Suite execution requires the teacher step to complete before dependent methods.")
+                if method in {"inhernet", "hetero"} and args.compressed_source == "student" and source_student_model is None:
+                    raise RuntimeError(
+                        "Suite execution with --compressed-source student requires a completed student step before compressed methods."
+                    )
                 model, history, metadata = train_method_from_scratch(
                     args,
                     method,
@@ -818,6 +935,7 @@ def run_suite(args: argparse.Namespace) -> Path:
                     device,
                     child_logger,
                     teacher_model=teacher_model,
+                    source_student_model=source_student_model,
                     suite_name=args.suite,
                     suite_label=label,
                     rank_preset_override=rank_preset_override,
@@ -876,9 +994,35 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--kd-temperature", type=float, default=None)
     parser.add_argument("--kd-weight", type=float, default=None)
     parser.add_argument("--ce-weight", type=float, default=None)
+    parser.add_argument(
+        "--legacy-eval-sticky",
+        action="store_true",
+        help=(
+            "Reproduce demo_code_org.py train/eval behavior, where epoch evaluation leaves the "
+            "model in eval mode for the next training epoch. This is for legacy comparison only."
+        ),
+    )
     parser.add_argument("--rank-preset", choices=["small", "large"], default="small")
     parser.add_argument("--rank", type=int, default=None)
     parser.add_argument("--head-num", type=int, default=None)
+    parser.add_argument(
+        "--compressed-source",
+        choices=["teacher", "student"],
+        default="teacher",
+        help="Dense model to decompose for InherNet/Hetero. teacher is the paper-style default; student matches demo_code_org.py.",
+    )
+    parser.add_argument(
+        "--compressed-train-mode",
+        choices=["distillation", "supervised"],
+        default="distillation",
+        help="Training objective for compressed InherNet/Hetero models after decomposition.",
+    )
+    parser.add_argument(
+        "--svd-backend",
+        choices=["auto", "device", "cpu"],
+        default="auto",
+        help="SVD backend for compressed models. auto tries the model device first and then CPU fallback.",
+    )
     parser.add_argument("--budget-ratio", type=float, default=0.35)
     parser.add_argument("--min-rank", type=int, default=8)
     parser.add_argument("--compress-threshold", type=int, default=12)
@@ -886,6 +1030,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--max-calib-batches", type=int, default=16)
     parser.add_argument("--aux-loss-weight", type=float, default=0.01)
     parser.add_argument("--hetero-expert-noise-scale", type=float, default=0.01)
+    parser.add_argument(
+        "--hetero-compress-linear",
+        action="store_true",
+        help="Also apply Hetero SVD to linear layers. The default keeps prior CIFAR experiments conv-only.",
+    )
     parser.add_argument("--plot-mode", choices=["none", "single", "compare", "both"], default="both")
     parser.add_argument("--plot-root", default=str(PROJECT_DIR / "results"))
     parser.add_argument("--smoke-test", action="store_true")

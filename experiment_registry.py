@@ -38,6 +38,7 @@ class TrainSettings:
     kd_loss_weight: float = 9.0
     ce_loss_weight: float = 0.1
     default_head_num: int = 3
+    legacy_eval_sticky: bool = False
 
 
 @dataclass(frozen=True)
@@ -143,11 +144,14 @@ def get_pair_spec(dataset_name: str, pair_name: str) -> Mapping[str, Any]:
 
 
 def get_role_name(pair_spec: Mapping[str, Any], role: str) -> str:
-    if role == "teacher":
-        return str(pair_spec.get("teacher_name", pair_spec["teacher"]))
-    if role == "student":
-        return str(pair_spec.get("student_name", pair_spec["student"]))
-    raise KeyError(f"Unknown role: {role}")
+    if role not in {"teacher", "student"}:
+        raise KeyError(f"Unknown role: {role}")
+    name_key = f"{role}_name"
+    if name_key in pair_spec:
+        return str(pair_spec[name_key])
+    if role in pair_spec:
+        return str(pair_spec[role])
+    raise KeyError(f"Pair spec is missing '{name_key}' or '{role}'.")
 
 
 def build_pair_model(dataset_name: str, pair_name: str, role: str, num_classes: int):
@@ -248,6 +252,8 @@ def resolve_train_settings(dataset_spec: DatasetSpec, args: argparse.Namespace) 
         settings = replace(settings, kd_loss_weight=args.kd_weight)
     if args.ce_weight is not None:
         settings = replace(settings, ce_loss_weight=args.ce_weight)
+    if getattr(args, "legacy_eval_sticky", False):
+        settings = replace(settings, legacy_eval_sticky=True)
     return settings
 
 
@@ -317,6 +323,12 @@ def build_method_tag(
         else:
             rank_source = "custom" if args.rank is not None else args.rank_preset
         tag = f"{rank_source}_rank_{rank}_heads_{head_num}"
+        compressed_source = getattr(args, "compressed_source", "teacher")
+        compressed_train_mode = getattr(args, "compressed_train_mode", "distillation")
+        if compressed_source != "teacher":
+            tag = f"{compressed_source}_source_{tag}"
+        if compressed_train_mode != "distillation":
+            tag = f"{tag}_{compressed_train_mode}"
     elif method == "hetero":
         tag = (
             f"heads_{head_num}_budget_{format_float_tag(args.budget_ratio)}_"
@@ -324,6 +336,14 @@ def build_method_tag(
             f"thr_{args.compress_threshold}_calib_{args.max_calib_batches}_"
             f"noise_{format_float_tag(args.hetero_expert_noise_scale)}"
         )
+        if args.hetero_compress_linear:
+            tag = f"{tag}_linear"
+        compressed_source = getattr(args, "compressed_source", "teacher")
+        compressed_train_mode = getattr(args, "compressed_train_mode", "distillation")
+        if compressed_source != "teacher":
+            tag = f"{compressed_source}_source_{tag}"
+        if compressed_train_mode != "distillation":
+            tag = f"{tag}_{compressed_train_mode}"
     else:
         raise ValueError(f"Unknown method: {method}")
     return tag

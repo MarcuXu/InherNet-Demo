@@ -44,6 +44,16 @@ Notes:
 Examples:
   Train all models for one CIFAR-100 pair for 5 epochs:
     ./run.sh --suite all --dataset cifar100 --pair resnet56_to_resnet20 -- --epochs 5 --download
+    ./run.sh --background --suite all --dataset cifar10 --pair resnet50_to_resnet18 -- --download
+    ./run.sh --background --suite all --dataset cifar10 --pair resnet50_to_resnet18_org -- --download --device cuda --epochs 100 --optimizer adam --lr 0.001 --weight-decay 0 --batch-size 256 --kd-temperature 7 --kd-weight 0.7 --ce-weight 0.3 --svd-backend auto
+
+./run.sh --background --suite all --dataset cifar10 --pair resnet50_to_resnet18_org -- \
+  --download --device cuda --epochs 100 --optimizer adam --lr 0.001 \
+  --weight-decay 0 --batch-size 256 --kd-temperature 7 --kd-weight 0.7 \
+  --ce-weight 0.3 --svd-backend auto \
+  --compressed-source student --compressed-train-mode supervised \
+  --legacy-eval-sticky
+
 
   Train only the comparison methods for one CIFAR-100 pair:
     ./run.sh --suite comparison --dataset cifar100 --pair resnet32_to_resnet8 -- --download

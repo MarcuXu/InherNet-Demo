@@ -21,8 +21,8 @@ _PLOT_THEME_APPLIED = False
 PLOT_METRIC_SPECS = (
     ("train_loss", "Loss", "Train Loss", None),
     ("test_loss", "Loss", "Test Loss", None),
-    ("train_accuracy", "Top-1 Accuracy (%)", "Train Accuracy", (0.0, 100.0)),
-    ("test_accuracy", "Top-1 Accuracy (%)", "Test Accuracy", (0.0, 100.0)),
+    ("train_accuracy", "Accuracy (%)", "Train Accuracy", (0.0, 100.0)),
+    ("test_accuracy", "Accuracy (%)", "Test Accuracy", (0.0, 100.0)),
 )
 
 

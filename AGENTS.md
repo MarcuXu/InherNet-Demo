@@ -13,7 +13,7 @@ The user is a PhD student in artificial intelligence and computer science. Treat
 - Do not create, edit, move, or delete files outside the workspace root, including parent directories, sibling projects, system directories, hidden global configuration files, or unrelated datasets.
 - Read-only environment discovery outside the workspace is allowed when needed to locate Python, conda, CUDA, or system package metadata for running this project. Keep this discovery narrow and do not print secrets or unrelated personal data.
 - Do not follow symlinks that resolve outside the workspace root unless the user explicitly authorizes it.
-- If a command would write outside the workspace, do not run it.
+- When testing the effect of your code changes, you can use 10 epochs for the test. For the smoke test, you can define the number of epochs to run yourself.
 - If external files, credentials, datasets, checkpoints, or system resources appear necessary, ask the user or provide a safe fallback inside the workspace. Prefer workspace-local temporary files, logs, caches, and virtual environments.
 
 ## General working procedure
@@ -43,29 +43,15 @@ Do not make broad refactors unless the user asks for them or they are required t
 
 Every time Codex runs, tests, debugs, formats, lints, type-checks, benchmarks, or otherwise executes Python-related code, it should use a project environment with the dependencies in `requirements.txt`.
 
-Preferred environment:
+Required environment:
 
 ```bash
+source /root/miniconda3/etc/profile.d/conda.sh
 conda activate inherdemo
 <command>
 ```
 
-If `conda` or the `inherdemo` environment is unavailable, use a workspace-local fallback instead of modifying system Python:
-
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -r requirements.txt
-<command>
-```
-
-When installing dependencies for the fallback environment, keep caches inside the workspace when practical, for example:
-
-```bash
-PIP_CACHE_DIR="$PWD/.cache/pip" python -m pip install -r requirements.txt
-```
-
-If neither conda nor a workspace-local virtual environment can provide the needed dependencies, run non-import checks such as `python3 -m py_compile` and report the blocker clearly.
+Non-interactive shells may not have `conda` on `PATH` until the profile script is sourced. If the `inherdemo` environment cannot be activated, do not install dependencies into system Python. Run only non-import checks that do not require project dependencies and report the environment blocker clearly.
 
 ## Python coding standards
 
@@ -113,7 +99,7 @@ For AI/ML code, pay special attention to:
 * Batch-size-dependent behavior.
 * Evaluation code matching the stated experimental protocol.
 
-Do not change experimental semantics casually. If a requested code improvement may alter reported results, make that explicit.
+You may change experimental semantics if you are requested to do so. If any finalized code modification alters reported results, state this explicitly.
 
 ## Testing and validation
 
@@ -131,7 +117,7 @@ python -m pyright
 python -m unittest
 ```
 
-All such commands should be run inside the active project environment described above.
+All such commands must be run inside the active `inherdemo` conda environment described above.
 
 When tests cannot be run:
 
@@ -162,8 +148,6 @@ Before adding a dependency:
 1. Check whether the project already has an equivalent dependency.
 2. Prefer standard-library solutions when adequate.
 3. Consider reproducibility and environment stability.
-4. Ask the user before adding new heavy dependencies, especially ML, CUDA, distributed-computing, or data-processing packages.
-
 
 ## File and data safety
 

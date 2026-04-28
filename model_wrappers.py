@@ -91,8 +91,6 @@ class GatedSumLinear(nn.Module):
         self.linear_list = linear_list
         self.head_num = head_num
         self.gate = nn.Linear(input_dim, head_num)
-        nn.init.zeros_(self.gate.weight)
-        nn.init.zeros_(self.gate.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim > 2:
@@ -109,8 +107,6 @@ class GatedSumConv2d(nn.Module):
         self.conv_list = conv_list
         self.head_num = head_num
         self.gate = nn.Linear(input_dim, head_num)
-        nn.init.zeros_(self.gate.weight)
-        nn.init.zeros_(self.gate.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size = x.shape[0]
@@ -348,10 +344,10 @@ class GenericInherNet(BackboneWrapper):
 
 
 class GenericHeteroNet(BackboneWrapper):
-    def _collect_hetero_target_layers(self) -> OrderedDict[str, nn.Module]:
+    def _collect_hetero_target_layers(self, include_linear: bool = False) -> OrderedDict[str, nn.Module]:
         layers: OrderedDict[str, nn.Module] = OrderedDict()
         for name, module in self.backbone.named_modules():
-            if isinstance(module, nn.Conv2d):
+            if isinstance(module, nn.Conv2d) or (include_linear and isinstance(module, nn.Linear)):
                 layers[name] = module
         return layers
 
@@ -454,8 +450,9 @@ class GenericHeteroNet(BackboneWrapper):
         calib_loader: DataLoader,
         max_batches: int = 16,
         eps: float = 1e-5,
+        include_linear: bool = False,
     ) -> dict[str, torch.Tensor]:
-        target_layers = self._collect_hetero_target_layers()
+        target_layers = self._collect_hetero_target_layers(include_linear=include_linear)
         stats = {
             name: {"sum": None, "sum_outer": None, "count": 0}
             for name in target_layers.keys()
@@ -520,8 +517,9 @@ class GenericHeteroNet(BackboneWrapper):
         covariances: Mapping[str, torch.Tensor],
         *,
         svd_backend: str,
+        include_linear: bool = False,
     ) -> tuple[dict[str, float], dict[str, int], dict[str, dict[str, torch.Tensor]]]:
-        target_layers = self._collect_hetero_target_layers()
+        target_layers = self._collect_hetero_target_layers(include_linear=include_linear)
         entropies: dict[str, float] = {}
         max_ranks: dict[str, int] = {}
         svd_cache: dict[str, dict[str, torch.Tensor]] = {}
@@ -663,6 +661,52 @@ class GenericHeteroNet(BackboneWrapper):
             use_uncompressed_gate,
         )
 
+    def _replace_linear_with_hetero_svd(
+        self,
+        module: nn.Linear,
+        rank: int,
+        head_num: int,
+        compress_threshold: int,
+        svd_pack: Mapping[str, torch.Tensor],
+        expert_noise_scale: float,
+    ) -> nn.Module:
+        u = svd_pack["u"]
+        s = svd_pack["s"]
+        v_h = svd_pack["v_h"]
+        whiten_inv = svd_pack["whiten_inv"]
+        rank = max(1, min(rank, s.numel()))
+        u_trunc = u[:, :rank]
+        s_trunc = s[:rank]
+        v_h_trunc = v_h[:rank, :]
+        s_sqrt = torch.sqrt(torch.clamp(s_trunc, min=1e-12))
+        linear1_weight = (torch.diag(s_sqrt) @ v_h_trunc @ whiten_inv).contiguous()
+        linear1 = nn.Linear(module.in_features, rank, bias=False)
+        linear1.weight.data = linear1_weight
+        expert_weight = (u_trunc @ torch.diag(s_sqrt)).contiguous()
+        expert_noise = self._build_zero_mean_expert_noise(
+            expert_weight,
+            head_num,
+            expert_noise_scale,
+        )
+        expert_layers = nn.ModuleList()
+        for head_idx in range(head_num):
+            linear2 = nn.Linear(rank, module.out_features, bias=module.bias is not None)
+            linear2.weight.data = expert_weight.clone()
+            if expert_noise is not None:
+                linear2.weight.data.add_(expert_noise[head_idx])
+            if module.bias is not None:
+                linear2.bias.data = module.bias.data.clone()
+            expert_layers.append(linear2)
+        use_uncompressed_gate = rank < compress_threshold
+        gate_input_dim = module.in_features if use_uncompressed_gate else rank
+        return DecoupledGatedSVDLinear(
+            linear1,
+            expert_layers,
+            gate_input_dim,
+            head_num,
+            use_uncompressed_gate,
+        )
+
     def _replace_module_with_hetero_svd(
         self,
         module: nn.Module,
@@ -674,6 +718,16 @@ class GenericHeteroNet(BackboneWrapper):
     ) -> nn.Module:
         if isinstance(module, nn.Conv2d):
             replacement = self._replace_conv_with_hetero_svd(
+                module,
+                rank,
+                head_num,
+                compress_threshold,
+                svd_pack,
+                expert_noise_scale,
+            )
+            return self._match_module_device_dtype(replacement, module)
+        if isinstance(module, nn.Linear):
+            replacement = self._replace_linear_with_hetero_svd(
                 module,
                 rank,
                 head_num,
@@ -695,18 +749,21 @@ class GenericHeteroNet(BackboneWrapper):
         max_calib_batches: int = 16,
         svd_backend: str = SVD_BACKEND_AUTO,
         expert_noise_scale: float = 0.01,
+        compress_linear: bool = False,
     ) -> tuple[dict[str, int], str]:
         last_error: StableSVDDecompositionError | None = None
         reference_device = next(self.parameters()).device
         covariances = self._estimate_input_covariances(
             calib_loader,
             max_batches=max_calib_batches,
+            include_linear=compress_linear,
         )
         for backend in _candidate_svd_backends(reference_device, svd_backend):
             try:
                 entropies, max_ranks, svd_cache = self._compute_spectral_entropies(
                     covariances,
                     svd_backend=backend,
+                    include_linear=compress_linear,
                 )
                 rank_map = self._allocate_ranks_by_entropy(
                     entropies,
@@ -716,7 +773,7 @@ class GenericHeteroNet(BackboneWrapper):
                     temperature=temperature,
                 )
                 replacements: list[tuple[nn.Module, str, nn.Module]] = []
-                for name, module in self._collect_hetero_target_layers().items():
+                for name, module in self._collect_hetero_target_layers(include_linear=compress_linear).items():
                     parent, child_name = self._get_parent_module(name)
                     replacement = self._replace_module_with_hetero_svd(
                         module,
