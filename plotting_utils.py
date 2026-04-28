@@ -24,6 +24,12 @@ PLOT_METRIC_SPECS = (
     ("train_accuracy", "Accuracy (%)", "Train Accuracy", (0.0, 100.0)),
     ("test_accuracy", "Accuracy (%)", "Test Accuracy", (0.0, 100.0)),
 )
+CIFAR100_PLOT_METRIC_SPECS = (
+    ("train_loss", "Loss", "Train Loss", None),
+    ("test_loss", "Loss", "Test Loss", None),
+    ("train_accuracy", "Top-1 Accuracy (%)", "Train Top-1", (0.0, 100.0)),
+    ("test_accuracy", "Top-1 Accuracy (%)", "Test Top-1", (0.0, 100.0)),
+)
 
 
 def get_pyplot(plot_mode: str):
@@ -83,6 +89,12 @@ def apply_publication_plot_theme(plt) -> None:
 def history_has_curves(history: Mapping[str, Any] | None) -> bool:
     normalized = normalize_history(history)
     return any(normalized[key] for key, *_ in PLOT_METRIC_SPECS)
+
+
+def get_plot_metric_specs(dataset_name: str):
+    if dataset_name == "cifar100":
+        return CIFAR100_PLOT_METRIC_SPECS
+    return PLOT_METRIC_SPECS
 
 
 def get_plot_method_key(method: str, metadata: Mapping[str, Any]) -> str:
@@ -330,7 +342,8 @@ def plot_single_history(
     plt = get_pyplot(plot_mode)
 
     fig, axes = plt.subplots(2, 2, figsize=(11.9, 8.2), dpi=300)
-    for axis, (metric_key, ylabel, title, clamp) in zip(axes.flatten(), PLOT_METRIC_SPECS, strict=True):
+    metric_specs = get_plot_metric_specs(dataset_name)
+    for axis, (metric_key, ylabel, title, clamp) in zip(axes.flatten(), metric_specs, strict=True):
         plot_single_metric_panel(axis, list(history.get(metric_key, [])), style, ylabel, title, clamp)
 
     summary_text = build_metric_summary(history)
@@ -490,7 +503,8 @@ def plot_comparison_histories_from_records(
     plt = get_pyplot(plot_mode)
 
     fig, axes = plt.subplots(2, 2, figsize=(13.7, 8.5), dpi=300)
-    for axis, (metric_key, ylabel, title, clamp) in zip(axes.flatten(), PLOT_METRIC_SPECS, strict=True):
+    metric_specs = get_plot_metric_specs(dataset_name)
+    for axis, (metric_key, ylabel, title, clamp) in zip(axes.flatten(), metric_specs, strict=True):
         plot_comparison_metric_panel(axis, records, metric_key, ylabel, title, clamp)
 
     handles = []

@@ -316,50 +316,65 @@ MODEL_REGISTRY: Dict[str, Callable[[int], nn.Module]] = {
 }
 
 
+CIFAR100_INHERNET_WORKFLOW_DEFAULTS = {
+    "compressed_source": "teacher",
+    "compressed_train_mode": "distillation",
+    "model_profile": "paper_cifar100_teacher_inheritance",
+}
+
+
 PAIR_REGISTRY: Dict[str, Mapping[str, object]] = {
     "resnet32_to_resnet8": {
+        **CIFAR100_INHERNET_WORKFLOW_DEFAULTS,
         "teacher": "resnet32",
         "student": "resnet8",
         "rank_presets": {"small": 4, "large": 8},
         "default_head_num": 3,
     },
     "resnet32x4_to_resnet8x4": {
+        **CIFAR100_INHERNET_WORKFLOW_DEFAULTS,
         "teacher": "resnet32x4",
         "student": "resnet8x4",
         "rank_presets": {"small": 4, "large": 8},
         "default_head_num": 3,
     },
     "vgg13_to_vgg8": {
+        **CIFAR100_INHERNET_WORKFLOW_DEFAULTS,
         "teacher": "vgg13",
         "student": "vgg8",
         "rank_presets": {"small": 128, "large": 256},
         "default_head_num": 3,
     },
     "wrn40_2_to_wrn40_1": {
+        **CIFAR100_INHERNET_WORKFLOW_DEFAULTS,
         "teacher": "wrn_40_2",
         "student": "wrn_40_1",
         "rank_presets": {"small": 16, "large": 32},
         "default_head_num": 3,
     },
     "wrn40_2_to_wrn16_2": {
+        **CIFAR100_INHERNET_WORKFLOW_DEFAULTS,
         "teacher": "wrn_40_2",
         "student": "wrn_16_2",
         "rank_presets": {"small": 16, "large": 32},
         "default_head_num": 3,
     },
     "resnet56_to_resnet20": {
+        **CIFAR100_INHERNET_WORKFLOW_DEFAULTS,
         "teacher": "resnet56",
         "student": "resnet20",
         "rank_presets": {"small": 8, "large": 16},
         "default_head_num": 3,
     },
     "resnet110_to_resnet32": {
+        **CIFAR100_INHERNET_WORKFLOW_DEFAULTS,
         "teacher": "resnet110",
         "student": "resnet32",
         "rank_presets": {"small": 8, "large": 32},
         "default_head_num": 3,
     },
     "resnet110_to_resnet20": {
+        **CIFAR100_INHERNET_WORKFLOW_DEFAULTS,
         "teacher": "resnet110",
         "student": "resnet20",
         "rank_presets": {"small": 4, "large": 8},

@@ -22,6 +22,21 @@ PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SUITE_LOG_DIR_ENV_VAR = "INHERNET_SUITE_LOG_DIR"
 METHOD_CHOICES = ["teacher", "student", "student_kd", "inhernet", "hetero"]
+TRAIN_SETTING_OVERRIDE_KEYS = {
+    "optimizer_name",
+    "batch_size",
+    "epochs",
+    "lr",
+    "momentum",
+    "weight_decay",
+    "lr_milestones",
+    "lr_gamma",
+    "kd_temperature",
+    "kd_loss_weight",
+    "ce_loss_weight",
+    "default_head_num",
+    "legacy_eval_sticky",
+}
 
 
 @dataclass(frozen=True)
@@ -232,8 +247,18 @@ def sanitize_tag(tag: str) -> str:
     return tag.replace("/", "_").replace(" ", "_")
 
 
-def resolve_train_settings(dataset_spec: DatasetSpec, args: argparse.Namespace) -> TrainSettings:
+def resolve_train_settings(
+    dataset_spec: DatasetSpec,
+    args: argparse.Namespace,
+    pair_spec: Mapping[str, Any] | None = None,
+) -> TrainSettings:
     settings = dataset_spec.train_settings
+    if pair_spec is not None:
+        train_defaults = pair_spec.get("train_defaults", {})
+        for key, value in train_defaults.items():
+            if key not in TRAIN_SETTING_OVERRIDE_KEYS:
+                raise ValueError(f"Unknown train_defaults key: {key}")
+            settings = replace(settings, **{key: value})
     if args.optimizer is not None:
         settings = replace(settings, optimizer_name=args.optimizer)
     if args.batch_size is not None:
@@ -255,6 +280,24 @@ def resolve_train_settings(dataset_spec: DatasetSpec, args: argparse.Namespace) 
     if getattr(args, "legacy_eval_sticky", False):
         settings = replace(settings, legacy_eval_sticky=True)
     return settings
+
+
+def resolve_compressed_source(args: argparse.Namespace, pair_spec: Mapping[str, Any]) -> str:
+    source = getattr(args, "compressed_source", None)
+    if source is None:
+        source = pair_spec.get("compressed_source", "teacher")
+    if source not in {"teacher", "student"}:
+        raise ValueError(f"Unsupported compressed source: {source}")
+    return str(source)
+
+
+def resolve_compressed_train_mode(args: argparse.Namespace, pair_spec: Mapping[str, Any]) -> str:
+    train_mode = getattr(args, "compressed_train_mode", None)
+    if train_mode is None:
+        train_mode = pair_spec.get("compressed_train_mode", "distillation")
+    if train_mode not in {"distillation", "supervised"}:
+        raise ValueError(f"Unsupported compressed training mode: {train_mode}")
+    return str(train_mode)
 
 
 def resolve_head_num(args: argparse.Namespace, pair_spec: Mapping[str, Any], settings: TrainSettings) -> int:
@@ -323,8 +366,8 @@ def build_method_tag(
         else:
             rank_source = "custom" if args.rank is not None else args.rank_preset
         tag = f"{rank_source}_rank_{rank}_heads_{head_num}"
-        compressed_source = getattr(args, "compressed_source", "teacher")
-        compressed_train_mode = getattr(args, "compressed_train_mode", "distillation")
+        compressed_source = resolve_compressed_source(args, pair_spec)
+        compressed_train_mode = resolve_compressed_train_mode(args, pair_spec)
         if compressed_source != "teacher":
             tag = f"{compressed_source}_source_{tag}"
         if compressed_train_mode != "distillation":
@@ -338,8 +381,8 @@ def build_method_tag(
         )
         if args.hetero_compress_linear:
             tag = f"{tag}_linear"
-        compressed_source = getattr(args, "compressed_source", "teacher")
-        compressed_train_mode = getattr(args, "compressed_train_mode", "distillation")
+        compressed_source = resolve_compressed_source(args, pair_spec)
+        compressed_train_mode = resolve_compressed_train_mode(args, pair_spec)
         if compressed_source != "teacher":
             tag = f"{compressed_source}_source_{tag}"
         if compressed_train_mode != "distillation":

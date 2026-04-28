@@ -6,6 +6,20 @@ import torch.nn as nn
 from torchvision.models import resnet18, resnet50
 
 
+DEMO_CODE_ORG_TRAIN_DEFAULTS = {
+    "optimizer_name": "adam",
+    "batch_size": 256,
+    "epochs": 100,
+    "lr": 0.001,
+    "weight_decay": 0.0,
+    "lr_milestones": (),
+    "kd_temperature": 7.0,
+    "kd_loss_weight": 0.7,
+    "ce_loss_weight": 0.3,
+    "legacy_eval_sticky": True,
+}
+
+
 def build_torchvision_resnet(arch: str, num_classes: int, *, cifar_stem: bool) -> nn.Module:
     if arch == "resnet18":
         model = resnet18(num_classes=num_classes)
@@ -62,6 +76,9 @@ PAIR_REGISTRY: dict[str, Mapping[str, object]] = {
         "rank_presets": {"small": 32, "large": 64},
         "default_head_num": 3,
         "model_profile": "demo_code_org_torchvision_stem",
+        "train_defaults": DEMO_CODE_ORG_TRAIN_DEFAULTS,
+        "compressed_source": "student",
+        "compressed_train_mode": "supervised",
     },
     "resnet50_to_resnet18_torchvision_stem": {
         "teacher_name": "resnet50_org",
@@ -71,6 +88,9 @@ PAIR_REGISTRY: dict[str, Mapping[str, object]] = {
         "rank_presets": {"small": 32, "large": 64},
         "default_head_num": 3,
         "model_profile": "demo_code_org_torchvision_stem",
+        "train_defaults": DEMO_CODE_ORG_TRAIN_DEFAULTS,
+        "compressed_source": "student",
+        "compressed_train_mode": "supervised",
     },
 }
 

@@ -20,6 +20,8 @@ from experiment_registry import (
     build_pair_model,
     get_pair_spec,
     get_role_name,
+    resolve_compressed_source,
+    resolve_compressed_train_mode,
     resolve_train_settings,
 )
 from model_wrappers import DecoupledGatedSVDLinear, GenericHeteroNet, GenericInherNet
@@ -74,7 +76,7 @@ class RegistryTests(unittest.TestCase):
         self.assertIsInstance(org_stem_model.maxpool, nn.MaxPool2d)
         self.assertEqual(count_parameters(org_stem_model) - count_parameters(cifar_stem_model), 7680)
 
-    def test_original_compatibility_options_are_explicit_in_tags_and_settings(self) -> None:
+    def test_original_compatibility_pair_defaults_match_demo_code_org(self) -> None:
         parser = build_argparser()
         args = parser.parse_args(
             [
@@ -84,19 +86,49 @@ class RegistryTests(unittest.TestCase):
                 "resnet50_to_resnet18_org",
                 "--method",
                 "inhernet",
-                "--compressed-source",
-                "student",
-                "--compressed-train-mode",
-                "supervised",
-                "--legacy-eval-sticky",
             ]
         )
-        settings = resolve_train_settings(DATASET_REGISTRY[args.dataset], args)
         pair = get_pair_spec(args.dataset, args.pair)
+        settings = resolve_train_settings(DATASET_REGISTRY[args.dataset], args, pair)
 
         self.assertTrue(settings.legacy_eval_sticky)
+        self.assertEqual(settings.optimizer_name, "adam")
+        self.assertEqual(settings.batch_size, 256)
+        self.assertEqual(settings.epochs, 100)
+        self.assertEqual(settings.lr, 0.001)
+        self.assertEqual(settings.weight_decay, 0.0)
+        self.assertEqual(settings.lr_milestones, ())
+        self.assertEqual(settings.kd_temperature, 7.0)
+        self.assertEqual(settings.kd_loss_weight, 0.7)
+        self.assertEqual(settings.ce_loss_weight, 0.3)
+        self.assertEqual(resolve_compressed_source(args, pair), "student")
+        self.assertEqual(resolve_compressed_train_mode(args, pair), "supervised")
         self.assertEqual(build_method_tag("inhernet", args, pair, settings), "student_source_small_rank_32_heads_3_supervised")
         self.assertIn("student_source_", build_method_tag("hetero", args, pair, settings))
+
+    def test_cifar100_pair_defaults_remain_paper_style_teacher_kd(self) -> None:
+        parser = build_argparser()
+        args = parser.parse_args(
+            [
+                "--dataset",
+                "cifar100",
+                "--pair",
+                "resnet56_to_resnet20",
+                "--method",
+                "inhernet",
+            ]
+        )
+        pair = get_pair_spec(args.dataset, args.pair)
+        settings = resolve_train_settings(DATASET_REGISTRY[args.dataset], args, pair)
+
+        self.assertFalse(settings.legacy_eval_sticky)
+        self.assertEqual(settings.optimizer_name, "sgd")
+        self.assertEqual(settings.batch_size, 64)
+        self.assertEqual(settings.epochs, 240)
+        self.assertEqual(settings.lr_milestones, (150, 180, 210))
+        self.assertEqual(resolve_compressed_source(args, pair), "teacher")
+        self.assertEqual(resolve_compressed_train_mode(args, pair), "distillation")
+        self.assertEqual(build_method_tag("inhernet", args, pair, settings), "small_rank_8_heads_3")
 
 
 class WrapperTests(unittest.TestCase):

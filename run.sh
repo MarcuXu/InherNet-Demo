@@ -40,41 +40,24 @@ Command structure:
 Notes:
   Suite runs are always serial and train all requested models from scratch.
   Shared options such as --epochs, --download, and --plot-mode must come after -- in suite mode.
+  Pair defaults choose the workflow. For example, resnet50_to_resnet18_org uses demo_code_org.py
+  settings by default, while CIFAR-100 pairs use paper-style teacher inheritance with KD.
 
 Examples:
-  Train all models for one CIFAR-100 pair for 5 epochs:
-    ./run.sh --suite all --dataset cifar100 --pair resnet56_to_resnet20 -- --epochs 5 --download
-    ./run.sh --background --suite all --dataset cifar10 --pair resnet50_to_resnet18 -- --download
-    ./run.sh --background --suite all --dataset cifar10 --pair resnet50_to_resnet18_org -- --download --device cuda --epochs 100 --optimizer adam --lr 0.001 --weight-decay 0 --batch-size 256 --kd-temperature 7 --kd-weight 0.7 --ce-weight 0.3 --svd-backend auto
+  Original demo_code_org.py-style CIFAR-10 suite:
+    ./run.sh --background --suite all --dataset cifar10 --pair resnet50_to_resnet18_org -- --download --device cuda
 
-./run.sh --background --suite all --dataset cifar10 --pair resnet50_to_resnet18_org -- \
-  --download --device cuda --epochs 100 --optimizer adam --lr 0.001 \
-  --weight-decay 0 --batch-size 256 --kd-temperature 7 --kd-weight 0.7 \
-  --ce-weight 0.3 --svd-backend auto \
-  --compressed-source student --compressed-train-mode supervised \
-  --legacy-eval-sticky
+  Paper-style CIFAR-100 suite:
+    ./run.sh --background --suite all --dataset cifar100 --pair resnet56_to_resnet20 -- --download --device cuda
 
-
-  Train only the comparison methods for one CIFAR-100 pair:
-    ./run.sh --suite comparison --dataset cifar100 --pair resnet32_to_resnet8 -- --download
-
-  Run one suite in the background with nohup-managed logs and PID reporting:
-    ./run.sh --background --suite all --dataset cifar100 --pair resnet56_to_resnet20 -- --download
+  Short smoke test without plots:
+    ./run.sh --suite all --dataset cifar10 --pair resnet50_to_resnet18_org -- --smoke-test --plot-mode none
 
   Run one CIFAR-100 method directly:
     ./run.sh --dataset cifar100 --pair vgg13_to_vgg8 --method hetero --download
 
-  Quick CIFAR-10 single-model smoke test:
-    ./run.sh --dataset cifar10 --pair resnet50_to_resnet18 --method teacher --smoke-test --plot-mode none
-
-  Single run in the background with nohup-managed logging:
-    ./run.sh --background --dataset cifar100 --pair resnet56_to_resnet20 --method student_kd --download
-
   Single run with a custom log path:
     ./run.sh --log-file logs/custom_teacher.log --dataset cifar100 --pair resnet56_to_resnet20 --method teacher --download
-
-  If the dataset is already present locally, omit --download:
-    ./run.sh --dataset cifar100 --pair resnet56_to_resnet20 --method teacher
 
   Use a different Python interpreter explicitly:
     PYTHON_BIN=/path/to/python ./run.sh --dataset cifar100 --pair vgg13_to_vgg8 --method inhernet --rank-preset large --download
