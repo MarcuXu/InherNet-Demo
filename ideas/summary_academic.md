@@ -1,211 +1,402 @@
-# Methods Draft (Ready-to-Paste): From InherNet to **HeteroInherNet-IB**
+# HeteroInherNet-IB: Paper Framework and Revision Notes
 
-> This section summarizes the original InherNet in *Beyond Student: An Asymmetric Network for Neural Network Inheritance* (arXiv:2602.09509), and presents our latest revised heterogeneous variant.  
-> We adopt the naming style common in top AI venues and denote the revised method as **HeteroInherNet-IB** (Information-Bottleneck-Driven Heterogeneous Neural Network Inheritance).
+This document is a writing guide for a possible Hetero paper built on
+InherNet.  It intentionally separates the paper narrative from engineering
+details.  The paper does not need to describe every implementation branch, but
+the theoretical claims must be stated with assumptions that we can defend.
 
----
+Working title:
 
-## 1. Preliminaries and Notation
+**HeteroInherNet-IB: Data-Aware Heterogeneous Neural Network Inheritance**
 
-Let a pretrained teacher layer weight be $W \in \mathbb{R}^{m \times n}$ with SVD
-$$
-W = U\Sigma V^\top.
-$$
-For truncated rank $r$,
-$$
-W_r = U_r\Sigma_r V_r^\top,
-$$
-and by Eckart–Young–Mirsky,
-$$
-\|W - W_r\|_F^2 = \sum_{i=r+1}^{\min(m,n)} \sigma_i^2(W).
-$$
-
-For convolution kernels $K \in \mathbb{R}^{N \times c \times k_w \times k_h}$, channel decomposition reshapes $K$ into $\hat K \in \mathbb{R}^{N \times (c k_w k_h)}$ before SVD.
+The `IB` suffix should be used only if the final theory section contains a
+clear information-bottleneck or rate-distortion derivation.  Otherwise, a safer
+title is **HeteroInherNet: Data-Aware Heterogeneous Neural Network
+Inheritance**.
 
 ---
 
-## 2. Original InherNet (Uniform NNI)
+## 1. What InherNet Actually Contributes
 
-### 2.1 Knowledge inheritance via low-rank factorization
+InherNet starts from a pretrained dense source network and constructs an
+inheriting network by low-rank factorizing full weights.  This is different
+from LoRA-style adaptation, where the pretrained weight is frozen and low-rank
+matrices parameterize a task-specific weight update.
 
-InherNet approximates full pretrained teacher weights (not LoRA-style updates), and initializes low-rank factors from top singular components:
+For a weight matrix
 $$
-W \approx U_r\Sigma_rV_r^\top.
+W \in \mathbb{R}^{m \times n}, \qquad W = U\Sigma V^\top,
 $$
-The factorized module uses two projections with asymmetric expert reconstruction.
+the rank-$r$ approximation is
+$$
+W_r = U_r \Sigma_r V_r^\top .
+$$
+For a layer acting as $y = Wx$, the conventional two-factor initialization is
+$$
+W^{\mathrm{down}} = \Sigma_r^{1/2}V_r^\top,\qquad
+W^{\mathrm{up}} = U_r\Sigma_r^{1/2}.
+$$
+Some papers or codebases transpose this notation depending on whether features
+are represented as row or column vectors.  The paper should therefore emphasize
+the factorization principle rather than over-commit to a notation that creates
+dimension confusion.
 
-### 2.2 Structure inheritance via one-down-many-ups
+For convolution kernels, the channel-decomposition view reshapes a kernel
+$K\in \mathbb{R}^{c_{\mathrm{out}}\times c_{\mathrm{in}}\times k_h\times k_w}$
+into a matrix
+$\widehat K\in\mathbb{R}^{c_{\mathrm{out}}\times (c_{\mathrm{in}}k_hk_w)}$
+before SVD.
 
-Given input $X$, InherNet defines
+InherNet's structure inheritance uses a one-down-many-ups module:
 $$
-Y = \sum_{h=1}^{H} G_h(X)\, W_h^{\text{up}}\big(W^{\text{down}}(X)\big),
-$$
-where $H$ is expert count, and gating is
-$$
-G(X) = \text{softmax}(W_g(X)).
-$$
-
-The paper initializes (asymmetric design):
-$$
-W^{\text{down}} \leftarrow U_r\Sigma_r^{1/2},
+Y = \sum_{h=1}^{H} G_h(X)\, W_h^{\mathrm{up}}
+        \bigl(W^{\mathrm{down}}(X)\bigr),
 \qquad
-W_h^{\text{up}} \leftarrow \frac{1}{H}\Sigma_r^{1/2}V_r^\top.
+G(X)=\mathrm{softmax}(W_g\phi(X)).
 $$
+Here $\phi(X)$ is a pooled or flattened routing feature.  The main message is:
 
-### 2.3 Core theoretical insights from the original paper
-
-- **Convergence**: under standard non-convex SGD assumptions (Lipschitz gradient, bounded variance), InherNet achieves $\mathcal{O}(1/T)$ stationarity rate.
-- **Conditioning benefit**: orthonormal SVD initialization improves optimization conditioning (effective smoother landscape).
-- **Efficiency–expressivity tradeoff**: parameter reduction bounds are established for low-rank + multi-head parameterization; representational power is argued to be preserved with proper rank/head selection.
-- **Empirical insight in the paper**: rank is primary for inheritance quality; multiple heads help but with diminishing returns.
+- SVD initialization transfers principal spectral knowledge from the dense
+  source.
+- Rank $r$ is the main knob controlling inherited knowledge.
+- Multiple heads can improve specialization, but the benefit is secondary and
+  empirically/theoretically diminishing.
+- The original convergence discussion should be treated as conditional on
+  standard nonconvex SGD assumptions, not as a universal guarantee.
 
 ---
 
-## 3. Revised Method: **HeteroInherNet-IB**
+## 2. Corrections to the Previous Drafts
 
-We retain the InherNet asymmetric inheritance backbone but replace static, heuristic rank design with data-aware heterogeneous allocation and optimization-stable training.
+The earlier Markdown and LaTeX drafts contained several claims that should be
+softened or corrected before becoming a paper.
 
-### 3.1 Inheritance source correction (Issue 1)
+1. **Do not claim that Hetero preserves InherNet's guarantees without
+   assumptions.**
+   It is safer to say that Hetero keeps the same differentiable
+   one-down-many-ups parameterization, so an analogous stationarity analysis can
+   be obtained under the same smoothness/variance assumptions plus bounded
+   routing and bounded auxiliary gradients.
 
-A critical correction is to avoid decomposing random weights. In our final setup we choose **copy-based inheritance source**:
-- train baseline inherited model first,
-- copy trained backbone weights to the heterogeneous base,
-- then perform heterogeneous decomposition.
+2. **Do not claim information-bottleneck optimality.**
+   We can claim IB consistency or a rate-distortion motivation.  A full IB
+   optimality theorem requires a specific probabilistic model, e.g.,
+   linear-Gaussian activations and task-relevance assumptions.
 
-Formally:
+3. **Do not present copy-based inheritance as the only valid source.**
+   The key paper principle is **trained-source inheritance**.  The source may be
+   a trained teacher, a trained compact baseline, or a copied trained base.  In
+   the current code, CIFAR-100 paper-style pairs decompose the trained teacher,
+   while the CIFAR-10 `demo_code_org.py` compatibility pair decomposes a trained
+   student source.
+
+4. **Do not put engineering cache reuse in the core contribution list.**
+   Spectral cache reuse is useful and should appear in implementation details or
+   appendix, but it is not the paper's theoretical novelty.
+
+5. **Fix the KD direction.**
+   The distillation loss used by PyTorch `kl_div(log_softmax(student),
+   softmax(teacher))` corresponds to
+   $\mathrm{KL}(p_{\mathrm{teacher}}\|p_{\mathrm{student}})$ up to the usual
+   temperature scaling.
+
+6. **Align practical defaults with the current code.**
+   The current Hetero defaults are budget ratio `0.35`, min rank `8`, entropy
+   temperature `1.4`, routing threshold/compression threshold `12`, calibration
+   batches `16`, expert noise scale `0.01`, and balance weight `0.01`.
+
+---
+
+## 3. Proposed Method: HeteroInherNet-IB
+
+HeteroInherNet keeps InherNet's asymmetric inheritance backbone but changes
+rank selection from a uniform hyperparameter to a data-aware layer-wise budget.
+
+### 3.1 Trained-Source Inheritance
+
+The decomposed weights must already encode task knowledge:
 $$
-\theta_{\text{hetero-base}} \leftarrow \theta_{\text{trained baseline}}.
+\theta_{\mathrm{source}}\in
+\{\theta_{\mathrm{teacher}},\theta_{\mathrm{trained\ compact}},
+\theta_{\mathrm{copied\ base}}\}.
 $$
+The paper should describe this as a design principle:
 
-This restores the fundamental inheritance assumption: decomposition should act on meaningful pretrained spectra.
+> HeteroInherNet decomposes a trained source network, not random weights.
 
-### 3.2 Activation whitening before decomposition
+The exact source can be dataset/protocol dependent.  This avoids forcing the
+CIFAR-10 legacy workflow and the CIFAR-100 paper-style workflow into one
+incorrect statement.
 
-Instead of decomposing $W$ directly, compute activation covariance from a calibration set:
-$$
-\Sigma_x = \frac{1}{N}XX^\top = CC^\top,
-$$
-and whitened weights
-$$
-\tilde W = W C.
-$$
-SVD is applied to $\tilde W$, improving data alignment of spectral structure.
+### 3.2 Data-Weighted Spectral Analysis
 
-### 3.3 Spectral-entropy-driven heterogeneous rank allocation
+Uniform SVD minimizes Frobenius error in weight space.  Hetero instead estimates
+an activation covariance from a calibration set and analyzes the data-weighted
+operator.
 
-For each layer $l$ with singular values of $\tilde W_l$, we use squared-spectrum distribution:
+For a linear layer, or for a convolutional layer under a channel-covariance
+approximation:
 $$
-p_{l,i} = \frac{\sigma_{l,i}^2}{\sum_j \sigma_{l,j}^2},
+\Sigma_x = \mathbb{E}[\phi(X)\phi(X)^\top] + \epsilon I,\qquad
+\Sigma_x = CC^\top,
+$$
+and
+$$
+\widetilde W = W C.
+$$
+The SVD of $\widetilde W$ minimizes the data-weighted reconstruction error
+$$
+\|W-\widehat W\|_{\Sigma_x}^2
+= \mathrm{tr}\left((W-\widehat W)\Sigma_x(W-\widehat W)^\top\right).
+$$
+For CNNs, the implementation uses a tractable channel-wise covariance rather
+than the full im2col covariance.  The paper can present the full linear theorem
+and state the channel version as the practical convolutional approximation.
+
+### 3.3 Spectral-Entropy Rank Allocation
+
+For layer $l$, let $\{\tilde\sigma_{l,i}\}$ be singular values of the
+data-weighted operator.  Define
+$$
+p_{l,i}=\frac{\tilde\sigma_{l,i}^2}
+{\sum_j \tilde\sigma_{l,j}^2},
 \qquad
-\mathcal{H}_l = -\sum_i p_{l,i}\log p_{l,i}.
+H_l=-\sum_i p_{l,i}\log p_{l,i}.
 $$
+This is a von-Neumann-style spectral entropy of the normalized Gram spectrum.
+It is better to call it a **spectral entropy proxy for effective rank**, not a
+direct measure of mutual information.
 
-Given global budget $\mathcal{B}$, minimum floor $r_{\min\_floor}$, and temperature $\tau$:
+Given total rank budget $B$, floor $r_{\min}$, and temperature $\tau$:
 $$
-r_l = r_{\min\_floor} +
-\frac{\mathcal{H}_l^{1/\tau}}{\sum_j \mathcal{H}_j^{1/\tau}}
-\big(\mathcal{B} - L\,r_{\min\_floor}\big),
+r_l = r_{\min}
+ + \operatorname{round}\left(
+\frac{H_l^{1/\tau}}{\sum_j H_j^{1/\tau}}
+\bigl(B-Lr_{\min}\bigr)
+\right),
 $$
-followed by integer/budget correction and clipping by layer-wise max rank.
+followed by clipping and integer budget correction.
 
-This resolves two weaknesses of uniform NNI: (i) non-adaptive rank usage, (ii) rank-collapse risk.
+The defensible theory angle is:
 
-### 3.4 Decoupled gating with routing floor
+- high entropy means the layer has diffuse spectral energy and needs more rank;
+- low entropy means spectral energy is concentrated and can tolerate stronger
+  compression;
+- temperature smoothing prevents a brittle winner-take-most allocation.
 
-For each layer with assigned rank $r_l$, gating input is selected as:
-- compressed representation if $r_l \ge r_{\text{route}}$,
-- uncompressed representation if $r_l < r_{\text{route}}$.
+### 3.4 Decoupled Routing
 
-This decoupled policy prevents routing degeneration in aggressively compressed layers.
+If a layer receives a small rank, routing on the compressed representation may
+be too weak.  Hetero therefore uses a routing threshold:
 
-### 3.5 Asymmetric de-symmetrized expert initialization
+- use compressed features when $r_l\ge r_{\mathrm{gate}}$;
+- use uncompressed pooled features when $r_l<r_{\mathrm{gate}}$.
 
-We follow a balanced split with $\Sigma^{1/2}$ and inject small perturbation to break expert symmetry:
+In the current code this threshold is `compress_threshold`, default `12`.
+The paper should call this a stability device, not the central theoretical
+contribution.
+
+### 3.5 Expert De-Symmetrization
+
+Identical experts can create symmetric gradients for the router.  Hetero uses
+zero-mean expert perturbations:
 $$
-W^{\text{down}} \sim \Sigma_r^{1/2}V_r^\top C^{-1},
-\qquad
-W_h^{\text{up}} \sim \frac{1}{H}U_r\Sigma_r^{1/2} + \epsilon_h,
+W_h^{\mathrm{up}}
+= U_r\Sigma_r^{1/2}+\epsilon_h,\qquad
+\sum_{h=1}^{H}\epsilon_h=0.
 $$
-where $\epsilon_h$ is small zero-mean noise.
+Zero-mean noise preserves the average reconstruction while breaking early
+expert symmetry.  Avoid a fixed $1/H$ factor unless the aggregation formula is
+also changed accordingly; with softmax gates that sum to one, identical full
+experts already reconstruct the rank-$r$ map before perturbation.
 
-This improves early expert specialization and avoids gate-gradient ambiguity under identical experts.
+### 3.6 Load-Balance Regularization
 
-### 3.6 Load-balancing auxiliary objective
-
-To reduce expert collapse, we add a lightweight balancing regularizer:
+For mean routing probabilities $\bar G_h$ in a mini-batch:
 $$
-\mathcal{L} = \mathcal{L}_{\text{task}} + \lambda\,\mathcal{L}_{\text{balance}},
+\mathcal{L}_{\mathrm{bal}}
+= H\sum_{h=1}^{H}\bar G_h^2.
 $$
-with $\lambda=0.01$ in our implementation.
-
-### 3.7 Engineering refinement: spectral cache reuse
-
-Cholesky and SVD are cached in the entropy stage and reused in decomposition construction, avoiding repeated high-cost factorizations and improving decomposition efficiency.
+This is minimized by uniform expert usage and discourages early expert collapse.
+It should be positioned as an MoE-inspired training stabilizer.
 
 ---
 
 ## 4. Method Comparison
 
-| Component | Original InherNet (Uniform NNI) | Revised HeteroInherNet-IB |
+| Component | InherNet | HeteroInherNet-IB |
 |---|---|---|
-| Inheritance source | Pretrained teacher/baseline decomposition | **Copy-based trained-source decomposition** (chosen) |
-| Decomposition target | Raw weight $W$ | Whitened weight $\tilde W = WC$ |
-| Rank policy | Uniform fixed $r$ across layers | Layer-wise adaptive $r_l$ via spectral entropy + budget |
-| Entropy definition | Not central / static-rank design | Correct von Neumann-style ($\sigma^2$) entropy |
-| Rank safety | No explicit global floor in classic setup | Min-rank floor + temperature smoothing |
-| Gating input | Coupled to compressed branch | Decoupled with routing floor |
-| Expert initialization | Asymmetric base, often near-symmetric experts | Asymmetric + deliberate de-symmetrization noise |
-| Expert utilization control | Implicit | Explicit load-balance auxiliary term |
-| Decomposition efficiency | Potential repeated SVD/Cholesky | Cached reuse of spectral factors |
+| Source | Trained teacher/source weights | Trained source weights; teacher or trained compact base depending on protocol |
+| Decomposition target | Raw weight $W$ | Data-weighted operator $\widetilde W = WC$ |
+| Rank policy | Uniform rank | Layer-wise entropy-budgeted rank |
+| Entropy | Not used | Spectral entropy / effective-rank proxy |
+| Routing | Standard compressed-feature gate | Decoupled routing when rank is too small |
+| Experts | Asymmetric one-down-many-ups | Same topology + zero-mean de-symmetrization |
+| Collapse control | Mostly implicit | Explicit load-balance penalty |
+| Theory emphasis | SVD inheritance and rank/head effects | Data-weighted approximation, budget allocation, routing stability |
 
 ---
 
-## 5. Why the Revised Method is Theoretically Reasonable
+## 5. Theory Plan for a Strong Paper
 
-### 5.1 Alignment with original InherNet theory
+The paper should avoid presenting all theory as already proven unless the
+appendix contains complete derivations.  A strong theory section can be built
+around four defensible claims.
 
-The original paper emphasizes that rank controls inheritance quality and SVD initialization stabilizes optimization. HeteroInherNet-IB does not contradict this; instead, it **strengthens** it by:
-1. ensuring decomposition acts on trained weights (`copy` path),
-2. allocating rank where spectral information demands it,
-3. preserving asymmetric one-down-many-ups design validated in the original paper and appendices.
+### 5.1 Data-Weighted Eckart-Young-Mirsky Theorem
 
-### 5.2 Information-bottleneck consistency
+For $\Sigma_x\succ0$, truncated SVD of $\widetilde W=WC$ is optimal for
+$$
+\min_{\mathrm{rank}(\widehat W)\le r}
+\mathrm{tr}\left((W-\widehat W)\Sigma_x(W-\widehat W)^\top\right).
+$$
+This is a clean theorem and should be central.
 
-The original appendix argues one-down-many-ups is superior via IB and credit-assignment analysis. Our revised method preserves this topology and adds data-dependent rank control + routing safeguards, which is consistent with the same IB motivation: retain sufficient predictive information while controlling compression.
+### 5.2 Entropy-Budget Allocation Lemma
 
-### 5.3 Optimization and variance considerations
+A safer derivation than the earlier draft is to define an explicit concave
+utility:
+$$
+\max_{r_l\ge r_{\min}}
+\sum_l H_l^{1/\tau}\log(r_l-r_{\min}+\epsilon)
+\quad
+\text{s.t.}\quad
+\sum_l r_l=B.
+$$
+The KKT solution allocates the extra budget in proportion to
+$H_l^{1/\tau}$, matching the algorithm before integer correction.  This is
+defensible because it says Hetero is optimal for a stated entropy-weighted
+utility, not for an unsupported approximation-error model.
 
-The original analysis highlights conditioning and gradient-routing effects. The revised method further reduces optimization pathologies via:
-- non-collapsing rank floor,
-- expert de-symmetrization,
-- auxiliary load balancing.
+### 5.3 Convergence Compatibility Lemma
 
-Hence, improvements are not heuristic-only; they are coherent with the paper’s convergence and specialization arguments.
+State that if:
+
+- the original InherNet smoothness/variance assumptions hold;
+- routing features are bounded;
+- expert noise has bounded variance;
+- the load-balance gradient is bounded;
+
+then the same stationarity rate order follows with modified constants.  Do not
+state that Hetero strictly improves the asymptotic rate.
+
+### 5.4 Linear-Gaussian IB Interpretation
+
+Under a linear-Gaussian approximation, the data-weighted spectrum controls how
+much input variance passes through the bottleneck.  Heterogeneous ranks then
+implement a rate-distortion-style allocation: more rank where predictive
+variance is diffuse, less rank where predictive variance is concentrated.
+
+This is a much more credible IB story than claiming exact IB optimality for
+deep nonlinear networks.
 
 ---
 
-## 6. Practical Configuration Used in the Latest Revision
+## 6. Narrative and Storyline for a Top-Tier AI Paper
 
-- Inheritance source mode: **`copy`** (selected)
-- Rank budget ratio: `0.35`
+Top-tier AI introductions usually work because they make one problem feel
+inevitable, then make the proposed method feel like the simplest principled
+answer.  For this paper, the story should not be "we added many tricks to
+InherNet."  The story should be:
+
+> Neural network inheritance is a promising alternative to student design and
+> distillation, but current inheritance uses a uniform bottleneck across layers.
+> This is misaligned with how information is distributed in real networks.
+> HeteroInherNet makes the bottleneck data-aware.
+
+Recommended introduction arc:
+
+1. **Broad motivation.**
+   Efficient model compression is still dominated by KD and PEFT.  KD transfers
+   behavior but not structure; PEFT adapts a frozen model but does not produce a
+   standalone compact inheritor.
+
+2. **InherNet as the starting point.**
+   InherNet reframes compression as inheritance: directly factorize a trained
+   source network and retain its spectral structure.  This is a stronger
+   starting point than training a small student from scratch.
+
+3. **Core gap.**
+   Uniform rank assumes every layer should pass through the same bottleneck.
+   Empirically and spectrally this is unlikely: different layers have different
+   data-conditioned spectra, different effective ranks, and different
+   sensitivity to compression.
+
+4. **Central idea.**
+   Replace a uniform architectural bottleneck with an information-aware
+   heterogeneous bottleneck.  The method estimates data-weighted spectra,
+   measures spectral entropy, and allocates rank under a global budget.
+
+5. **Why this is principled.**
+   The method is supported by: data-weighted low-rank approximation theory,
+   entropy-budget optimization, convergence compatibility with InherNet, and a
+   linear-Gaussian IB/rate-distortion interpretation.
+
+6. **Contributions.**
+   Keep the contribution list short and defensible:
+   - a data-aware heterogeneous inheritance framework;
+   - an entropy-budget rank allocation algorithm;
+   - routing and expert-utilization stabilizers for low-rank MoE inheritance;
+   - theory connecting the method to data-weighted SVD and rate-distortion;
+   - experiments showing better accuracy/parameter tradeoffs and diagnostics
+     explaining when heterogeneous ranks help.
+
+Suggested opening sentence:
+
+> Neural network inheritance offers a direct route to compact models by
+> factorizing trained weights, but existing inheritance methods impose the same
+> low-rank bottleneck on every layer, ignoring the fact that task-relevant
+> information is distributed unevenly across a network.
+
+Suggested one-sentence method pitch:
+
+> HeteroInherNet turns inheritance from a uniform compression rule into a
+> data-aware budget allocation problem.
+
+Suggested reviewer-facing caution:
+
+> We do not claim a universal IB optimum for deep networks; instead, we provide
+> a linear/data-weighted analysis that explains the allocation rule and matches
+> the observed layer-wise behavior.
+
+This framing matches common successful ML-paper practice: state the problem,
+show why it matters, identify a narrow gap, present a simple principle, then
+support it with theory and experiments.
+
+---
+
+## 7. Practical Configuration to Report
+
+Method defaults:
+
+- Budget ratio: `0.35`
 - Minimum rank floor: `8`
-- Entropy temperature: `1.5`
-- Routing floor `r_route`: `4`
-- Expert heads tested: `H \in {1,2,3}`
-- Auxiliary load-balance weight: `0.01`
+- Entropy temperature: `1.4`
+- Routing/compression threshold: `12`
+- Calibration batches: `16`
+- Expert heads: default `3`; ablate `1,2,3`
+- Expert noise scale: `0.01`
+- Balance loss weight: `0.01`
+- Linear-layer compression: off by default in current CIFAR experiments
+
+Training protocol should be reported separately by dataset:
+
+- CIFAR-10 original-compatible workflow: Adam, LR `1e-3`, batch `256`,
+  100 epochs, trained student source, supervised compressed-model training.
+- CIFAR-100 paper-style workflow: SGD, LR `0.05`, momentum `0.9`, weight decay
+  `5e-4`, batch `64`, 240 epochs, trained teacher source, KD training.
 
 ---
 
-## 7. Suggested Paper-Style Naming and Positioning
+## 8. Final Positioning
 
-We recommend naming the revised method:
+The cleanest positioning is:
 
-**HeteroInherNet-IB: Information-Bottleneck-Driven Heterogeneous Neural Network Inheritance**
+> HeteroInherNet extends InherNet from uniform low-rank inheritance to
+> data-aware heterogeneous inheritance.  Its central claim is not that every
+> engineering detail is theoretically optimal, but that the main design choice
+> - allocating rank according to data-weighted spectral complexity - is a
+> principled correction to uniform inheritance.
 
-This name is concise, method-informative, and stylistically consistent with top conference naming conventions (core mechanism + theoretical lens).
-
----
-
-## 8. Concluding Statement for Methods Section
-
-In summary, HeteroInherNet-IB extends InherNet from *uniform* low-rank inheritance to *data-aware heterogeneous* inheritance. By combining activation-whitened spectral analysis, entropy-budgeted rank allocation, decoupled routing, and stability-oriented training refinements, the method preserves InherNet’s asymmetric inheritance principle while improving robustness, efficiency, and empirical competitiveness under comparable parameter budgets.
+This is the strongest narrative for a top-tier submission because it gives
+reviewers a single conceptual hook and a clear theory/experiment checklist.

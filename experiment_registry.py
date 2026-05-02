@@ -14,6 +14,7 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 
 from cifar10_models import PAIR_REGISTRY as CIFAR10_PAIR_REGISTRY
+from cifar10_models import build_model as build_cifar10_model
 from cifar100_models import PAIR_REGISTRY as CIFAR100_PAIR_REGISTRY
 from cifar100_models import build_model as build_cifar100_model
 
@@ -175,6 +176,8 @@ def build_pair_model(dataset_name: str, pair_name: str, role: str, num_classes: 
     if builder_key in pair_spec:
         return pair_spec[builder_key](num_classes)
     model_name = get_role_name(pair_spec, role)
+    if dataset_name == "cifar10":
+        return build_cifar10_model(model_name, num_classes)
     if dataset_name == "cifar100":
         return build_cifar100_model(model_name, num_classes)
     raise ValueError(f"No builder registered for {dataset_name}:{pair_name}:{role}")
@@ -321,10 +324,6 @@ def resolve_fixed_rank_with_override(
         available = ", ".join(sorted(rank_presets.keys()))
         raise ValueError(f"No rank preset '{preset_name}'. Available: {available}")
     return int(rank_presets[preset_name])
-
-
-def resolve_fixed_rank(args: argparse.Namespace, pair_spec: Mapping[str, Any]) -> int:
-    return resolve_fixed_rank_with_override(args, pair_spec)
 
 
 def validate_args(args: argparse.Namespace, pair_spec: Mapping[str, Any]) -> None:

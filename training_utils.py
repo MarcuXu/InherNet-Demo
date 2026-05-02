@@ -127,11 +127,6 @@ def evaluate_classification_metrics(
     }
 
 
-def evaluate_model(model: nn.Module, data_loader: DataLoader, device: torch.device) -> float:
-    metrics = evaluate_classification_metrics(model, data_loader, device, nn.CrossEntropyLoss())
-    return metrics["accuracy"]
-
-
 def ensure_finite_scalar(value: float, context: str) -> float:
     if not math.isfinite(float(value)):
         raise RuntimeError(f"Non-finite metric detected: {context}={value}")

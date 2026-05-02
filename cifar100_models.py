@@ -323,63 +323,32 @@ CIFAR100_INHERNET_WORKFLOW_DEFAULTS = {
 }
 
 
+def make_cifar100_pair(
+    teacher: str,
+    student: str,
+    *,
+    small_rank: int,
+    large_rank: int,
+    default_head_num: int = 3,
+) -> dict[str, object]:
+    return {
+        **CIFAR100_INHERNET_WORKFLOW_DEFAULTS,
+        "teacher": teacher,
+        "student": student,
+        "rank_presets": {"small": small_rank, "large": large_rank},
+        "default_head_num": default_head_num,
+    }
+
+
 PAIR_REGISTRY: Dict[str, Mapping[str, object]] = {
-    "resnet32_to_resnet8": {
-        **CIFAR100_INHERNET_WORKFLOW_DEFAULTS,
-        "teacher": "resnet32",
-        "student": "resnet8",
-        "rank_presets": {"small": 4, "large": 8},
-        "default_head_num": 3,
-    },
-    "resnet32x4_to_resnet8x4": {
-        **CIFAR100_INHERNET_WORKFLOW_DEFAULTS,
-        "teacher": "resnet32x4",
-        "student": "resnet8x4",
-        "rank_presets": {"small": 4, "large": 8},
-        "default_head_num": 3,
-    },
-    "vgg13_to_vgg8": {
-        **CIFAR100_INHERNET_WORKFLOW_DEFAULTS,
-        "teacher": "vgg13",
-        "student": "vgg8",
-        "rank_presets": {"small": 128, "large": 256},
-        "default_head_num": 3,
-    },
-    "wrn40_2_to_wrn40_1": {
-        **CIFAR100_INHERNET_WORKFLOW_DEFAULTS,
-        "teacher": "wrn_40_2",
-        "student": "wrn_40_1",
-        "rank_presets": {"small": 16, "large": 32},
-        "default_head_num": 3,
-    },
-    "wrn40_2_to_wrn16_2": {
-        **CIFAR100_INHERNET_WORKFLOW_DEFAULTS,
-        "teacher": "wrn_40_2",
-        "student": "wrn_16_2",
-        "rank_presets": {"small": 16, "large": 32},
-        "default_head_num": 3,
-    },
-    "resnet56_to_resnet20": {
-        **CIFAR100_INHERNET_WORKFLOW_DEFAULTS,
-        "teacher": "resnet56",
-        "student": "resnet20",
-        "rank_presets": {"small": 8, "large": 16},
-        "default_head_num": 3,
-    },
-    "resnet110_to_resnet32": {
-        **CIFAR100_INHERNET_WORKFLOW_DEFAULTS,
-        "teacher": "resnet110",
-        "student": "resnet32",
-        "rank_presets": {"small": 8, "large": 32},
-        "default_head_num": 3,
-    },
-    "resnet110_to_resnet20": {
-        **CIFAR100_INHERNET_WORKFLOW_DEFAULTS,
-        "teacher": "resnet110",
-        "student": "resnet20",
-        "rank_presets": {"small": 4, "large": 8},
-        "default_head_num": 3,
-    },
+    "resnet32_to_resnet8": make_cifar100_pair("resnet32", "resnet8", small_rank=4, large_rank=8),
+    "resnet32x4_to_resnet8x4": make_cifar100_pair("resnet32x4", "resnet8x4", small_rank=4, large_rank=8),
+    "vgg13_to_vgg8": make_cifar100_pair("vgg13", "vgg8", small_rank=128, large_rank=256),
+    "wrn40_2_to_wrn40_1": make_cifar100_pair("wrn_40_2", "wrn_40_1", small_rank=16, large_rank=32),
+    "wrn40_2_to_wrn16_2": make_cifar100_pair("wrn_40_2", "wrn_16_2", small_rank=16, large_rank=32),
+    "resnet56_to_resnet20": make_cifar100_pair("resnet56", "resnet20", small_rank=8, large_rank=16),
+    "resnet110_to_resnet32": make_cifar100_pair("resnet110", "resnet32", small_rank=8, large_rank=32),
+    "resnet110_to_resnet20": make_cifar100_pair("resnet110", "resnet20", small_rank=4, large_rank=8),
 }
 
 
@@ -387,15 +356,3 @@ def build_model(model_name: str, num_classes: int) -> nn.Module:
     if model_name not in MODEL_REGISTRY:
         raise KeyError(f"Unknown CIFAR model: {model_name}")
     return MODEL_REGISTRY[model_name](num_classes)
-
-
-def build_teacher_model(pair_name: str, num_classes: int) -> nn.Module:
-    if pair_name not in PAIR_REGISTRY:
-        raise KeyError(f"Unknown CIFAR pair: {pair_name}")
-    return build_model(str(PAIR_REGISTRY[pair_name]["teacher"]), num_classes)
-
-
-def build_student_model(pair_name: str, num_classes: int) -> nn.Module:
-    if pair_name not in PAIR_REGISTRY:
-        raise KeyError(f"Unknown CIFAR pair: {pair_name}")
-    return build_model(str(PAIR_REGISTRY[pair_name]["student"]), num_classes)

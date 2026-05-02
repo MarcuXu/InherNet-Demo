@@ -49,49 +49,52 @@ MODEL_REGISTRY: Dict[str, Callable[[int], nn.Module]] = {
 }
 
 
+def make_resnet_pair(
+    *,
+    teacher_name: str,
+    student_name: str,
+    model_profile: str,
+    train_defaults: Mapping[str, object] | None = None,
+    compressed_source: str | None = None,
+    compressed_train_mode: str | None = None,
+) -> dict[str, object]:
+    spec: dict[str, object] = {
+        "teacher_name": teacher_name,
+        "student_name": student_name,
+        "rank_presets": {"small": 32, "large": 64},
+        "default_head_num": 3,
+        "model_profile": model_profile,
+    }
+    if train_defaults is not None:
+        spec["train_defaults"] = train_defaults
+    if compressed_source is not None:
+        spec["compressed_source"] = compressed_source
+    if compressed_train_mode is not None:
+        spec["compressed_train_mode"] = compressed_train_mode
+    return spec
+
+
+CIFAR_STEM_PAIR = make_resnet_pair(
+    teacher_name="resnet50",
+    student_name="resnet18",
+    model_profile="cifar_resnet_stem",
+)
+
+DEMO_CODE_ORG_PAIR = make_resnet_pair(
+    teacher_name="resnet50_org",
+    student_name="resnet18_org",
+    model_profile="demo_code_org_torchvision_stem",
+    train_defaults=DEMO_CODE_ORG_TRAIN_DEFAULTS,
+    compressed_source="student",
+    compressed_train_mode="supervised",
+)
+
+
 PAIR_REGISTRY: dict[str, Mapping[str, object]] = {
-    "resnet50_to_resnet18": {
-        "teacher_name": "resnet50",
-        "student_name": "resnet18",
-        "teacher_builder": lambda num_classes: build_cifar_torchvision_resnet("resnet50", num_classes),
-        "student_builder": lambda num_classes: build_cifar_torchvision_resnet("resnet18", num_classes),
-        "rank_presets": {"small": 32, "large": 64},
-        "default_head_num": 3,
-        "model_profile": "cifar_resnet_stem",
-    },
-    "resnet50_to_resnet18_cifar_stem": {
-        "teacher_name": "resnet50",
-        "student_name": "resnet18",
-        "teacher_builder": lambda num_classes: build_cifar_torchvision_resnet("resnet50", num_classes),
-        "student_builder": lambda num_classes: build_cifar_torchvision_resnet("resnet18", num_classes),
-        "rank_presets": {"small": 32, "large": 64},
-        "default_head_num": 3,
-        "model_profile": "cifar_resnet_stem",
-    },
-    "resnet50_to_resnet18_org": {
-        "teacher_name": "resnet50_org",
-        "student_name": "resnet18_org",
-        "teacher_builder": lambda num_classes: build_org_torchvision_resnet("resnet50", num_classes),
-        "student_builder": lambda num_classes: build_org_torchvision_resnet("resnet18", num_classes),
-        "rank_presets": {"small": 32, "large": 64},
-        "default_head_num": 3,
-        "model_profile": "demo_code_org_torchvision_stem",
-        "train_defaults": DEMO_CODE_ORG_TRAIN_DEFAULTS,
-        "compressed_source": "student",
-        "compressed_train_mode": "supervised",
-    },
-    "resnet50_to_resnet18_torchvision_stem": {
-        "teacher_name": "resnet50_org",
-        "student_name": "resnet18_org",
-        "teacher_builder": lambda num_classes: build_org_torchvision_resnet("resnet50", num_classes),
-        "student_builder": lambda num_classes: build_org_torchvision_resnet("resnet18", num_classes),
-        "rank_presets": {"small": 32, "large": 64},
-        "default_head_num": 3,
-        "model_profile": "demo_code_org_torchvision_stem",
-        "train_defaults": DEMO_CODE_ORG_TRAIN_DEFAULTS,
-        "compressed_source": "student",
-        "compressed_train_mode": "supervised",
-    },
+    "resnet50_to_resnet18": dict(CIFAR_STEM_PAIR),
+    "resnet50_to_resnet18_cifar_stem": dict(CIFAR_STEM_PAIR),
+    "resnet50_to_resnet18_org": dict(DEMO_CODE_ORG_PAIR),
+    "resnet50_to_resnet18_torchvision_stem": dict(DEMO_CODE_ORG_PAIR),
 }
 
 

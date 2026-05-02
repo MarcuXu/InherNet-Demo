@@ -75,9 +75,11 @@ smoothing,
 (iii)~decoupled gating with a routing-floor policy, and
 (iv)~de-symmetrized expert initialization with load-balance regularization.
 Collectively, these modifications preserve InherNet's convergence guarantees
-($\cO(1/T)$ stationary rate) and information-bottleneck optimality while
-yielding tighter spectral approximation bounds where the data demands higher
-fidelity.
+at the level of parameterization and admit analogous stationarity analyses
+under explicit boundedness assumptions. They also provide a data-weighted
+low-rank approximation principle and an information-bottleneck interpretation,
+rather than claiming an unconditional information-theoretic optimum for deep
+nonlinear networks.
 \end{abstract}
 
 % ============================================================================
@@ -135,12 +137,16 @@ Given input features $\bX$, the InherNet module output is
 where $H$ is the number of expert heads. The shared backbone
 $\bW^{\down}$ reduces dimensionality and each expert head
 $\bW_h^{\up}$ reconstructs the output, producing a one-down-many-ups
-topology.  Initialization follows a balanced $\bSigma^{1/2}$ split:
+topology.  Under the column-vector convention $y=\bW x$,
+initialization follows a balanced $\bSigma^{1/2}$ split:
 \begin{equation}\label{eq:init-orig}
-  \bW^{\down} \leftarrow \bU_r\,\bSigma_r^{1/2},
+  \bW^{\down} \leftarrow \bSigma_r^{1/2}\bV_r^\top,
   \qquad
-  \bW_h^{\up} \leftarrow \tfrac{1}{H}\;\bSigma_r^{1/2}\,\bV_r^\top.
+  \bW_h^{\up} \leftarrow \bU_r\,\bSigma_r^{1/2}.
 \end{equation}
+Equivalent transposed forms appear when features are written as row vectors.
+The important point is that the two factors reconstruct
+$\bU_r\bSigma_r\bV_r^\top$ before task training.
 
 \paragraph{Core theoretical properties (from~\cite{zhou2026inherNet}).}
 \begin{enumerate}
@@ -151,9 +157,10 @@ topology.  Initialization follows a balanced $\bSigma^{1/2}$ split:
   with a practical scaling constant improved from $L$ to
   $L'\approx L/\kappa$ due to orthonormal SVD initialization
   (Proposition~2.3, Theorem~2.4 of~\cite{zhou2026inherNet}).
-\item \textbf{Information bottleneck}: The one-down-many-ups design creates
+\item \textbf{Information bottleneck}: The one-down-many-ups design is
+  analyzed as creating
   a single shared bottleneck $\bZ\triangleq\bW^{\down}(\bX)$ that forms
-  the Markov chain $\bX\to\bZ\to\bY$ and minimizes the IB Lagrangian
+  the Markov chain $\bX\to\bZ\to\bY$ and motivates the IB Lagrangian
   $\cL_{\mathrm{IB}}=I(\bX;\bZ)-\beta\,I(\bZ;\bY)$
   (Appendix~A.2 of~\cite{zhou2026inherNet}).
 \item \textbf{Knowledge preservation}: Rank is the primary determinant
@@ -182,28 +189,32 @@ allocation pipeline.  The six components of HeteroInherNet-IB are
 described below and summarized in Algorithm~\ref{alg:hetero}.
 
 % ---------- 3.1 -----------------------------------------------------------
-\subsection{Inheritance Source: Weight-Copy Initialization}
+\subsection{Inheritance Source: Trained-Source Initialization}
 \label{sec:copy}
 
 A prerequisite for meaningful SVD-based inheritance is that the weight
 matrices being decomposed already encode learned representations.
 In the original InherNet, the teacher's pretrained weights are directly
 decomposed; in the hetero setting, we additionally require a calibration
-forward pass (Section~\ref{sec:whitening}).  We consider two strategies
-for initializing the heterogeneous base model $\theta_{\mathrm{hetero}}$:
+forward pass (Section~\ref{sec:whitening}).  We therefore describe the
+source model abstractly as
+\begin{equation}
+  \theta_{\mathrm{source}}
+  \in
+  \{\theta_{\mathrm{teacher}},\;
+    \theta_{\mathrm{trained\ compact}},\;
+    \theta_{\mathrm{copied\ base}}\}.
+\end{equation}
+The concrete choice can depend on the experimental protocol.  For
+paper-style CIFAR-100 inheritance, the natural source is the trained
+teacher; for the legacy CIFAR-10 workflow that reproduces
+\texttt{demo\_code\_org.py}, the source can be a trained compact
+baseline copied into the heterogeneous base.
 
-\begin{enumerate}
-\item \textbf{Copy}: $\theta_{\mathrm{hetero}}\leftarrow\theta_{\mathrm{trained}}$.
-  Weights from a trained baseline (e.g., an already-converged
-  ResNet-18) are copied.  This avoids decomposing random weights and
-  guarantees that the spectral structure reflects the task.
-\item \textbf{Pretrain}: Train $\theta_{\mathrm{hetero}}$ from scratch for a
-  number of epochs before decomposition.
-\end{enumerate}
-
-We adopt \textbf{copy} as the default, which formally satisfies the
-Eckart--Young--Mirsky precondition that the singular spectrum
-to be truncated should already encode task-relevant information.
+The paper-level principle is thus not ``copy only'', but rather
+\emph{trained-source inheritance}: heterogeneous decomposition should
+not be applied to random weights.  This ensures that the singular
+spectrum being truncated reflects task-relevant structure.
 
 % ---------- 3.2 -----------------------------------------------------------
 \subsection{Activation Whitening Before Decomposition}
@@ -225,6 +236,9 @@ input covariance at each convolutional layer $l$:
 where $\bar{x}^{(l)}=\E_{h,w}[x^{(l)}_{:,h,w}]$ denotes the
 spatially-averaged activation and $\epsilon>0$ is a regularization
 constant.
+For a linear layer, $\bar{x}^{(l)}$ is the full input feature vector.
+For convolutional layers this channel covariance is a tractable
+approximation to a full im2col covariance.
 
 \paragraph{Cholesky whitening.}
 We compute the Cholesky factor $\bC^{(l)}$ such that
@@ -268,8 +282,8 @@ and the spectral entropy:
 
 \begin{remark}[Why $\sigma^2$ instead of $\sigma$]
 The choice of squaring the singular values before normalization is not
-a mere convention.  It corresponds to using the \emph{nuclear-norm
-eigenvalue distribution}
+a mere convention.  It corresponds to using the \emph{normalized
+Gram-spectrum distribution}
 $\lambda_i=\sigma_i^2/\|\bW\|_F^2$ of the Gram matrix $\bW^\top\bW$.
 This is the standard von~Neumann entropy
 $S(\rho)=-\tr(\rho\log\rho)$ of the quantum-information-theoretic
@@ -300,29 +314,36 @@ $\lfloor\cdot\rceil$ denotes rounding to the nearest integer,
 followed by a greedy correction pass that adjusts ranks to satisfy
 $\sum_l r_l = \cB$ exactly.
 
-\begin{proposition}[Optimality of entropy-proportional allocation]
+\begin{proposition}[Entropy-weighted budget allocation]
 \label{prop:alloc}
-Under a simplified model where each layer's approximation error is
-$\mathcal{E}_l(r_l)=e^{-r_l/\cH_l}$ (exponential decay governed by
-spectral entropy), the allocation in Eq.~\eqref{eq:rank-alloc}
-(with $\tau=1$) minimizes the sum of layer-wise errors
-$\sum_l\mathcal{E}_l(r_l)$ subject to the budget constraint
-$\sum_l r_l=\cB$.
+Let $a_l=\cH_l^{1/\tau}$ and let $s_l=r_l-r_{\min}$ denote the
+extra rank assigned above the floor.  The continuous relaxation
+\begin{equation}
+  \max_{s_l\ge 0}
+  \sum_l a_l\log(s_l+\epsilon)
+  \quad
+  \text{s.t.}\quad
+  \sum_l s_l=\cB-Lr_{\min}
+\end{equation}
+allocates the extra budget proportionally to $a_l$ up to the small
+$\epsilon$ correction.  Eq.~\eqref{eq:rank-alloc} is the corresponding
+integer-rounded allocation with clipping by layer-wise maximum rank.
 \end{proposition}
 
 \begin{proof}
-By the method of Lagrange multipliers, setting
-$\partial\mathcal{E}_l/\partial r_l=\lambda$ for all $l$ yields
-$\frac{1}{\cH_l}e^{-r_l/\cH_l}=\lambda$, from which
-$r_l=\cH_l\log(1/(\lambda\cH_l))$.
-Substituting into $\sum_l r_l=\cB$ and solving for $\lambda$ gives
-$r_l\propto\cH_l$ as desired.
+The Lagrangian is
+$\sum_l a_l\log(s_l+\epsilon)-\lambda(\sum_l s_l-\cB+Lr_{\min})$.
+Stationarity gives $a_l/(s_l+\epsilon)=\lambda$, hence
+$s_l=a_l/\lambda-\epsilon$.  Enforcing the budget constraint yields
+$s_l$ proportional to $a_l$ when $\epsilon$ is small relative to the
+available extra budget.  The implementation then rounds, clips, and
+greedily corrects the allocation to satisfy the discrete budget.
 \end{proof}
 
 The temperature $\tau>1$ acts as a smoothing parameter that
-interpolates between the theoretically optimal entropy-proportional
-allocation ($\tau=1$) and a uniform assignment ($\tau\to\infty$).
-In practice $\tau=1.5$ provides a good trade-off between fidelity
+interpolates between entropy-proportional allocation ($\tau=1$) and a
+near-uniform assignment ($\tau\to\infty$).
+In practice $\tau=1.4$ provides a good trade-off between fidelity
 and robustness by preventing extreme rank assignments in layers with
 atypically high or low entropy.
 
@@ -371,9 +392,8 @@ load-balance loss (Section~\ref{sec:balance}).
 A known failure mode in MoE training is \emph{expert collapse}: when
 all experts are initialized identically, the gating gradients experience
 a saddle point and experts fail to specialize.  The original InherNet
-initializes each expert head identically as
-$\bW_h^{\up}\leftarrow\frac{1}{H}\bSigma_r^{1/2}\bV_r^\top$, relying
-on stochastic gradient noise alone to break symmetry.
+initializes expert heads from the same SVD factors, relying on stochastic
+training dynamics to break symmetry.
 
 In HeteroInherNet-IB, after restoring to the original (un-whitened) space
 via $\bC^{-1}$, the initialization becomes:
@@ -382,33 +402,35 @@ via $\bC^{-1}$, the initialization becomes:
     \widetilde{\bSigma}_r^{1/2}\,\widetilde{\bV}_r^\top\,(\bC^{(l)})^{-1},
     \label{eq:init-down}\\[3pt]
   \bW_h^{\up} &\;\leftarrow\;
-    \frac{1}{H}\,\widetilde{\bU}_r\,\widetilde{\bSigma}_r^{1/2}
+    \widetilde{\bU}_r\,\widetilde{\bSigma}_r^{1/2}
     + \epsilon_h,
     \qquad
-    \epsilon_h \sim \mathcal{N}\!\bigl(0,\;\alpha^2
-      \|\widetilde{\bU}_r\widetilde{\bSigma}_r^{1/2}\|_{\infty}^2\,\bI\bigr),
+    \sum_{h=1}^{H}\epsilon_h=\bm{0},
     \label{eq:init-up}
 \end{align}
-where $\alpha=0.01$ controls the noise scale.
+where $\epsilon_h$ is a small zero-mean perturbation and
+$\alpha=0.01$ controls its scale.  The zero-mean constraint preserves
+the average SVD reconstruction while making expert outputs distinct.
 
 \begin{proposition}[Symmetry-breaking gradient]
 \label{prop:break}
 Under the noise-perturbed initialization~\eqref{eq:init-up} with
-$\epsilon_h\ne\epsilon_{h'}$ for $h\ne h'$, the expected gradient
-of the task loss with respect to the gating parameters $\theta_g$ has
-a non-zero component in the direction that differentiates experts:
+$\epsilon_h\ne\epsilon_{h'}$ for $h\ne h'$, the gradient of the task
+loss with respect to the gating parameters $\theta_g$ is generically
+non-zero in directions that differentiate experts:
 \begin{equation}
-  \E\left[\nabla_{\theta_g}\cL\right]
-  = \sum_{h=1}^{H}\E\!\bigl[\Delta_h\,\nabla_{\theta_g}G_h(\bX)\bigr]
+  \nabla_{\theta_g}\cL
+  = \sum_{h=1}^{H}\Delta_h\,\nabla_{\theta_g}G_h(\bX)
   \;\neq\; \bm{0},
 \end{equation}
-where $\Delta_h=\partial\cL/\partial f_h(\bX)$ and the expectation is
-over the data distribution and the independent noise.
+where $\Delta_h=\partial\cL/\partial f_h(\bX)$, except on a
+measure-zero set where the perturbations produce identical expert
+responses.
 \end{proposition}
 
 \begin{proof}
-Since each $\bW_h^{\up}$ now differs by a zero-mean but independent
-perturbation $\epsilon_h$, the expert outputs
+Since each $\bW_h^{\up}$ differs by a small perturbation $\epsilon_h$,
+the expert outputs
 $f_h(\bX)=\bW_h^{\up}(\bW^{\down}(\bX))$ are no longer identical.
 By Lemma~B.1 of~\cite{zhou2026inherNet} (gradient decomposition),
 the gating gradient is
@@ -416,8 +438,8 @@ $\nabla_{\theta_g}\cL=\sum_h\Delta_h\nabla_{\theta_g}G_h$.
 When experts are identical, $\Delta_1=\cdots=\Delta_H$ and
 $\sum_h\nabla_{\theta_g}G_h=\nabla_{\theta_g}\sum_h G_h=\bm{0}$
 (since softmax sums to 1).  The perturbation breaks this degeneracy:
-$\Delta_h\ne\Delta_{h'}$ in expectation over data, so the sum is
-generically nonzero.
+$\Delta_h\ne\Delta_{h'}$ for almost all nonzero perturbations and
+non-degenerate inputs, so the weighted sum is generically nonzero.
 \end{proof}
 
 % ---------- 3.6 -----------------------------------------------------------
@@ -449,11 +471,11 @@ knowledge distillation is employed, $\cL_{\mathrm{task}}$ is replaced by
 \begin{equation}\label{eq:kd}
   \cL_{\mathrm{task}}
   = \alpha\,\cL_{\mathrm{CE}}(f_r(\bX),y)
-  + (1-\alpha)\,\tau^2\,
+  + (1-\alpha)\,T_{\mathrm{KD}}^2\,
     \mathrm{KL}\!\bigl(
-      \softmax(f_r(\bX)/\tau)
+      \softmax(f_{\bW}(\bX)/T_{\mathrm{KD}})
       \;\big\|\;
-      \softmax(f_{\bW}(\bX)/\tau)
+      \softmax(f_r(\bX)/T_{\mathrm{KD}})
     \bigr).
 \end{equation}
 
@@ -479,7 +501,7 @@ optimization and does not affect the resulting model.
 \caption{HeteroInherNet-IB: Heterogeneous Neural Network Inheritance}
 \label{alg:hetero}
 \begin{algorithmic}[1]
-\REQUIRE Trained base model with weights $\{\bW^{(l)}\}_{l=1}^L$;
+\REQUIRE Trained source model with weights $\{\bW^{(l)}\}_{l=1}^L$;
   calibration loader $\mathcal{D}_{\mathrm{cal}}$;
   budget ratio $\beta$; min rank $r_{\min}$;
   temperature $\tau$; routing floor $r_{\mathrm{route}}$;
@@ -525,10 +547,10 @@ optimization and does not affect the resulting model.
     \widetilde{\bV}_r^\top(\bC^{(l)})^{-1}$
     \hfill\COMMENT{Eq.~\eqref{eq:init-down}}
   \FOR{$h=1,\dots,H$}
-    \STATE $\bW_h^{\up}\leftarrow\frac{1}{H}
+    \STATE $\bW_h^{\up}\leftarrow
       \widetilde{\bU}_r\widetilde{\bSigma}_r^{1/2}
       +\epsilon_h$,\;
-      $\epsilon_h\sim\mathcal{N}(0,\alpha^2\|\cdot\|_\infty^2\bI)$
+      $\sum_h\epsilon_h=\bm{0}$
       \hfill\COMMENT{Eq.~\eqref{eq:init-up}}
   \ENDFOR
   \STATE Construct \texttt{DecoupledGatedSVDConv2d} with gate input
@@ -589,12 +611,22 @@ $\widetilde{\bW}$.
 \end{theorem}
 
 \begin{proof}
-Write $\hat{\bW}=\bW-\bm{E}$ with $\rank(\bm{E})\le r$.  Then
-$\|\bm{E}\|_{\bSigma_x}^2=\|\bm{E}\bC\|_F^2$.
-Setting $\widetilde{\bm{E}}=\bm{E}\bC$, the problem reduces to
-minimizing $\|\widetilde{\bW}-(\widetilde{\bW}-\widetilde{\bm{E}})\|_F^2$
-over rank-$r$ matrices, which is the standard Eckart--Young--Mirsky
-problem on $\widetilde{\bW}$.
+For any candidate $\hat{\bW}$, define
+$\hat{\bA}=\hat{\bW}\bC$ and $\bA=\bW\bC$.  Since $\bC$ is invertible,
+$\rank(\hat{\bA})=\rank(\hat{\bW})$.  Moreover,
+\begin{equation}
+  \|\bW-\hat{\bW}\|_{\bSigma_x}^2
+  =
+  \|(\bW-\hat{\bW})\bC\|_F^2
+  =
+  \|\bA-\hat{\bA}\|_F^2 .
+\end{equation}
+Thus the data-weighted problem is exactly the standard rank-$r$
+Frobenius approximation problem for $\bA=\widetilde{\bW}$.  By
+Eckart--Young--Mirsky, the optimizer is
+$\hat{\bA}^*=\widetilde{\bU}_r\widetilde{\bSigma}_r
+\widetilde{\bV}_r^\top$, and therefore
+$\hat{\bW}^*=\hat{\bA}^*\bC^{-1}$.
 \end{proof}
 
 \begin{corollary}
@@ -621,22 +653,22 @@ with rapidly decaying spectra can be compressed more aggressively.
 \subsection{Preservation of Convergence Guarantees}
 \label{sec:theory-conv}
 
-\begin{theorem}[Convergence of HeteroInherNet-IB under SGD]
+\begin{theorem}[Convergence compatibility under SGD]
 \label{thm:conv-hetero}
 Under Assumptions~2.1--2.3 of~\cite{zhou2026inherNet} (Lipschitz
-gradient, bounded variance, bounded representations), the SGD iterates
-$\{\theta^{(t)}\}_{t=1}^T$ of HeteroInherNet-IB with diminishing
-learning rate $\eta_t=\eta/\sqrt{t}$ satisfy:
+gradient, bounded variance, bounded representations), and assuming
+bounded routing features, bounded expert perturbations, and bounded
+load-balance gradients, the SGD iterates
+$\{\theta^{(t)}\}_{t=1}^T$ of HeteroInherNet-IB satisfy the same
+stationarity-rate order as the original InherNet analysis, with
+modified constants:
 \begin{equation}
   \frac{1}{T}\sum_{t=1}^{T}
     \E\!\bigl[\|\nabla\cL(\theta^{(t)})\|^2\bigr]
-  = \cO\!\left(\frac{1}{\sqrt{T}}\right).
+  \le
+  \mathrm{Rate}_{\mathrm{InherNet}}(T)
+  + \cO(\alpha^2+\lambda_{\mathrm{bal}}).
 \end{equation}
-With the standard choice $\eta_t=\eta/t$, the rate improves to
-$\cO(1/T)$ matching Theorem~2.4 of~\cite{zhou2026inherNet}.
-The auxiliary load-balance loss (Eq.~\eqref{eq:total-loss}) adds a
-bounded perturbation of order $\cO(\lambda_{\mathrm{bal}})$ to the
-gradient, which does not affect the asymptotic rate.
 \end{theorem}
 
 \begin{proof}[Proof sketch]
@@ -649,13 +681,12 @@ the functional form of the SGD descent lemma.  Specifically:
 \begin{itemize}
 \item Per-layer rank heterogeneity changes the effective
   parameter count and the Lipschitz constant $L$ layer-by-layer,
-  but the global smoothness still holds with
-  $L'=\max_l L_l/(r_l+1)$, where $L_l$ is the per-layer
-  Lipschitz constant.
-\item The whitened SVD initialization preserves orthonormality
-  of $\widetilde{\bU}_r$ and $\widetilde{\bV}_r$, so
-  Proposition~2.3 of~\cite{zhou2026inherNet}
-  (conditioning improvement by $\kappa$) still applies.
+  but global smoothness still holds under a finite maximum layer
+  constant.
+\item The whitened SVD initialization remains an orthogonal
+  initialization in the data-weighted coordinates, so the same
+  conditioning intuition applies after absorbing the covariance
+  conditioning into the constants.
 \item The noise perturbation $\epsilon_h$ has zero mean and
   bounded variance ($\alpha^2\|\cdot\|^2$), which adds only
   $\cO(\alpha^2)$ to the variance bound.
@@ -664,8 +695,10 @@ the functional form of the SGD descent lemma.  Specifically:
   and the softmax Jacobian is bounded), contributing
   $\cO(\lambda_{\mathrm{bal}}H)$ to the total gradient norm.
 \end{itemize}
-Substituting these modified constants into the telescoping argument
-of Theorem~B.3 yields the stated rate.
+Substituting these modified constants into the descent argument used
+for InherNet yields the stated compatibility result.  This theorem
+should be presented as an assumption-conditional extension, not as a
+claim that HeteroInherNet universally improves the asymptotic rate.
 \end{proof}
 
 % ---------- 5.3 -----------------------------------------------------------
@@ -681,24 +714,27 @@ HeteroInherNet-IB preserves this topology: the shared projection
 $\bW^{\down}$ still produces a single latent variable
 $\bZ=\bW^{\down}(\bX)\in\R^{r_l}$, and the expert heads
 $\{\bW_h^{\up}\}$ operate on this shared representation.  The
-modifications strengthen the IB objective:
+modifications are consistent with the IB objective under a
+linear-Gaussian or local-linear approximation:
 
 \begin{enumerate}
 \item \textbf{Whitened decomposition} aligns the SVD truncation with
-  the data distribution, ensuring that the discarded components of $\bZ$
-  carry minimal mutual information $I(\bX;\bZ)$---precisely the
-  compression objective of IB.
+  the data distribution, so discarded components have small
+  data-weighted variance.  In a linear-Gaussian setting this provides
+  a tractable proxy for reducing unnecessary information in
+  $I(\bX;\bZ)$.
 \item \textbf{Heterogeneous rank allocation} assigns higher $r_l$
-  (more bits of $\bZ$) to layers where $I(\bZ;\bY)$ is harder to
+  (more bottleneck capacity) to layers where $I(\bZ;\bY)$ is harder to
   preserve, and fewer bits where the spectrum decays rapidly
-  (predictive information is concentrated in a lower-dimensional
-  subspace).  This directly implements the rate-distortion
-  interpretation of IB~\cite{tishby2000information}.
+  (predictive information appears concentrated in a lower-dimensional
+  subspace).  This follows the rate-distortion intuition behind
+  IB~\cite{tishby2000information}, without requiring an exact
+  nonlinear mutual-information estimate.
 \item \textbf{De-symmetrized experts} enable genuine specialization
   among the heads $\bW_h^{\up}$, increasing the effective dimensionality
   of $\bY$ from $r$ (single head) to up to $rH$ (the union of expert
   subspaces), as argued in Appendix~A.2 of~\cite{zhou2026inherNet}.
-\item \textbf{Load-balance loss} prevents expert collapse into a single
+\item \textbf{Load-balance loss} discourages expert collapse into a single
   active expert, maintaining the expressiveness benefit of the
   many-ups design.
 \end{enumerate}
@@ -721,6 +757,9 @@ original InherNet and HeteroInherNet-IB.
   & \textbf{InherNet (Uniform)}
   & \textbf{HeteroInherNet-IB} \\
 \midrule
+Inheritance source
+  & Trained teacher/source
+  & Trained source; teacher or compact base by protocol \\
 Decomposition target
   & Raw weight $\bW$
   & Whitened weight $\widetilde{\bW}=\bW\bC$ \\
@@ -737,8 +776,8 @@ Gating input
   & Compressed features only
   & Decoupled with routing floor \\
 Expert initialization
-  & Symmetric $\frac{1}{H}\bSigma^{1/2}\bV^\top$
-  & De-symmetrized with noise $\epsilon_h$ \\
+  & Identical SVD-initialized experts
+  & SVD experts plus zero-mean noise $\epsilon_h$ \\
 Expert utilization
   & Implicit (no regularization)
   & Load-balance auxiliary loss \\
@@ -750,7 +789,7 @@ Convergence rate
   & $\cO(1/T)$ (preserved) \\
 IB topology
   & One-down-many-ups
-  & Same (strengthened by whitening) \\
+  & Same, with data-weighted bottleneck analysis \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -759,8 +798,9 @@ IB topology
 \section{Practical Configuration}
 \label{sec:config}
 
-Table~\ref{tab:config} lists the default hyper-parameters used in our
-experiments.
+Table~\ref{tab:config} lists method-level defaults.  Optimizer and
+source-model choices should be reported separately for each dataset
+protocol.
 
 \begin{table}[h]
 \centering
@@ -771,19 +811,57 @@ experiments.
 \toprule
 \textbf{Parameter} & \textbf{Symbol} & \textbf{Default} \\
 \midrule
-Inheritance source mode & ---                    & copy \\
+Inheritance source mode & ---                    & trained source \\
 Budget ratio            & $\beta$                & 0.35 \\
 Minimum rank floor      & $r_{\min}$             & 8 \\
-Entropy temperature     & $\tau$                 & 1.5 \\
-Routing floor           & $r_{\mathrm{route}}$   & 4 \\
-Expert heads            & $H$                    & $\{1,2,3\}$ \\
+Entropy temperature     & $\tau$                 & 1.4 \\
+Routing threshold       & $r_{\mathrm{route}}$   & 12 \\
+Expert heads            & $H$                    & 3 (ablate 1,2,3) \\
 Expert noise scale      & $\alpha$               & 0.01 \\
 Balance loss weight     & $\lambda_{\mathrm{bal}}$& 0.01 \\
-Calibration batches     & ---                    & 5 \\
-Optimizer               & ---                    & Adam, lr=$10^{-3}$ \\
+Calibration batches     & ---                    & 16 \\
+Linear-layer compression& ---                    & off by default \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+For the CIFAR-10 legacy-compatible protocol, the trained source is the
+compact baseline and the compressed model is trained supervised with
+Adam.  For the CIFAR-100 paper-style protocol, the trained source is
+the teacher and the compressed model is trained with knowledge
+distillation using SGD.
+
+% ============================================================================
+\section{Narrative Positioning for the Full Paper}
+\label{sec:narrative}
+
+The central story should be simple: InherNet shows that a compact model
+can inherit a trained source by SVD-based low-rank factorization, but
+uniform rank assigns the same bottleneck to every layer.  Real networks
+do not distribute task-relevant information uniformly across layers.
+HeteroInherNet-IB therefore turns inheritance into a data-aware budget
+allocation problem.
+
+A top-tier introduction should follow this arc:
+\begin{enumerate}
+\item Motivate why explicit inheritance is a useful alternative to
+  designing small students or adapting frozen models.
+\item Present InherNet as the right starting point because it inherits
+  full trained weights rather than only matching outputs.
+\item Identify the gap: uniform low-rank inheritance ignores
+  layer-wise data-conditioned spectral complexity.
+\item State the principle: allocate bottleneck capacity according to
+  data-weighted spectral entropy under a global parameter budget.
+\item Preview the evidence: a data-weighted approximation theorem, an
+  entropy-budget derivation, convergence-compatible optimization
+  analysis, and experiments/diagnostics showing improved
+  accuracy--parameter tradeoffs.
+\end{enumerate}
+
+The paper should avoid claiming universal IB optimality.  The stronger
+and more credible claim is that HeteroInherNet-IB provides a principled
+data-weighted approximation and rate-distortion interpretation that
+explains why heterogeneous ranks are preferable to uniform ranks.
 
 % ============================================================================
 \section{Discussion}

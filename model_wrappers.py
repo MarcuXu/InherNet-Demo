@@ -368,66 +368,6 @@ class GenericHeteroNet(BackboneWrapper):
         noise = noise * (noise_scale * base_std)
         return noise - noise.mean(dim=0, keepdim=True)
 
-    def _replace_linear_with_rank_map(
-        self,
-        module: nn.Linear,
-        rank: int,
-        head_num: int,
-        compress_threshold: int,
-    ) -> nn.Module:
-        rank = max(1, min(rank, min(module.in_features, module.out_features)))
-        linear1 = nn.Linear(module.in_features, rank, bias=False)
-        expert_layers = nn.ModuleList(
-            [
-                nn.Linear(rank, module.out_features, bias=module.bias is not None)
-                for _ in range(head_num)
-            ]
-        )
-        use_uncompressed_gate = rank < compress_threshold
-        gate_input_dim = module.in_features if use_uncompressed_gate else rank
-        return DecoupledGatedSVDLinear(
-            linear1,
-            expert_layers,
-            gate_input_dim,
-            head_num,
-            use_uncompressed_gate,
-        )
-
-    def _replace_conv_with_rank_map(
-        self,
-        module: nn.Conv2d,
-        rank: int,
-        head_num: int,
-        compress_threshold: int,
-    ) -> nn.Module:
-        if module.groups != 1:
-            return module
-        rank = max(1, min(rank, min(module.in_channels * module.kernel_size[0] * module.kernel_size[1], module.out_channels)))
-        conv1 = nn.Conv2d(
-            module.in_channels,
-            rank,
-            kernel_size=module.kernel_size,
-            stride=module.stride,
-            padding=module.padding,
-            dilation=module.dilation,
-            bias=False,
-        )
-        expert_layers = nn.ModuleList(
-            [
-                nn.Conv2d(rank, module.out_channels, kernel_size=1, stride=1, padding=0, bias=module.bias is not None)
-                for _ in range(head_num)
-            ]
-        )
-        use_uncompressed_gate = rank < compress_threshold
-        gate_input_dim = module.in_channels if use_uncompressed_gate else rank
-        return DecoupledGatedSVDConv2d(
-            conv1,
-            expert_layers,
-            gate_input_dim,
-            head_num,
-            use_uncompressed_gate,
-        )
-
     def _extract_input_features(self, module: nn.Module, layer_input: torch.Tensor) -> torch.Tensor:
         if isinstance(module, nn.Conv2d):
             return torch.mean(layer_input, dim=(2, 3))

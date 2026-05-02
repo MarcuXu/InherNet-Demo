@@ -42,6 +42,7 @@ Notes:
   Shared options such as --epochs, --download, and --plot-mode must come after -- in suite mode.
   Pair defaults choose the workflow. For example, resnet50_to_resnet18_org uses demo_code_org.py
   settings by default, while CIFAR-100 pairs use paper-style teacher inheritance with KD.
+  Use explicit demo_code.py options after -- when you need to override those defaults.
 
 Examples:
   Original demo_code_org.py-style CIFAR-10 suite:
@@ -52,6 +53,9 @@ Examples:
 
   Short smoke test without plots:
     ./run.sh --suite all --dataset cifar10 --pair resnet50_to_resnet18_org -- --smoke-test --plot-mode none
+
+  Short 10-epoch validation run:
+    ./run.sh --suite comparison --dataset cifar100 --pair resnet56_to_resnet20 -- --epochs 10 --download --plot-mode none
 
   Run one CIFAR-100 method directly:
     ./run.sh --dataset cifar100 --pair vgg13_to_vgg8 --method hetero --download
