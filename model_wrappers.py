@@ -67,7 +67,12 @@ def _checked_inverse(matrix: torch.Tensor, context: str) -> torch.Tensor:
     try:
         inverse = torch.linalg.inv(matrix)
     except RuntimeError as exc:
-        raise StableSVDDecompositionError(f"{context} inversion failed: {exc}") from exc
+        try:
+            inverse = torch.linalg.pinv(matrix)
+        except RuntimeError as pinv_exc:
+            raise StableSVDDecompositionError(
+                f"{context} inversion failed: {exc}; pseudo-inverse also failed: {pinv_exc}"
+            ) from pinv_exc
     _ensure_finite_tensors(f"{context} inversion", inverse=inverse)
     return inverse
 
@@ -93,12 +98,13 @@ class GatedSumLinear(nn.Module):
         self.gate = nn.Linear(input_dim, head_num)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim > 2:
-            x = torch.flatten(x, 1)
-        gating_scores = self.gate(x)
+        original_shape = x.shape[:-1]
+        x_flat = x.reshape(-1, x.shape[-1])
+        gating_scores = self.gate(x_flat)
         gating_weights = F.softmax(gating_scores, dim=-1)
-        expert_outputs = torch.stack([expert(x) for expert in self.linear_list], dim=-1)
-        return torch.sum(gating_weights.unsqueeze(1) * expert_outputs, dim=-1)
+        expert_outputs = torch.stack([expert(x_flat) for expert in self.linear_list], dim=-1)
+        output = torch.sum(gating_weights.unsqueeze(1) * expert_outputs, dim=-1)
+        return output.reshape(*original_shape, output.shape[-1])
 
 
 class GatedSumConv2d(nn.Module):
@@ -138,15 +144,16 @@ class DecoupledGatedSVDLinear(nn.Module):
         self._last_gating_probs: torch.Tensor | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim > 2:
-            x = torch.flatten(x, 1)
-        compressed = self.linear1(x)
+        original_shape = x.shape[:-1]
+        x_flat = x.reshape(-1, x.shape[-1])
+        compressed = self.linear1(x_flat)
         expert_outputs = torch.stack([layer(compressed) for layer in self.linear_list], dim=-1)
-        gate_feat = x if self.use_uncompressed_gate else compressed
+        gate_feat = x_flat if self.use_uncompressed_gate else compressed
         gating_scores = self.gate(gate_feat)
         gating_probs = F.softmax(gating_scores, dim=-1)
         self._last_gating_probs = gating_probs
-        return torch.sum(gating_probs.unsqueeze(1) * expert_outputs, dim=-1)
+        output = torch.sum(gating_probs.unsqueeze(1) * expert_outputs, dim=-1)
+        return output.reshape(*original_shape, output.shape[-1])
 
     def load_balance_loss(self) -> torch.Tensor | None:
         if self._last_gating_probs is None:
@@ -200,8 +207,8 @@ class BackboneWrapper(nn.Module):
         super().__init__()
         self.backbone = backbone
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.backbone(x)
+    def forward(self, *args, **kwargs):
+        return self.backbone(*args, **kwargs)
 
     def load_dense_state_dict(self, state_dict: Mapping[str, torch.Tensor]) -> None:
         self.backbone.load_state_dict(state_dict)
@@ -371,19 +378,49 @@ class GenericHeteroNet(BackboneWrapper):
     def _extract_input_features(self, module: nn.Module, layer_input: torch.Tensor) -> torch.Tensor:
         if isinstance(module, nn.Conv2d):
             return torch.mean(layer_input, dim=(2, 3))
-        if layer_input.ndim > 2:
-            return torch.flatten(layer_input, 1)
-        return layer_input
+        return layer_input.reshape(-1, layer_input.shape[-1])
+
+    def _move_inputs_to_device(self, inputs, device: torch.device):
+        if isinstance(inputs, Mapping):
+            return {
+                key: value.to(device) if isinstance(value, torch.Tensor) else value
+                for key, value in inputs.items()
+            }
+        return inputs.to(device)
+
+    def _forward_with_inputs(self, inputs):
+        if isinstance(inputs, Mapping):
+            return self(**inputs)
+        return self(inputs)
 
     def _stable_cholesky(self, matrix: torch.Tensor, base_eps: float = 1e-5) -> torch.Tensor:
-        eye = torch.eye(matrix.shape[0], device=matrix.device, dtype=matrix.dtype)
-        jitter = base_eps
+        original_dtype = matrix.dtype
+        working = torch.nan_to_num(matrix, nan=0.0, posinf=1e6, neginf=-1e6)
+        working = 0.5 * (working + working.transpose(0, 1))
+        working = working.to(dtype=torch.float64)
+        eye = torch.eye(working.shape[0], device=working.device, dtype=working.dtype)
+        scale = torch.diagonal(working).abs().mean().clamp_min(1.0)
+        jitter = base_eps * scale
+
+        def finalize(chol: torch.Tensor) -> torch.Tensor:
+            chol = torch.nan_to_num(chol, nan=0.0, posinf=1e6, neginf=-1e6)
+            chol = torch.clamp(chol, min=-1e6, max=1e6)
+            chol = chol.to(dtype=original_dtype)
+            diag_idx = torch.arange(chol.shape[0], device=chol.device)
+            chol[diag_idx, diag_idx] = chol[diag_idx, diag_idx].clamp_min(1e-6)
+            return chol
+
         for _ in range(5):
             try:
-                return torch.linalg.cholesky(matrix + jitter * eye)
+                chol = torch.linalg.cholesky(working + jitter * eye)
+                return finalize(chol)
             except RuntimeError:
                 jitter *= 10.0
-        return torch.linalg.cholesky(matrix + jitter * eye)
+        eigvals, eigvecs = torch.linalg.eigh(working)
+        eigvals = torch.clamp(eigvals, min=base_eps * scale)
+        repaired = (eigvecs * eigvals.unsqueeze(0)) @ eigvecs.transpose(0, 1)
+        chol = torch.linalg.cholesky(repaired + jitter * eye)
+        return finalize(chol)
 
     def _estimate_input_covariances(
         self,
@@ -403,6 +440,8 @@ class GenericHeteroNet(BackboneWrapper):
             def hook(_, layer_input, __):
                 features = self._extract_input_features(layer_module, layer_input[0].detach())
                 features = features.view(features.shape[0], -1)
+                features = torch.nan_to_num(features, nan=0.0, posinf=1e6, neginf=-1e6)
+                features = torch.clamp(features, min=-1e6, max=1e6)
                 sum_vec = features.sum(dim=0)
                 sum_outer = features.t().matmul(features)
                 if stats[layer_name]["sum"] is None:
@@ -424,7 +463,8 @@ class GenericHeteroNet(BackboneWrapper):
             for batch_idx, (inputs, _) in enumerate(calib_loader):
                 if batch_idx >= max_batches:
                     break
-                _ = self(inputs.to(next(self.parameters()).device))
+                moved_inputs = self._move_inputs_to_device(inputs, next(self.parameters()).device)
+                _ = self._forward_with_inputs(moved_inputs)
         for handle in handles:
             handle.remove()
         if was_training:
@@ -440,6 +480,8 @@ class GenericHeteroNet(BackboneWrapper):
             mean = layer_stats["sum"] / layer_stats["count"]
             exx = layer_stats["sum_outer"] / layer_stats["count"]
             cov = exx - torch.outer(mean, mean)
+            cov = 0.5 * (cov + cov.transpose(0, 1))
+            cov = torch.nan_to_num(cov, nan=0.0, posinf=1e6, neginf=-1e6)
             cov = cov + eps * torch.eye(cov.shape[0], device=cov.device, dtype=cov.dtype)
             covariances[name] = cov.to(device=module.weight.device, dtype=module.weight.dtype)
         return covariances

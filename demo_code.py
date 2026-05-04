@@ -29,6 +29,7 @@ from experiment_registry import (
     resolve_compressed_train_mode,
     resolve_device,
     resolve_fixed_rank_with_override,
+    resolve_hetero_compress_linear,
     resolve_head_num,
     resolve_suite_log_dir,
     resolve_train_settings,
@@ -39,9 +40,12 @@ from model_wrappers import GenericHeteroNet, GenericInherNet
 from plotting_utils import get_pyplot, plot_single_history, plot_suite_comparison_from_logs
 from training_utils import (
     RunLogger,
+    build_task_criterion,
     build_run_logger,
     compute_distillation_objective,
     count_parameters,
+    forward_logits,
+    move_batch_to_device,
     probe_distillation_warmup,
     train_distillation,
     train_supervised,
@@ -95,23 +99,24 @@ def validate_compressed_distillation_setup(
     settings: TrainSettings,
     device: torch.device,
     aux_loss_weight: float = 0.0,
+    problem_type: str = "classification",
 ) -> None:
     try:
         inputs, labels = next(iter(train_loader))
     except StopIteration:
         return
 
-    inputs = inputs.to(device)
+    inputs = move_batch_to_device(inputs, device)
     labels = labels.to(device)
-    criterion = nn.CrossEntropyLoss()
+    criterion = build_task_criterion(problem_type)
     teacher_was_training = teacher_model.training
     student_was_training = student_model.training
     teacher_model.eval()
     student_model.eval()
     try:
         with torch.no_grad():
-            teacher_logits = teacher_model(inputs)
-            student_logits = student_model(inputs)
+            teacher_logits = forward_logits(teacher_model, inputs)
+            student_logits = forward_logits(student_model, inputs)
             ce_loss, kd_loss, aux_loss, total_loss = compute_distillation_objective(
                 teacher_logits,
                 student_logits,
@@ -120,6 +125,7 @@ def validate_compressed_distillation_setup(
                 student_model=student_model,
                 aux_loss_weight=aux_loss_weight,
                 criterion=criterion,
+                problem_type=problem_type,
             )
     finally:
         teacher_model.train(teacher_was_training)
@@ -163,6 +169,7 @@ def validate_compressed_distillation_warmup(
     warmup_batches: int = COMPRESSED_MODEL_WARMUP_BATCHES,
     check_post_step_finiteness: bool = True,
     detailed_check_batches: int = COMPRESSED_MODEL_WARMUP_BATCHES,
+    problem_type: str = "classification",
 ) -> None:
     try:
         probe_distillation_warmup(
@@ -178,6 +185,7 @@ def validate_compressed_distillation_warmup(
             backend_label=backend_label,
             check_post_step_finiteness=check_post_step_finiteness,
             detailed_check_batches=detailed_check_batches,
+            problem_type=problem_type,
         )
     except RuntimeError as exc:
         raise CompressedModelSanityError(
@@ -201,6 +209,7 @@ def build_validated_compressed_model(
     warmup_batches: int = COMPRESSED_MODEL_WARMUP_BATCHES,
     check_post_step_finiteness: bool = True,
     detailed_check_batches: int = COMPRESSED_MODEL_DETAILED_CHECK_BATCHES,
+    problem_type: str = "classification",
 ) -> tuple[nn.Module, dict[str, Any]]:
     loader_generator = getattr(train_loader, "generator", None)
 
@@ -222,6 +231,7 @@ def build_validated_compressed_model(
                 settings=settings,
                 device=device,
                 aux_loss_weight=aux_loss_weight,
+                problem_type=problem_type,
             )
             validate_compressed_distillation_warmup(
                 method=method,
@@ -236,6 +246,7 @@ def build_validated_compressed_model(
                 warmup_batches=warmup_batches,
                 check_post_step_finiteness=check_post_step_finiteness,
                 detailed_check_batches=min(detailed_check_batches, warmup_batches),
+                problem_type=problem_type,
             )
         finally:
             if probe_model is not None:
@@ -280,10 +291,19 @@ def build_run_metadata(
     rank_preset_override: str | None = None,
     extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    dataset_spec = DATASET_REGISTRY[args.dataset]
     metadata: dict[str, Any] = {
         "dataset": args.dataset,
         "pair": args.pair,
         "method": method,
+        "task_type": dataset_spec.task_type,
+        "problem_type": dataset_spec.problem_type,
+        "num_classes": dataset_spec.num_classes,
+        "train_split": dataset_spec.train_split or "train",
+        "eval_split": dataset_spec.eval_split_name,
+        "primary_metric_name": dataset_spec.primary_metric_name,
+        "primary_metric_display": dataset_spec.primary_metric_display,
+        "metric_names": list(dataset_spec.metric_names),
         "config_tag": config_tag,
         "plot_tag": config_tag,
         "teacher_arch": get_role_name(pair_spec, "teacher"),
@@ -291,6 +311,11 @@ def build_run_metadata(
         "num_parameters": count_parameters(model),
         "train_settings": asdict(settings),
     }
+    if dataset_spec.task_type == "vision":
+        metadata["image_size"] = dataset_spec.image_size
+    if dataset_spec.text_task_name is not None:
+        metadata["text_task_name"] = dataset_spec.text_task_name
+        metadata["text_max_length"] = dataset_spec.text_max_length
     if "model_profile" in pair_spec:
         metadata["model_profile"] = str(pair_spec["model_profile"])
     if suite_name is not None:
@@ -358,6 +383,12 @@ def train_teacher_pretrain(
         device,
         logger=logger,
         phase="teacher_pretrain",
+        eval_split_name=dataset_spec.eval_split_name,
+        primary_metric_name=dataset_spec.primary_metric_name,
+        primary_metric_display=dataset_spec.primary_metric_display,
+        metric_names=dataset_spec.metric_names,
+        problem_type=dataset_spec.problem_type,
+        num_labels=dataset_spec.num_classes,
     )
     teacher_model.eval()
     return teacher_model, history
@@ -382,6 +413,12 @@ def train_student_pretrain(
         device,
         logger=logger,
         phase="student_source_pretrain",
+        eval_split_name=dataset_spec.eval_split_name,
+        primary_metric_name=dataset_spec.primary_metric_name,
+        primary_metric_display=dataset_spec.primary_metric_display,
+        metric_names=dataset_spec.metric_names,
+        problem_type=dataset_spec.problem_type,
+        num_labels=dataset_spec.num_classes,
     )
     student_model.eval()
     return student_model, history
@@ -408,6 +445,15 @@ def train_method_from_scratch(
     head_num = resolve_head_num(args, pair_spec, settings)
     compressed_source = resolve_compressed_source(args, pair_spec)
     compressed_train_mode = resolve_compressed_train_mode(args, pair_spec)
+    hetero_compress_linear = resolve_hetero_compress_linear(args, pair_spec)
+    metric_log_kwargs = {
+        "eval_split_name": dataset_spec.eval_split_name,
+        "primary_metric_name": dataset_spec.primary_metric_name,
+        "primary_metric_display": dataset_spec.primary_metric_display,
+        "metric_names": dataset_spec.metric_names,
+        "problem_type": dataset_spec.problem_type,
+        "num_labels": dataset_spec.num_classes,
+    }
 
     if method == "teacher":
         model = build_pair_model(args.dataset, args.pair, "teacher", dataset_spec.num_classes).to(device)
@@ -422,7 +468,15 @@ def train_method_from_scratch(
             suite_label=suite_label,
         )
         logger.metadata(metadata)
-        history = train_supervised(model, train_loader, test_loader, settings, device, logger=logger)
+        history = train_supervised(
+            model,
+            train_loader,
+            test_loader,
+            settings,
+            device,
+            logger=logger,
+            **metric_log_kwargs,
+        )
     elif method == "student":
         model = build_pair_model(args.dataset, args.pair, "student", dataset_spec.num_classes).to(device)
         metadata = build_run_metadata(
@@ -436,7 +490,15 @@ def train_method_from_scratch(
             suite_label=suite_label,
         )
         logger.metadata(metadata)
-        history = train_supervised(model, train_loader, test_loader, settings, device, logger=logger)
+        history = train_supervised(
+            model,
+            train_loader,
+            test_loader,
+            settings,
+            device,
+            logger=logger,
+            **metric_log_kwargs,
+        )
     elif method == "student_kd":
         if teacher_model is None:
             raise ValueError("student_kd requires an in-memory teacher model.")
@@ -463,6 +525,7 @@ def train_method_from_scratch(
             device,
             logger=logger,
             run_label=method,
+            **metric_log_kwargs,
         )
     elif method == "inhernet":
         if teacher_model is None:
@@ -518,6 +581,7 @@ def train_method_from_scratch(
             retry_svd_backend="cpu" if args.svd_backend != "cpu" else None,
             gradient_clip_norm=5.0,
             detailed_check_batches=COMPRESSED_MODEL_DETAILED_CHECK_BATCHES,
+            problem_type=dataset_spec.problem_type,
         )
         metadata = build_run_metadata(
             method,
@@ -540,6 +604,7 @@ def train_method_from_scratch(
                 settings,
                 device,
                 logger=logger,
+                **metric_log_kwargs,
             )
         else:
             history = train_distillation(
@@ -555,6 +620,7 @@ def train_method_from_scratch(
                 backend_label=str(inhernet_extra["svd_backend"]),
                 check_post_step_finiteness=True,
                 detailed_check_batches=COMPRESSED_MODEL_DETAILED_CHECK_BATCHES,
+                **metric_log_kwargs,
             )
     elif method == "hetero":
         if teacher_model is None:
@@ -591,12 +657,12 @@ def train_method_from_scratch(
                 max_calib_batches=args.max_calib_batches,
                 svd_backend=svd_backend,
                 expert_noise_scale=args.hetero_expert_noise_scale,
-                compress_linear=args.hetero_compress_linear,
+                compress_linear=hetero_compress_linear,
             )
             rank_values = list(rank_map.values())
             avg_rank = sum(rank_values) / len(rank_values)
             target_layer_types = ["conv2d"]
-            if args.hetero_compress_linear:
+            if hetero_compress_linear:
                 target_layer_types.append("linear")
             extra = {
                 "head_num": head_num,
@@ -607,7 +673,7 @@ def train_method_from_scratch(
                 "max_calib_batches": args.max_calib_batches,
                 "aux_loss_weight": args.aux_loss_weight,
                 "hetero_expert_noise_scale": args.hetero_expert_noise_scale,
-                "hetero_compress_linear": args.hetero_compress_linear,
+                "hetero_compress_linear": hetero_compress_linear,
                 "target_layer_types": target_layer_types,
                 "rank_map": {name: int(rank) for name, rank in rank_map.items()},
                 "avg_rank": avg_rank,
@@ -633,6 +699,7 @@ def train_method_from_scratch(
             retry_svd_backend="cpu" if args.svd_backend != "cpu" else None,
             gradient_clip_norm=5.0,
             detailed_check_batches=COMPRESSED_MODEL_DETAILED_CHECK_BATCHES,
+            problem_type=dataset_spec.problem_type,
         )
         rank_map = hetero_extra["rank_map"]
         avg_rank = float(hetero_extra["avg_rank"])
@@ -662,6 +729,7 @@ def train_method_from_scratch(
                 device,
                 aux_loss_weight=args.aux_loss_weight,
                 logger=logger,
+                **metric_log_kwargs,
             )
         else:
             history = train_distillation(
@@ -678,12 +746,47 @@ def train_method_from_scratch(
                 backend_label=str(hetero_extra["svd_backend"]),
                 check_post_step_finiteness=True,
                 detailed_check_batches=COMPRESSED_MODEL_DETAILED_CHECK_BATCHES,
+                **metric_log_kwargs,
             )
     else:
         raise ValueError(f"Unsupported method: {method}")
 
     model.eval()
     return model, history, metadata
+
+
+def build_smoke_sample(dataset_spec: DatasetSpec, device: torch.device):
+    if dataset_spec.task_type == "text":
+        return {
+            "input_ids": torch.randint(0, 1000, (2, min(dataset_spec.text_max_length, 16)), device=device),
+            "attention_mask": torch.ones(2, min(dataset_spec.text_max_length, 16), dtype=torch.long, device=device),
+        }
+    return torch.randn(2, 3, dataset_spec.image_size, dataset_spec.image_size, device=device)
+
+
+def build_smoke_calibration_loader(dataset_spec: DatasetSpec) -> DataLoader:
+    if dataset_spec.task_type == "text":
+        sequence_length = min(dataset_spec.text_max_length, 16)
+        input_ids = torch.randint(0, 1000, (8, sequence_length))
+        attention_mask = torch.ones(8, sequence_length, dtype=torch.long)
+        labels = torch.zeros(8, dtype=torch.long)
+        tensor_dataset = TensorDataset(input_ids, attention_mask, labels)
+
+        def collate_text_smoke(batch):
+            ids, masks, batch_labels = zip(*batch)
+            return (
+                {
+                    "input_ids": torch.stack(ids),
+                    "attention_mask": torch.stack(masks),
+                },
+                torch.stack(batch_labels),
+            )
+
+        return DataLoader(tensor_dataset, batch_size=2, shuffle=False, collate_fn=collate_text_smoke)
+
+    calib_inputs = torch.randn(8, 3, dataset_spec.image_size, dataset_spec.image_size)
+    calib_labels = torch.zeros(8, dtype=torch.long)
+    return DataLoader(TensorDataset(calib_inputs, calib_labels), batch_size=2, shuffle=False)
 
 
 def run_single_method_smoke_test(
@@ -698,28 +801,27 @@ def run_single_method_smoke_test(
     settings = resolve_train_settings(dataset_spec, args, pair_spec)
     head_num = resolve_head_num(args, pair_spec, settings)
     compressed_source = resolve_compressed_source(args, pair_spec)
+    hetero_compress_linear = resolve_hetero_compress_linear(args, pair_spec)
     device = resolve_device(args.device)
-    sample = torch.randn(2, 3, 32, 32, device=device)
-    calib_inputs = torch.randn(8, 3, 32, 32)
-    calib_labels = torch.zeros(8, dtype=torch.long)
-    calib_loader = DataLoader(TensorDataset(calib_inputs, calib_labels), batch_size=2, shuffle=False)
+    sample = build_smoke_sample(dataset_spec, device)
+    calib_loader = build_smoke_calibration_loader(dataset_spec)
 
     if method == "teacher":
         model = build_pair_model(dataset_name, pair_name, "teacher", dataset_spec.num_classes).to(device)
         with torch.no_grad():
-            output = model(sample)
+            output = forward_logits(model, sample)
         return {"method": method, "shape": tuple(output.shape), "params": count_parameters(model)}
     if method == "student":
         model = build_pair_model(dataset_name, pair_name, "student", dataset_spec.num_classes).to(device)
         with torch.no_grad():
-            output = model(sample)
+            output = forward_logits(model, sample)
         return {"method": method, "shape": tuple(output.shape), "params": count_parameters(model)}
     if method == "student_kd":
         teacher = build_pair_model(dataset_name, pair_name, "teacher", dataset_spec.num_classes).to(device)
         student = build_pair_model(dataset_name, pair_name, "student", dataset_spec.num_classes).to(device)
         with torch.no_grad():
-            teacher_out = teacher(sample)
-            student_out = student(sample)
+            teacher_out = forward_logits(teacher, sample)
+            student_out = forward_logits(student, sample)
         return {
             "method": method,
             "teacher_shape": tuple(teacher_out.shape),
@@ -733,7 +835,7 @@ def run_single_method_smoke_test(
         rank = resolve_fixed_rank_with_override(args, pair_spec, rank_preset_override)
         svd_backend = model.apply_svd(rank=rank, head_num=head_num, svd_backend=args.svd_backend)
         with torch.no_grad():
-            output = model(sample)
+            output = forward_logits(model, sample)
         return {
             "method": method,
             "shape": tuple(output.shape),
@@ -758,10 +860,10 @@ def run_single_method_smoke_test(
             max_calib_batches=min(args.max_calib_batches, len(calib_loader)),
             svd_backend=args.svd_backend,
             expert_noise_scale=args.hetero_expert_noise_scale,
-            compress_linear=args.hetero_compress_linear,
+            compress_linear=hetero_compress_linear,
         )
         with torch.no_grad():
-            output = model(sample)
+            output = forward_logits(model, sample)
         assert args.compress_threshold > args.min_rank
         return {
             "method": method,
@@ -980,7 +1082,7 @@ def run_training(args: argparse.Namespace) -> Path:
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Registry-driven InherNet runner for CIFAR-10 and CIFAR-100.")
+    parser = argparse.ArgumentParser(description="Registry-driven HeteroInherNet runner for vision and GLUE tasks.")
     parser.add_argument("--dataset", choices=sorted(DATASET_REGISTRY.keys()), required=True)
     parser.add_argument("--pair", required=True, help="Dataset-specific teacher/student pair name.")
     mode_group = parser.add_mutually_exclusive_group(required=True)

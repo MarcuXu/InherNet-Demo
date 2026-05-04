@@ -17,6 +17,11 @@ from cifar10_models import PAIR_REGISTRY as CIFAR10_PAIR_REGISTRY
 from cifar10_models import build_model as build_cifar10_model
 from cifar100_models import PAIR_REGISTRY as CIFAR100_PAIR_REGISTRY
 from cifar100_models import build_model as build_cifar100_model
+from glue_data import build_glue_dataloaders
+from glue_models import PAIR_REGISTRY as GLUE_PAIR_REGISTRY
+from glue_models import build_model as build_glue_model
+from pet_models import PAIR_REGISTRY as OXFORD_PETS_PAIR_REGISTRY
+from pet_models import build_model as build_pet_model
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -60,11 +65,65 @@ class TrainSettings:
 @dataclass(frozen=True)
 class DatasetSpec:
     num_classes: int
-    dataset_class: type
-    mean: tuple[float, float, float]
-    std: tuple[float, float, float]
+    dataset_class: type | None
+    mean: tuple[float, float, float] | None
+    std: tuple[float, float, float] | None
     train_settings: TrainSettings
     pair_registry: Mapping[str, Mapping[str, Any]]
+    task_type: str = "vision"
+    image_size: int = 32
+    train_split: str | None = None
+    test_split: str | None = None
+    eval_split_name: str = "test"
+    primary_metric_name: str = "accuracy"
+    primary_metric_display: str = "Accuracy (%)"
+    metric_names: tuple[str, ...] = ("accuracy",)
+    problem_type: str = "classification"
+    text_task_name: str | None = None
+    text_max_length: int = 128
+
+
+GLUE_TRAIN_SETTINGS = TrainSettings(
+    optimizer_name="adam",
+    batch_size=32,
+    epochs=3,
+    lr=2e-5,
+    momentum=0.0,
+    weight_decay=0.01,
+    lr_milestones=(),
+    kd_temperature=2.0,
+    kd_loss_weight=1.0,
+    ce_loss_weight=1.0,
+    default_head_num=2,
+)
+
+
+def build_glue_dataset_spec(
+    *,
+    task_name: str,
+    num_classes: int,
+    eval_split_name: str = "validation",
+    primary_metric_name: str = "accuracy",
+    primary_metric_display: str = "GLUE Accuracy (%)",
+    metric_names: tuple[str, ...] = ("accuracy",),
+    problem_type: str = "classification",
+) -> DatasetSpec:
+    return DatasetSpec(
+        num_classes=num_classes,
+        dataset_class=None,
+        mean=None,
+        std=None,
+        train_settings=GLUE_TRAIN_SETTINGS,
+        pair_registry=GLUE_PAIR_REGISTRY,
+        task_type="text",
+        eval_split_name=eval_split_name,
+        primary_metric_name=primary_metric_name,
+        primary_metric_display=primary_metric_display,
+        metric_names=metric_names,
+        problem_type=problem_type,
+        text_task_name=task_name,
+        text_max_length=128,
+    )
 
 
 DATASET_REGISTRY: dict[str, DatasetSpec] = {
@@ -87,6 +146,7 @@ DATASET_REGISTRY: dict[str, DatasetSpec] = {
             default_head_num=3,
         ),
         pair_registry=CIFAR10_PAIR_REGISTRY,
+        primary_metric_display="Top-1 Accuracy (%)",
     ),
     "cifar100": DatasetSpec(
         num_classes=100,
@@ -107,6 +167,74 @@ DATASET_REGISTRY: dict[str, DatasetSpec] = {
             default_head_num=3,
         ),
         pair_registry=CIFAR100_PAIR_REGISTRY,
+        primary_metric_display="Top-1 Accuracy (%)",
+    ),
+    "oxford_pets": DatasetSpec(
+        num_classes=37,
+        dataset_class=torchvision.datasets.OxfordIIITPet,
+        mean=(0.485, 0.456, 0.406),
+        std=(0.229, 0.224, 0.225),
+        train_settings=TrainSettings(
+            optimizer_name="sgd",
+            batch_size=64,
+            epochs=80,
+            lr=0.01,
+            momentum=0.9,
+            weight_decay=1e-4,
+            lr_milestones=(50, 70),
+            kd_temperature=2.0,
+            kd_loss_weight=1.0,
+            ce_loss_weight=1.0,
+            default_head_num=3,
+        ),
+        pair_registry=OXFORD_PETS_PAIR_REGISTRY,
+        image_size=128,
+        train_split="trainval",
+        test_split="test",
+        primary_metric_display="Top-1 Accuracy (%)",
+        metric_names=("accuracy", "macro_f1", "balanced_accuracy"),
+    ),
+    "glue_mrpc": build_glue_dataset_spec(
+        task_name="mrpc",
+        num_classes=2,
+        metric_names=("accuracy", "f1"),
+    ),
+    "glue_qqp": build_glue_dataset_spec(
+        task_name="qqp",
+        num_classes=2,
+        metric_names=("accuracy", "f1"),
+    ),
+    "glue_sst2": build_glue_dataset_spec(
+        task_name="sst2",
+        num_classes=2,
+    ),
+    "glue_mnli": build_glue_dataset_spec(
+        task_name="mnli",
+        num_classes=3,
+        eval_split_name="validation_matched",
+    ),
+    "glue_rte": build_glue_dataset_spec(
+        task_name="rte",
+        num_classes=2,
+    ),
+    "glue_qnli": build_glue_dataset_spec(
+        task_name="qnli",
+        num_classes=2,
+    ),
+    "glue_cola": build_glue_dataset_spec(
+        task_name="cola",
+        num_classes=2,
+        primary_metric_name="matthews_correlation",
+        primary_metric_display="Matthews Correlation (%)",
+        metric_names=("matthews_correlation", "accuracy"),
+    ),
+    "glue_stsb": build_glue_dataset_spec(
+        task_name="stsb",
+        num_classes=1,
+        primary_metric_name="pearson",
+        primary_metric_display="Pearson / Spearman Correlation (%)",
+        metric_names=("pearson", "spearmanr"),
+        problem_type="regression",
     ),
 }
 
@@ -180,33 +308,73 @@ def build_pair_model(dataset_name: str, pair_name: str, role: str, num_classes: 
         return build_cifar10_model(model_name, num_classes)
     if dataset_name == "cifar100":
         return build_cifar100_model(model_name, num_classes)
+    if dataset_name == "oxford_pets":
+        return build_pet_model(model_name, num_classes)
+    if DATASET_REGISTRY[dataset_name].task_type == "text":
+        return build_glue_model(model_name, num_classes)
     raise ValueError(f"No builder registered for {dataset_name}:{pair_name}:{role}")
 
 
 def get_transforms(dataset_name: str) -> tuple[transforms.Compose, transforms.Compose]:
     dataset_spec = DATASET_REGISTRY[dataset_name]
+    if dataset_spec.task_type != "vision":
+        raise ValueError(f"Dataset '{dataset_name}' is not a vision dataset.")
+    if dataset_spec.mean is None or dataset_spec.std is None:
+        raise ValueError(f"Vision dataset '{dataset_name}' is missing normalization statistics.")
     normalize = transforms.Normalize(dataset_spec.mean, dataset_spec.std)
+    if dataset_name in {"cifar10", "cifar100"}:
+        train_transform = transforms.Compose(
+            [
+                transforms.RandomCrop(dataset_spec.image_size, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                normalize,
+            ]
+        )
+        test_transform = transforms.Compose([transforms.ToTensor(), normalize])
+        return train_transform, test_transform
     train_transform = transforms.Compose(
         [
-            transforms.RandomCrop(32, padding=4),
+            transforms.Resize((dataset_spec.image_size, dataset_spec.image_size)),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             normalize,
         ]
     )
-    test_transform = transforms.Compose([transforms.ToTensor(), normalize])
+    test_transform = transforms.Compose(
+        [
+            transforms.Resize((dataset_spec.image_size, dataset_spec.image_size)),
+            transforms.ToTensor(),
+            normalize,
+        ]
+    )
     return train_transform, test_transform
 
 
 def get_dataset(dataset_name: str, root: str, train: bool, download: bool):
     dataset_spec = DATASET_REGISTRY[dataset_name]
+    if dataset_spec.task_type != "vision":
+        raise ValueError(f"Dataset '{dataset_name}' is not loaded through the vision dataset path.")
+    if dataset_spec.dataset_class is None:
+        raise ValueError(f"Vision dataset '{dataset_name}' does not define a dataset class.")
     train_transform, test_transform = get_transforms(dataset_name)
-    return dataset_spec.dataset_class(
-        root=root,
-        train=train,
-        download=download,
-        transform=train_transform if train else test_transform,
-    )
+    if dataset_name in {"cifar10", "cifar100"}:
+        return dataset_spec.dataset_class(
+            root=root,
+            train=train,
+            download=download,
+            transform=train_transform if train else test_transform,
+        )
+    if dataset_name == "oxford_pets":
+        split = dataset_spec.train_split if train else dataset_spec.test_split
+        return dataset_spec.dataset_class(
+            root=root,
+            split=split,
+            target_types="category",
+            download=download,
+            transform=train_transform if train else test_transform,
+        )
+    raise ValueError(f"No vision dataset loader registered for {dataset_name}")
 
 
 def get_dataloaders(
@@ -219,6 +387,9 @@ def get_dataloaders(
     seed: int = 42,
     pin_memory: bool | None = None,
 ) -> tuple[DataLoader, DataLoader]:
+    dataset_spec = DATASET_REGISTRY[dataset_name]
+    if dataset_spec.task_type != "vision":
+        raise ValueError(f"Dataset '{dataset_name}' is not loaded through the vision dataloader path.")
     train_set = get_dataset(dataset_name, root=root, train=True, download=download)
     test_set = get_dataset(dataset_name, root=root, train=False, download=download)
     generator = torch.Generator().manual_seed(seed)
@@ -240,7 +411,6 @@ def get_dataloaders(
         pin_memory=pin_memory,
     )
     return train_loader, test_loader
-
 
 def format_float_tag(value: float) -> str:
     return f"{value:g}".replace(".", "p")
@@ -311,6 +481,10 @@ def resolve_head_num(args: argparse.Namespace, pair_spec: Mapping[str, Any], set
     return settings.default_head_num
 
 
+def resolve_hetero_compress_linear(args: argparse.Namespace, pair_spec: Mapping[str, Any]) -> bool:
+    return bool(args.hetero_compress_linear or pair_spec.get("hetero_compress_linear_default", False))
+
+
 def resolve_fixed_rank_with_override(
     args: argparse.Namespace,
     pair_spec: Mapping[str, Any],
@@ -372,13 +546,14 @@ def build_method_tag(
         if compressed_train_mode != "distillation":
             tag = f"{tag}_{compressed_train_mode}"
     elif method == "hetero":
+        compress_linear = resolve_hetero_compress_linear(args, pair_spec)
         tag = (
             f"heads_{head_num}_budget_{format_float_tag(args.budget_ratio)}_"
             f"min_{args.min_rank}_temp_{format_float_tag(args.hetero_temperature)}_"
             f"thr_{args.compress_threshold}_calib_{args.max_calib_batches}_"
             f"noise_{format_float_tag(args.hetero_expert_noise_scale)}"
         )
-        if args.hetero_compress_linear:
+        if compress_linear:
             tag = f"{tag}_linear"
         compressed_source = resolve_compressed_source(args, pair_spec)
         compressed_train_mode = resolve_compressed_train_mode(args, pair_spec)
@@ -397,6 +572,24 @@ def build_training_dataloaders(
     device: torch.device | None = None,
 ) -> tuple[DataLoader, DataLoader]:
     runtime_device = resolve_device(args.device) if device is None else device
+    dataset_spec = DATASET_REGISTRY[args.dataset]
+    if dataset_spec.task_type == "text":
+        pair_spec = get_pair_spec(args.dataset, args.pair)
+        tokenizer_name = str(pair_spec.get("tokenizer_name", get_role_name(pair_spec, "teacher")))
+        if dataset_spec.text_task_name is None:
+            raise ValueError(f"Text dataset '{args.dataset}' is missing a GLUE task name.")
+        return build_glue_dataloaders(
+            task_name=dataset_spec.text_task_name,
+            eval_split_name=dataset_spec.eval_split_name,
+            problem_type=dataset_spec.problem_type,
+            root=args.data_root,
+            batch_size=settings.batch_size,
+            num_workers=args.num_workers,
+            seed=args.seed,
+            pin_memory=runtime_device.type == "cuda",
+            tokenizer_name=tokenizer_name,
+            max_length=dataset_spec.text_max_length,
+        )
     return get_dataloaders(
         args.dataset,
         batch_size=settings.batch_size,

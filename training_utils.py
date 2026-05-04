@@ -20,6 +20,7 @@ from model_wrappers import compute_gating_load_balance_loss
 RUN_LOG_ENV_VAR = "INHERNET_RUN_LOG"
 RUN_METADATA_PREFIX = "RUN_METADATA"
 RUN_METRICS_PREFIX = "RUN_METRICS"
+RUN_SUMMARY_PREFIX = "RUN_SUMMARY"
 
 
 class RunLogger:
@@ -100,31 +101,242 @@ def normalize_history(history: Mapping[str, Any] | None) -> dict[str, list[float
     return normalized
 
 
+def move_batch_to_device(inputs: Any, device: torch.device):
+    if isinstance(inputs, Mapping):
+        return {
+            key: value.to(device) if isinstance(value, torch.Tensor) else value
+            for key, value in inputs.items()
+        }
+    return inputs.to(device)
+
+
+def forward_logits(model: nn.Module, inputs: Any) -> torch.Tensor:
+    outputs = model(**inputs) if isinstance(inputs, Mapping) else model(inputs)
+    if isinstance(outputs, torch.Tensor):
+        return outputs
+    logits = getattr(outputs, "logits", None)
+    if logits is not None:
+        return logits
+    if isinstance(outputs, (tuple, list)) and outputs:
+        first = outputs[0]
+        if isinstance(first, torch.Tensor):
+            return first
+    raise TypeError(f"Model output type {type(outputs)!r} does not expose logits.")
+
+
+def build_task_criterion(problem_type: str) -> nn.Module:
+    if problem_type == "classification":
+        return nn.CrossEntropyLoss()
+    if problem_type == "regression":
+        return nn.MSELoss()
+    raise ValueError(f"Unsupported problem type: {problem_type}")
+
+
+def prepare_labels(labels: torch.Tensor, problem_type: str) -> torch.Tensor:
+    return labels.float() if problem_type == "regression" else labels.long()
+
+
+def prepare_regression_outputs(logits: torch.Tensor) -> torch.Tensor:
+    if logits.ndim > 1 and logits.size(-1) == 1:
+        return logits.squeeze(-1)
+    return logits.reshape(-1)
+
+
+def _safe_divide(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator > 0 else 0.0
+
+
+def _compute_classification_metric_values(
+    predictions: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    num_labels: int,
+    metric_names: tuple[str, ...],
+) -> dict[str, float]:
+    predictions = predictions.detach().cpu().long().view(-1)
+    labels = labels.detach().cpu().long().view(-1)
+    total = int(labels.numel())
+    metrics: dict[str, float] = {}
+    if total == 0:
+        return {metric_name: 0.0 for metric_name in metric_names}
+
+    correct = int((predictions == labels).sum().item())
+    if "accuracy" in metric_names:
+        metrics["accuracy"] = 100.0 * correct / total
+
+    recalls: list[float] = []
+    f1_values: list[float] = []
+    for class_idx in range(num_labels):
+        pred_pos = predictions == class_idx
+        label_pos = labels == class_idx
+        true_pos = int((pred_pos & label_pos).sum().item())
+        false_pos = int((pred_pos & ~label_pos).sum().item())
+        false_neg = int((~pred_pos & label_pos).sum().item())
+        support = int(label_pos.sum().item())
+        if support > 0:
+            recalls.append(_safe_divide(true_pos, true_pos + false_neg))
+        precision = _safe_divide(true_pos, true_pos + false_pos)
+        recall = _safe_divide(true_pos, true_pos + false_neg)
+        f1_values.append(_safe_divide(2.0 * precision * recall, precision + recall))
+
+    if "balanced_accuracy" in metric_names:
+        metrics["balanced_accuracy"] = 100.0 * (sum(recalls) / len(recalls) if recalls else 0.0)
+    if "macro_f1" in metric_names:
+        metrics["macro_f1"] = 100.0 * (sum(f1_values) / len(f1_values) if f1_values else 0.0)
+    if "f1" in metric_names:
+        positive_label = 1 if num_labels > 1 else 0
+        pred_pos = predictions == positive_label
+        label_pos = labels == positive_label
+        true_pos = int((pred_pos & label_pos).sum().item())
+        false_pos = int((pred_pos & ~label_pos).sum().item())
+        false_neg = int((~pred_pos & label_pos).sum().item())
+        precision = _safe_divide(true_pos, true_pos + false_pos)
+        recall = _safe_divide(true_pos, true_pos + false_neg)
+        metrics["f1"] = 100.0 * _safe_divide(2.0 * precision * recall, precision + recall)
+    if "matthews_correlation" in metric_names:
+        if num_labels != 2:
+            metrics["matthews_correlation"] = 0.0
+        else:
+            pred_pos = predictions == 1
+            label_pos = labels == 1
+            tp = int((pred_pos & label_pos).sum().item())
+            tn = int((~pred_pos & ~label_pos).sum().item())
+            fp = int((pred_pos & ~label_pos).sum().item())
+            fn = int((~pred_pos & label_pos).sum().item())
+            denominator = math.sqrt(float((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)))
+            metrics["matthews_correlation"] = 100.0 * _safe_divide(float(tp * tn - fp * fn), denominator)
+    return metrics
+
+
+def _rankdata_average(values: torch.Tensor) -> torch.Tensor:
+    values = values.detach().cpu().float().view(-1)
+    if values.numel() == 0:
+        return values
+    sorted_indices = torch.argsort(values, stable=True)
+    sorted_values = values[sorted_indices]
+    ranks = torch.empty_like(values)
+    start = 0
+    count = int(values.numel())
+    while start < count:
+        end = start + 1
+        while end < count and float(sorted_values[end].item()) == float(sorted_values[start].item()):
+            end += 1
+        average_rank = 0.5 * (start + end - 1) + 1.0
+        ranks[sorted_indices[start:end]] = average_rank
+        start = end
+    return ranks
+
+
+def _pearson_correlation_percent(predictions: torch.Tensor, labels: torch.Tensor) -> float:
+    predictions = predictions.detach().cpu().float().view(-1)
+    labels = labels.detach().cpu().float().view(-1)
+    if predictions.numel() < 2:
+        return 0.0
+    pred_centered = predictions - predictions.mean()
+    label_centered = labels - labels.mean()
+    denominator = torch.linalg.vector_norm(pred_centered) * torch.linalg.vector_norm(label_centered)
+    if float(denominator.item()) <= 0:
+        return 0.0
+    return 100.0 * float(torch.dot(pred_centered, label_centered).item() / denominator.item())
+
+
+def _compute_regression_metric_values(
+    predictions: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    metric_names: tuple[str, ...],
+) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    if "pearson" in metric_names:
+        metrics["pearson"] = _pearson_correlation_percent(predictions, labels)
+    if "spearmanr" in metric_names:
+        metrics["spearmanr"] = _pearson_correlation_percent(
+            _rankdata_average(predictions),
+            _rankdata_average(labels),
+        )
+    return metrics
+
+
+def compute_task_metric_values(
+    predictions: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    problem_type: str,
+    num_labels: int,
+    metric_names: tuple[str, ...],
+) -> dict[str, float]:
+    if problem_type == "classification":
+        return _compute_classification_metric_values(
+            predictions,
+            labels,
+            num_labels=num_labels,
+            metric_names=metric_names,
+        )
+    if problem_type == "regression":
+        return _compute_regression_metric_values(predictions, labels, metric_names=metric_names)
+    raise ValueError(f"Unsupported problem type: {problem_type}")
+
+
+def evaluate_task_metrics(
+    model: nn.Module,
+    data_loader: DataLoader,
+    device: torch.device,
+    criterion: nn.Module,
+    *,
+    problem_type: str = "classification",
+    num_labels: int = 0,
+    metric_names: tuple[str, ...] = ("accuracy",),
+) -> dict[str, float]:
+    model.eval()
+    running_loss = 0.0
+    total = 0
+    all_predictions: list[torch.Tensor] = []
+    all_labels: list[torch.Tensor] = []
+    with torch.no_grad():
+        for inputs, labels in data_loader:
+            inputs = move_batch_to_device(inputs, device)
+            labels = prepare_labels(labels.to(device), problem_type)
+            logits = forward_logits(model, inputs)
+            if problem_type == "regression":
+                predictions = prepare_regression_outputs(logits)
+                loss = criterion(predictions, labels.view_as(predictions))
+                metric_labels = labels.view_as(predictions)
+            else:
+                loss = criterion(logits, labels)
+                predictions = logits.argmax(dim=1)
+                metric_labels = labels
+            batch_size = labels.size(0)
+            running_loss += loss.item() * batch_size
+            total += batch_size
+            all_predictions.append(predictions.detach().cpu())
+            all_labels.append(metric_labels.detach().cpu())
+    prediction_tensor = torch.cat(all_predictions) if all_predictions else torch.empty(0)
+    label_tensor = torch.cat(all_labels) if all_labels else torch.empty(0)
+    metrics = compute_task_metric_values(
+        prediction_tensor,
+        label_tensor,
+        problem_type=problem_type,
+        num_labels=max(num_labels, 1),
+        metric_names=metric_names,
+    )
+    metrics["loss"] = running_loss / max(total, 1)
+    return metrics
+
+
 def evaluate_classification_metrics(
     model: nn.Module,
     data_loader: DataLoader,
     device: torch.device,
     criterion: nn.Module,
 ) -> dict[str, float]:
-    model.eval()
-    running_loss = 0.0
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for inputs, labels in data_loader:
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-            logits = model(inputs)
-            loss = criterion(logits, labels)
-            predictions = logits.argmax(dim=1)
-            batch_size = labels.size(0)
-            running_loss += loss.item() * batch_size
-            total += batch_size
-            correct += (predictions == labels).sum().item()
-    return {
-        "loss": running_loss / max(total, 1),
-        "accuracy": 100.0 * correct / max(total, 1),
-    }
+    return evaluate_task_metrics(
+        model,
+        data_loader,
+        device,
+        criterion,
+        problem_type="classification",
+        metric_names=("accuracy",),
+    )
 
 
 def ensure_finite_scalar(value: float, context: str) -> float:
@@ -311,18 +523,28 @@ def compute_distillation_objective(
     student_model: nn.Module | None = None,
     aux_loss_weight: float = 0.0,
     criterion: nn.Module | None = None,
+    problem_type: str = "classification",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
-    hard_loss = nn.CrossEntropyLoss() if criterion is None else criterion
-    ce_loss = hard_loss(student_logits, labels)
-    kd_loss = F.kl_div(
-        F.log_softmax(student_logits / settings.kd_temperature, dim=1),
-        F.softmax(teacher_logits / settings.kd_temperature, dim=1),
-        reduction="batchmean",
-    )
+    hard_loss = build_task_criterion(problem_type) if criterion is None else criterion
+    if problem_type == "regression":
+        student_values = prepare_regression_outputs(student_logits)
+        teacher_values = prepare_regression_outputs(teacher_logits).detach()
+        label_values = labels.float().view_as(student_values)
+        ce_loss = hard_loss(student_values, label_values)
+        kd_loss = F.mse_loss(student_values, teacher_values.view_as(student_values))
+        kd_scale = 1.0
+    else:
+        ce_loss = hard_loss(student_logits, labels.long())
+        kd_loss = F.kl_div(
+            F.log_softmax(student_logits / settings.kd_temperature, dim=1),
+            F.softmax(teacher_logits / settings.kd_temperature, dim=1),
+            reduction="batchmean",
+        )
+        kd_scale = settings.kd_temperature**2
     aux_loss = None
     total_loss = (
         settings.ce_loss_weight * ce_loss
-        + settings.kd_loss_weight * (settings.kd_temperature**2) * kd_loss
+        + settings.kd_loss_weight * kd_scale * kd_loss
     )
     if aux_loss_weight > 0 and student_model is not None:
         aux_loss = compute_gating_load_balance_loss(student_model)
@@ -346,12 +568,13 @@ def probe_distillation_warmup(
     backend_label: str | None = None,
     check_post_step_finiteness: bool = True,
     detailed_check_batches: int = 0,
+    problem_type: str = "classification",
 ) -> None:
     if warmup_batches <= 0:
         return
 
     optimizer = build_optimizer(student_model, settings)
-    hard_loss = nn.CrossEntropyLoss()
+    hard_loss = build_task_criterion(problem_type)
     teacher_was_training = teacher_model.training
     student_was_training = student_model.training
     teacher_model.eval()
@@ -360,12 +583,12 @@ def probe_distillation_warmup(
         for batch_idx, (inputs, labels) in enumerate(train_loader, start=1):
             if batch_idx > warmup_batches:
                 break
-            inputs = inputs.to(device)
-            labels = labels.to(device)
+            inputs = move_batch_to_device(inputs, device)
+            labels = prepare_labels(labels.to(device), problem_type)
             optimizer.zero_grad(set_to_none=True)
             with torch.no_grad():
-                teacher_logits = teacher_model(inputs)
-            student_logits = student_model(inputs)
+                teacher_logits = forward_logits(teacher_model, inputs)
+            student_logits = forward_logits(student_model, inputs)
             ce_loss, kd_loss, aux_loss, loss = compute_distillation_objective(
                 teacher_logits,
                 student_logits,
@@ -374,6 +597,7 @@ def probe_distillation_warmup(
                 student_model=student_model,
                 aux_loss_weight=aux_loss_weight,
                 criterion=hard_loss,
+                problem_type=problem_type,
             )
             collect_detailed_stats = check_post_step_finiteness and _should_collect_detailed_finiteness_stats(
                 epoch=1,
@@ -516,16 +740,33 @@ def _finalize_test_metrics(
     criterion: nn.Module,
     phase: str,
     epoch: int,
+    *,
+    problem_type: str,
+    num_labels: int,
+    metric_names: tuple[str, ...],
+    primary_metric_name: str,
 ) -> dict[str, float]:
-    test_metrics = evaluate_classification_metrics(model, test_loader, device, criterion)
+    test_metrics = evaluate_task_metrics(
+        model,
+        test_loader,
+        device,
+        criterion,
+        problem_type=problem_type,
+        num_labels=num_labels,
+        metric_names=metric_names,
+    )
     test_metrics["loss"] = ensure_finite_scalar(
         test_metrics["loss"],
         f"{phase} epoch {epoch} test_loss",
     )
-    test_metrics["accuracy"] = ensure_finite_scalar(
-        test_metrics["accuracy"],
-        f"{phase} epoch {epoch} test_accuracy",
-    )
+    for metric_name in metric_names:
+        if metric_name in test_metrics:
+            test_metrics[metric_name] = ensure_finite_scalar(
+                test_metrics[metric_name],
+                f"{phase} epoch {epoch} test_{metric_name}",
+            )
+    if primary_metric_name not in test_metrics:
+        raise KeyError(f"Primary metric '{primary_metric_name}' missing from evaluation metrics.")
     return test_metrics
 
 
@@ -538,38 +779,126 @@ def _record_epoch_metrics(
     phase: str,
     train_objective: float,
     train_loss: float,
-    train_accuracy: float,
+    train_metrics: Mapping[str, float],
     test_metrics: Mapping[str, float],
     epoch_time_seconds: float,
     avg_train_batch_ms: float,
+    eval_split_name: str = "test",
+    primary_metric_name: str = "accuracy",
 ) -> None:
+    eval_loss = float(test_metrics["loss"])
+    train_primary = float(train_metrics[primary_metric_name])
+    eval_primary = float(test_metrics[primary_metric_name])
+    train_accuracy = float(train_metrics.get("accuracy", train_primary))
+    eval_accuracy = float(test_metrics.get("accuracy", eval_primary))
+    split_key_prefix = eval_split_name.replace("-", "_").replace(" ", "_")
     history["train_objective"].append(train_objective)
     history["train_loss"].append(train_loss)
-    history["train_accuracy"].append(train_accuracy)
-    history["test_loss"].append(float(test_metrics["loss"]))
-    history["test_accuracy"].append(float(test_metrics["accuracy"]))
+    history["train_accuracy"].append(train_primary)
+    history["test_loss"].append(eval_loss)
+    history["test_accuracy"].append(eval_primary)
     metrics_payload = {
         "epoch": epoch,
         "epochs": settings.epochs,
         "phase": phase,
+        "eval_split": eval_split_name,
         "train_objective": train_objective,
         "train_loss": train_loss,
-        "train_accuracy": train_accuracy,
-        "test_loss": float(test_metrics["loss"]),
-        "test_accuracy": float(test_metrics["accuracy"]),
+        "eval_loss": eval_loss,
+        "test_loss": eval_loss,
+        f"{split_key_prefix}_loss": eval_loss,
+        "primary_metric_name": primary_metric_name,
+        "primary_metric_value": eval_primary,
+        "train_primary_metric_value": train_primary,
         "epoch_time_seconds": epoch_time_seconds,
         "avg_train_batch_ms": avg_train_batch_ms,
     }
+    for metric_name, metric_value in train_metrics.items():
+        metrics_payload[f"train_{metric_name}"] = float(metric_value)
+    for metric_name, metric_value in test_metrics.items():
+        if metric_name == "loss":
+            continue
+        metric_value = float(metric_value)
+        metrics_payload[f"eval_{metric_name}"] = metric_value
+        metrics_payload[f"test_{metric_name}"] = metric_value
+        metrics_payload[f"{split_key_prefix}_{metric_name}"] = metric_value
     logger.metrics(metrics_payload)
+    train_metric_label = f"train_{primary_metric_name}"
+    eval_metric_label = f"{eval_split_name}_{primary_metric_name}"
     logger.epoch(
         f"[{phase}] Epoch {epoch:03d}/{settings.epochs:03d} | "
         f"train_objective={train_objective:.4f} | "
         f"train_loss={train_loss:.4f} | "
-        f"train_acc={train_accuracy:.2f}% | "
-        f"test_loss={float(test_metrics['loss']):.4f} | "
-        f"test_acc={float(test_metrics['accuracy']):.2f}% | "
+        f"{train_metric_label}={train_primary:.2f} | "
+        f"{eval_split_name}_loss={eval_loss:.4f} | "
+        f"{eval_metric_label}={eval_primary:.2f} | "
         f"epoch_time={epoch_time_seconds:.2f}s | "
         f"avg_batch={avg_train_batch_ms:.2f}ms"
+    )
+
+
+def _summarize_history(
+    history: Mapping[str, list[float]],
+    *,
+    eval_split_name: str,
+    primary_metric_name: str,
+    primary_metric_display: str,
+) -> dict[str, float | int | str | None]:
+    train_loss = history.get("train_loss", [])
+    train_primary = history.get("train_accuracy", [])
+    eval_loss = history.get("test_loss", [])
+    eval_primary = history.get("test_accuracy", [])
+    best_eval_metric = max(eval_primary) if eval_primary else None
+    best_eval_epoch = eval_primary.index(best_eval_metric) + 1 if best_eval_metric is not None else 0
+    summary: dict[str, float | int | str | None] = {
+        "epochs_completed": len(eval_primary),
+        "eval_split": eval_split_name,
+        "primary_metric_name": primary_metric_name,
+        "primary_metric_display": primary_metric_display,
+        "best_eval_metric": best_eval_metric,
+        "best_eval_epoch": best_eval_epoch,
+    }
+    if primary_metric_name == "accuracy":
+        summary["best_eval_accuracy"] = best_eval_metric
+    if train_loss:
+        summary["final_train_loss"] = train_loss[-1]
+    if train_primary:
+        summary["final_train_primary_metric"] = train_primary[-1]
+        if primary_metric_name == "accuracy":
+            summary["final_train_accuracy"] = train_primary[-1]
+    if eval_loss:
+        summary["final_eval_loss"] = eval_loss[-1]
+    if eval_primary:
+        summary["final_eval_primary_metric"] = eval_primary[-1]
+        if primary_metric_name == "accuracy":
+            summary["final_eval_accuracy"] = eval_primary[-1]
+    return summary
+
+
+def _log_training_summary(
+    history: Mapping[str, list[float]],
+    logger: RunLogger,
+    *,
+    eval_split_name: str,
+    primary_metric_name: str,
+    primary_metric_display: str,
+) -> None:
+    summary = _summarize_history(
+        history,
+        eval_split_name=eval_split_name,
+        primary_metric_name=primary_metric_name,
+        primary_metric_display=primary_metric_display,
+    )
+    logger.structured(RUN_SUMMARY_PREFIX, summary)
+    if summary["epochs_completed"] == 0:
+        logger.info("Training summary | no epochs completed")
+        return
+    logger.info(
+        "Training summary | "
+        f"best_{eval_split_name}_{primary_metric_name}={float(summary['best_eval_metric']):.2f} "
+        f"@ epoch {int(summary['best_eval_epoch'])} | "
+        f"final_{eval_split_name}_{primary_metric_name}={float(summary['final_eval_primary_metric']):.2f} | "
+        f"final_{eval_split_name}_loss={float(summary['final_eval_loss']):.4f}"
     )
 
 
@@ -582,8 +911,14 @@ def train_supervised(
     aux_loss_weight: float = 0.0,
     logger: RunLogger | None = None,
     phase: str = "target",
+    eval_split_name: str = "test",
+    primary_metric_name: str = "accuracy",
+    primary_metric_display: str = "Accuracy (%)",
+    metric_names: tuple[str, ...] = ("accuracy",),
+    problem_type: str = "classification",
+    num_labels: int = 0,
 ) -> dict[str, list[float]]:
-    criterion = nn.CrossEntropyLoss()
+    criterion = build_task_criterion(problem_type)
     optimizer = build_optimizer(model, settings)
     scheduler = build_scheduler(optimizer, settings)
     history = create_history_template()
@@ -597,15 +932,24 @@ def train_supervised(
             model.train()
         running_objective = 0.0
         running_ce_loss = 0.0
-        running_correct = 0
         total_examples = 0
         batch_count = 0
+        train_predictions: list[torch.Tensor] = []
+        train_labels: list[torch.Tensor] = []
         for batch_count, (inputs, labels) in enumerate(train_loader, start=1):
-            inputs = inputs.to(device)
-            labels = labels.to(device)
+            inputs = move_batch_to_device(inputs, device)
+            labels = prepare_labels(labels.to(device), problem_type)
             optimizer.zero_grad(set_to_none=True)
-            logits = model(inputs)
-            ce_loss = criterion(logits, labels)
+            logits = forward_logits(model, inputs)
+            if problem_type == "regression":
+                predictions = prepare_regression_outputs(logits)
+                label_values = labels.view_as(predictions)
+                ce_loss = criterion(predictions, label_values)
+                metric_labels = label_values
+            else:
+                ce_loss = criterion(logits, labels)
+                predictions = logits.argmax(dim=1)
+                metric_labels = labels
             loss = ce_loss
             if aux_loss_weight > 0:
                 aux_loss = compute_gating_load_balance_loss(model)
@@ -617,8 +961,9 @@ def train_supervised(
             batch_size = labels.size(0)
             running_objective += loss.item() * batch_size
             running_ce_loss += ce_loss.item() * batch_size
-            running_correct += (logits.argmax(dim=1) == labels).sum().item()
             total_examples += batch_size
+            train_predictions.append(predictions.detach().cpu())
+            train_labels.append(metric_labels.detach().cpu())
         if scheduler is not None:
             scheduler.step()
 
@@ -630,10 +975,18 @@ def train_supervised(
             running_ce_loss / max(total_examples, 1),
             f"{phase} epoch {epoch + 1} train_loss",
         )
-        train_accuracy = ensure_finite_scalar(
-            100.0 * running_correct / max(total_examples, 1),
-            f"{phase} epoch {epoch + 1} train_accuracy",
+        train_metrics = compute_task_metric_values(
+            torch.cat(train_predictions) if train_predictions else torch.empty(0),
+            torch.cat(train_labels) if train_labels else torch.empty(0),
+            problem_type=problem_type,
+            num_labels=max(num_labels, 1),
+            metric_names=metric_names,
         )
+        for metric_name, metric_value in list(train_metrics.items()):
+            train_metrics[metric_name] = ensure_finite_scalar(
+                metric_value,
+                f"{phase} epoch {epoch + 1} train_{metric_name}",
+            )
         test_metrics = _finalize_test_metrics(
             model,
             test_loader,
@@ -641,6 +994,10 @@ def train_supervised(
             criterion,
             phase,
             epoch + 1,
+            problem_type=problem_type,
+            num_labels=max(num_labels, 1),
+            metric_names=metric_names,
+            primary_metric_name=primary_metric_name,
         )
         epoch_time_seconds = ensure_finite_scalar(
             time.perf_counter() - epoch_start,
@@ -658,11 +1015,20 @@ def train_supervised(
             phase=phase,
             train_objective=train_objective,
             train_loss=train_loss,
-            train_accuracy=train_accuracy,
+            train_metrics=train_metrics,
             test_metrics=test_metrics,
             epoch_time_seconds=epoch_time_seconds,
             avg_train_batch_ms=avg_train_batch_ms,
+            eval_split_name=eval_split_name,
+            primary_metric_name=primary_metric_name,
         )
+    _log_training_summary(
+        history,
+        logger,
+        eval_split_name=eval_split_name,
+        primary_metric_name=primary_metric_name,
+        primary_metric_display=primary_metric_display,
+    )
     return history
 
 
@@ -681,8 +1047,14 @@ def train_distillation(
     backend_label: str | None = None,
     check_post_step_finiteness: bool = False,
     detailed_check_batches: int = 0,
+    eval_split_name: str = "test",
+    primary_metric_name: str = "accuracy",
+    primary_metric_display: str = "Accuracy (%)",
+    metric_names: tuple[str, ...] = ("accuracy",),
+    problem_type: str = "classification",
+    num_labels: int = 0,
 ) -> dict[str, list[float]]:
-    hard_loss = nn.CrossEntropyLoss()
+    hard_loss = build_task_criterion(problem_type)
     optimizer = build_optimizer(student_model, settings)
     scheduler = build_scheduler(optimizer, settings)
     history = create_history_template()
@@ -698,17 +1070,18 @@ def train_distillation(
             student_model.train()
         running_objective = 0.0
         running_ce_loss = 0.0
-        running_correct = 0
         total_examples = 0
         batch_count = 0
+        train_predictions: list[torch.Tensor] = []
+        train_labels: list[torch.Tensor] = []
         for batch_idx, (inputs, labels) in enumerate(train_loader, start=1):
             batch_count = batch_idx
-            inputs = inputs.to(device)
-            labels = labels.to(device)
+            inputs = move_batch_to_device(inputs, device)
+            labels = prepare_labels(labels.to(device), problem_type)
             optimizer.zero_grad(set_to_none=True)
             with torch.no_grad():
-                teacher_logits = teacher_model(inputs)
-            student_logits = student_model(inputs)
+                teacher_logits = forward_logits(teacher_model, inputs)
+            student_logits = forward_logits(student_model, inputs)
             ce_loss, kd_loss, aux_loss, loss = compute_distillation_objective(
                 teacher_logits,
                 student_logits,
@@ -717,6 +1090,7 @@ def train_distillation(
                 student_model=student_model,
                 aux_loss_weight=aux_loss_weight,
                 criterion=hard_loss,
+                problem_type=problem_type,
             )
             collect_detailed_stats = check_post_step_finiteness and _should_collect_detailed_finiteness_stats(
                 epoch=epoch + 1,
@@ -827,8 +1201,15 @@ def train_distillation(
             batch_size = labels.size(0)
             running_objective += loss.item() * batch_size
             running_ce_loss += ce_loss.item() * batch_size
-            running_correct += (student_logits.argmax(dim=1) == labels).sum().item()
             total_examples += batch_size
+            if problem_type == "regression":
+                predictions = prepare_regression_outputs(student_logits)
+                metric_labels = labels.view_as(predictions)
+            else:
+                predictions = student_logits.argmax(dim=1)
+                metric_labels = labels
+            train_predictions.append(predictions.detach().cpu())
+            train_labels.append(metric_labels.detach().cpu())
         if scheduler is not None:
             scheduler.step()
 
@@ -840,10 +1221,18 @@ def train_distillation(
             running_ce_loss / max(total_examples, 1),
             f"{phase} epoch {epoch + 1} train_loss",
         )
-        train_accuracy = ensure_finite_scalar(
-            100.0 * running_correct / max(total_examples, 1),
-            f"{phase} epoch {epoch + 1} train_accuracy",
+        train_metrics = compute_task_metric_values(
+            torch.cat(train_predictions) if train_predictions else torch.empty(0),
+            torch.cat(train_labels) if train_labels else torch.empty(0),
+            problem_type=problem_type,
+            num_labels=max(num_labels, 1),
+            metric_names=metric_names,
         )
+        for metric_name, metric_value in list(train_metrics.items()):
+            train_metrics[metric_name] = ensure_finite_scalar(
+                metric_value,
+                f"{phase} epoch {epoch + 1} train_{metric_name}",
+            )
         test_metrics = _finalize_test_metrics(
             student_model,
             test_loader,
@@ -851,6 +1240,10 @@ def train_distillation(
             hard_loss,
             phase,
             epoch + 1,
+            problem_type=problem_type,
+            num_labels=max(num_labels, 1),
+            metric_names=metric_names,
+            primary_metric_name=primary_metric_name,
         )
         epoch_time_seconds = ensure_finite_scalar(
             time.perf_counter() - epoch_start,
@@ -868,11 +1261,20 @@ def train_distillation(
             phase=phase,
             train_objective=train_objective,
             train_loss=train_loss,
-            train_accuracy=train_accuracy,
+            train_metrics=train_metrics,
             test_metrics=test_metrics,
             epoch_time_seconds=epoch_time_seconds,
             avg_train_batch_ms=avg_train_batch_ms,
+            eval_split_name=eval_split_name,
+            primary_metric_name=primary_metric_name,
         )
+    _log_training_summary(
+        history,
+        logger,
+        eval_split_name=eval_split_name,
+        primary_metric_name=primary_metric_name,
+        primary_metric_display=primary_metric_display,
+    )
     return history
 
 

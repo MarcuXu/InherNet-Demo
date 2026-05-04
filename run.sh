@@ -10,6 +10,7 @@ PID_FILE="$PROJECT_DIR/run.pid"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 SUITE=""
 DATASET=""
+GLUE_TASK=""
 PAIR=""
 METHOD=""
 PRE_DASH_EXTRA=()
@@ -21,12 +22,14 @@ usage() {
 Usage:
   ./run.sh [--background] [--log-file PATH] --dataset DATASET --pair PAIR --method METHOD [demo_code.py args...]
   ./run.sh [--background] --suite {baseline,comparison,all} --dataset DATASET --pair PAIR -- [shared demo_code.py args...]
+  ./run.sh ... --dataset glue --glue-task {mrpc,qqp,sst2,mnli,rte,qnli,cola,stsb} --pair bert4_to_bert2 ...
 
 Launcher options:
   --background           Launch the selected run in the background with nohup.
   --log-file PATH        Single-run only custom log path.
   --suite NAME           Serial preset suite: baseline, comparison, or all.
                          Suite mode always targets one dataset/pair, not every registered pair.
+  --glue-task NAME       Convenience alias for --dataset glue_<NAME>.
   --                    Separator before shared demo_code.py args in suite mode.
                          Everything after -- is forwarded directly to demo_code.py.
 
@@ -51,8 +54,17 @@ Examples:
   Paper-style CIFAR-100 suite:
     ./run.sh --background --suite all --dataset cifar100 --pair resnet56_to_resnet20 -- --download --device cuda
 
+  Oxford-IIIT Pet fine-grained vision suite:
+    ./run.sh --background --suite comparison --dataset oxford_pets --pair resnet34_to_resnet18 -- --download --device cuda
+
+  GLUE task Hetero run:
+    ./run.sh --dataset glue --glue-task mrpc --pair bert4_to_bert2 --method hetero --device cuda
+
   Short smoke test without plots:
     ./run.sh --suite all --dataset cifar10 --pair resnet50_to_resnet18_org -- --smoke-test --plot-mode none
+
+  Short GLUE/SST-2 smoke test without plots:
+    ./run.sh --dataset glue --glue-task sst2 --pair bert4_to_bert2 --method hetero --smoke-test --plot-mode none --device cuda
 
   Short 10-epoch validation run:
     ./run.sh --suite comparison --dataset cifar100 --pair resnet56_to_resnet20 -- --epochs 10 --download --plot-mode none
@@ -128,6 +140,14 @@ while (($#)); do
             DATASET="$2"
             shift 2
             ;;
+        --glue-task)
+            if (($# < 2)); then
+                echo "--glue-task requires a value" >&2
+                exit 1
+            fi
+            GLUE_TASK="$2"
+            shift 2
+            ;;
         --pair)
             if (($# < 2)); then
                 echo "--pair requires a value" >&2
@@ -161,6 +181,19 @@ if [[ -z "$DATASET" || -z "$PAIR" ]]; then
     exit 1
 fi
 
+if [[ -n "$GLUE_TASK" ]]; then
+    GLUE_TASK="$(printf '%s' "$GLUE_TASK" | tr '[:upper:]' '[:lower:]' | tr '-' '_')"
+    if [[ "$DATASET" == "glue" ]]; then
+        DATASET="glue_$GLUE_TASK"
+    elif [[ "$DATASET" != "glue_$GLUE_TASK" ]]; then
+        echo "--glue-task $GLUE_TASK conflicts with --dataset $DATASET" >&2
+        exit 1
+    fi
+elif [[ "$DATASET" == "glue" ]]; then
+    echo "--dataset glue requires --glue-task {mrpc,qqp,sst2,mnli,rte,qnli,cola,stsb}." >&2
+    exit 1
+fi
+
 if [[ -n "$SUITE" && -n "$METHOD" ]]; then
     usage
     echo "Use either --method or --suite, not both." >&2
@@ -183,7 +216,7 @@ if [[ -n "$SUITE" ]]; then
         exit 1
     fi
 
-    TIMESTAMP="$(date -u +%Y%m%d_%H%M%S)"
+    TIMESTAMP="$(date -u +%Y%m%d_%H%M%S_%N)"
     SUITE_DIR="$PROJECT_DIR/logs/$DATASET/$PAIR/$SUITE/$TIMESTAMP"
     SUITE_LOG_FILE="$SUITE_DIR/suite.log"
     SUITE_PID_FILE="$SUITE_DIR/suite.pid"
@@ -228,7 +261,7 @@ PY_ARGS=(
 )
 
 if [[ -z "$LOG_FILE" ]]; then
-    TIMESTAMP="$(date -u +%Y%m%d_%H%M%S)"
+    TIMESTAMP="$(date -u +%Y%m%d_%H%M%S_%N)"
     mkdir -p "$PROJECT_DIR/logs"
     LOG_FILE="$PROJECT_DIR/logs/run_${TIMESTAMP}.log"
 else

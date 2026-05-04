@@ -22,6 +22,7 @@ from experiment_registry import (
     get_role_name,
     resolve_compressed_source,
     resolve_compressed_train_mode,
+    resolve_hetero_compress_linear,
     resolve_train_settings,
 )
 from model_wrappers import DecoupledGatedSVDLinear, GenericHeteroNet, GenericInherNet
@@ -129,6 +130,86 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(resolve_compressed_source(args, pair), "teacher")
         self.assertEqual(resolve_compressed_train_mode(args, pair), "distillation")
         self.assertEqual(build_method_tag("inhernet", args, pair, settings), "small_rank_8_heads_3")
+
+    def test_added_dataset_registries_are_small_a6000_targets(self) -> None:
+        parser = build_argparser()
+        pet_args = parser.parse_args(
+            [
+                "--dataset",
+                "oxford_pets",
+                "--pair",
+                "resnet34_to_resnet18",
+                "--method",
+                "hetero",
+            ]
+        )
+        pet_spec = DATASET_REGISTRY[pet_args.dataset]
+        pet_pair = get_pair_spec(pet_args.dataset, pet_args.pair)
+        pet_settings = resolve_train_settings(pet_spec, pet_args, pet_pair)
+
+        self.assertEqual(pet_spec.num_classes, 37)
+        self.assertEqual(pet_spec.task_type, "vision")
+        self.assertEqual(pet_spec.image_size, 128)
+        self.assertEqual(pet_spec.eval_split_name, "test")
+        self.assertEqual(pet_spec.primary_metric_display, "Top-1 Accuracy (%)")
+        self.assertEqual(pet_spec.metric_names, ("accuracy", "macro_f1", "balanced_accuracy"))
+        self.assertEqual(get_role_name(pet_pair, "teacher"), "resnet34")
+        self.assertEqual(get_role_name(pet_pair, "student"), "resnet18")
+        self.assertEqual(pet_settings.epochs, 80)
+        self.assertFalse(resolve_hetero_compress_linear(pet_args, pet_pair))
+
+        glue_args = parser.parse_args(
+            [
+                "--dataset",
+                "glue_sst2",
+                "--pair",
+                "bert4_to_bert2",
+                "--method",
+                "hetero",
+            ]
+        )
+        glue_spec = DATASET_REGISTRY[glue_args.dataset]
+        glue_pair = get_pair_spec(glue_args.dataset, glue_args.pair)
+        glue_settings = resolve_train_settings(glue_spec, glue_args, glue_pair)
+
+        self.assertEqual(glue_spec.num_classes, 2)
+        self.assertEqual(glue_spec.task_type, "text")
+        self.assertEqual(glue_spec.problem_type, "classification")
+        self.assertEqual(glue_spec.text_task_name, "sst2")
+        self.assertEqual(glue_spec.eval_split_name, "validation")
+        self.assertEqual(glue_spec.primary_metric_display, "GLUE Accuracy (%)")
+        self.assertEqual(get_role_name(glue_pair, "teacher"), "google/bert_uncased_L-4_H-256_A-4")
+        self.assertEqual(get_role_name(glue_pair, "student"), "google/bert_uncased_L-2_H-128_A-2")
+        self.assertEqual(glue_settings.epochs, 3)
+        self.assertTrue(resolve_hetero_compress_linear(glue_args, glue_pair))
+        self.assertIn("_linear", build_method_tag("hetero", glue_args, glue_pair, glue_settings))
+
+        glue_expectations = {
+            "glue_mrpc": ("mrpc", 2, "validation", "accuracy", ("accuracy", "f1"), "classification"),
+            "glue_qqp": ("qqp", 2, "validation", "accuracy", ("accuracy", "f1"), "classification"),
+            "glue_sst2": ("sst2", 2, "validation", "accuracy", ("accuracy",), "classification"),
+            "glue_mnli": ("mnli", 3, "validation_matched", "accuracy", ("accuracy",), "classification"),
+            "glue_rte": ("rte", 2, "validation", "accuracy", ("accuracy",), "classification"),
+            "glue_qnli": ("qnli", 2, "validation", "accuracy", ("accuracy",), "classification"),
+            "glue_cola": (
+                "cola",
+                2,
+                "validation",
+                "matthews_correlation",
+                ("matthews_correlation", "accuracy"),
+                "classification",
+            ),
+            "glue_stsb": ("stsb", 1, "validation", "pearson", ("pearson", "spearmanr"), "regression"),
+        }
+        for dataset_name, expectation in glue_expectations.items():
+            task_name, num_classes, eval_split, primary_metric, metric_names, problem_type = expectation
+            spec = DATASET_REGISTRY[dataset_name]
+            self.assertEqual(spec.text_task_name, task_name)
+            self.assertEqual(spec.num_classes, num_classes)
+            self.assertEqual(spec.eval_split_name, eval_split)
+            self.assertEqual(spec.primary_metric_name, primary_metric)
+            self.assertEqual(spec.metric_names, metric_names)
+            self.assertEqual(spec.problem_type, problem_type)
 
 
 class WrapperTests(unittest.TestCase):
