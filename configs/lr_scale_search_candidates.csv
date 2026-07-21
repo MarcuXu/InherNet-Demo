@@ -1,0 +1,4 @@
+candidate_id,lr_scale
+lr_05,0.5
+lr_1,1.0
+lr_2,2.0

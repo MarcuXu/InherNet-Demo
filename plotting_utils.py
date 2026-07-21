@@ -91,19 +91,30 @@ def history_has_curves(history: Mapping[str, Any] | None) -> bool:
     return any(normalized[key] for key, *_ in PLOT_METRIC_SPECS)
 
 
-def get_plot_metric_specs(dataset_name: str):
+def get_plot_metric_specs(
+    dataset_name: str,
+    *,
+    eval_split_name: str = "test",
+    primary_metric_display: str = "Accuracy (%)",
+):
     if dataset_name == "cifar100":
         return CIFAR100_PLOT_METRIC_SPECS
-    return PLOT_METRIC_SPECS
+    split_label = eval_split_name.replace("_", " ").title()
+    return (
+        ("train_loss", "Loss", "Train Loss", None),
+        ("test_loss", "Loss", f"{split_label} Loss", None),
+        ("train_accuracy", primary_metric_display, f"Train {primary_metric_display}", (0.0, 100.0)),
+        ("test_accuracy", primary_metric_display, f"{split_label} {primary_metric_display}", (0.0, 100.0)),
+    )
 
 
 def get_plot_method_key(method: str, metadata: Mapping[str, Any]) -> str:
     config_tag = str(metadata.get("config_tag", "default"))
     if method == "inhernet":
-        rank_preset = str(metadata.get("rank_preset", ""))
-        if rank_preset == "small" or config_tag.startswith("small_rank_"):
+        size = str(metadata.get("size", metadata.get("rank_preset", "")))
+        if size == "small" or config_tag.startswith("small_rank_"):
             return "inhernet_small"
-        if rank_preset == "large" or config_tag.startswith("large_rank_"):
+        if size == "large" or config_tag.startswith("large_rank_"):
             return "inhernet_large"
         return "inhernet_custom"
     return method
@@ -165,7 +176,7 @@ def add_endpoint_marker(ax, x_value: int, y_value: float, color: str) -> None:
     )
 
 
-def build_metric_summary(history: Mapping[str, Any]) -> str:
+def build_metric_summary(history: Mapping[str, Any], eval_split_name: str = "test") -> str:
     normalized = normalize_history(history)
     summary_lines = []
     train_loss = [value for value in normalized["train_loss"] if math.isfinite(value)]
@@ -175,13 +186,14 @@ def build_metric_summary(history: Mapping[str, Any]) -> str:
     train_objective = [value for value in normalized["train_objective"] if math.isfinite(value)]
     if train_loss:
         summary_lines.append(f"Train loss   {train_loss[-1]:.3f}")
+    split_label = eval_split_name.replace("_", " ").title()
     if test_loss:
-        summary_lines.append(f"Test loss    {test_loss[-1]:.3f}")
+        summary_lines.append(f"{split_label} loss {test_loss[-1]:.3f}")
     if train_accuracy:
         summary_lines.append(f"Train acc    {train_accuracy[-1]:.2f}%")
     if test_accuracy:
-        summary_lines.append(f"Test acc     {test_accuracy[-1]:.2f}%")
-        summary_lines.append(f"Best test    {max(test_accuracy):.2f}%")
+        summary_lines.append(f"{split_label} metric {test_accuracy[-1]:.2f}%")
+        summary_lines.append(f"Best {split_label.lower()} {max(test_accuracy):.2f}%")
     if train_objective and (not train_loss or abs(train_objective[-1] - train_loss[-1]) > 1e-8):
         summary_lines.append(f"Objective    {train_objective[-1]:.3f}")
     return "\n".join(summary_lines)
@@ -310,10 +322,10 @@ def build_plot_label(
         avg_rank = None
         if isinstance(rank_map, Mapping) and rank_map:
             avg_rank = sum(int(value) for value in rank_map.values()) / len(rank_map)
-        label = "Hetero"
+        size = metadata.get("size")
+        label = "Hetero-Lite" if size == "small" else "Hetero"
         if detailed:
-            budget_ratio = metadata.get("budget_ratio", "?")
-            label = f"Hetero - heads {metadata.get('head_num', '?')}, budget {budget_ratio}"
+            label = f"{label} - heads {metadata.get('head_num', '?')}"
             if avg_rank is None and "avg_rank" in metadata:
                 avg_rank = float(metadata["avg_rank"])
             if avg_rank is not None:
@@ -342,11 +354,16 @@ def plot_single_history(
     plt = get_pyplot(plot_mode)
 
     fig, axes = plt.subplots(2, 2, figsize=(11.9, 8.2), dpi=300)
-    metric_specs = get_plot_metric_specs(dataset_name)
+    eval_split_name = str(metadata.get("eval_split", "test"))
+    metric_specs = get_plot_metric_specs(
+        dataset_name,
+        eval_split_name=eval_split_name,
+        primary_metric_display=str(metadata.get("primary_metric_display", "Accuracy (%)")),
+    )
     for axis, (metric_key, ylabel, title, clamp) in zip(axes.flatten(), metric_specs, strict=True):
         plot_single_metric_panel(axis, list(history.get(metric_key, [])), style, ylabel, title, clamp)
 
-    summary_text = build_metric_summary(history)
+    summary_text = build_metric_summary(history, eval_split_name)
     if summary_text:
         axes[1, 1].text(
             0.98,
@@ -503,7 +520,12 @@ def plot_comparison_histories_from_records(
     plt = get_pyplot(plot_mode)
 
     fig, axes = plt.subplots(2, 2, figsize=(13.7, 8.5), dpi=300)
-    metric_specs = get_plot_metric_specs(dataset_name)
+    first_metadata = records[0].get("metadata", {})
+    metric_specs = get_plot_metric_specs(
+        dataset_name,
+        eval_split_name=str(first_metadata.get("eval_split", "test")),
+        primary_metric_display=str(first_metadata.get("primary_metric_display", "Accuracy (%)")),
+    )
     for axis, (metric_key, ylabel, title, clamp) in zip(axes.flatten(), metric_specs, strict=True):
         plot_comparison_metric_panel(axis, records, metric_key, ylabel, title, clamp)
 

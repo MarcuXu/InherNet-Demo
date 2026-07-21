@@ -1,0 +1,6 @@
+profile,recipe_id,aux_loss_weight,second_moment_shrinkage,expert_noise_scale,allocation_scale,lr_scale,train_mode,kd_temperature,kd_fraction
+cifar10,weighted_uniform,0.01,0.01,0.01,weighted_uniform,1.0,distillation,2.0,
+cifar100,weighted_uniform,0.01,0.01,0.01,weighted_uniform,1.0,supervised,,
+oxford_pets,weighted_uniform,0.01,0.01,0.01,weighted_uniform,1.0,distillation,2.0,
+glue_classification,weighted_uniform,0.01,0.01,0.01,weighted_uniform,1.0,distillation,2.0,
+glue_regression,weighted_uniform,0.01,0.01,0.01,weighted_uniform,1.0,distillation,2.0,

@@ -4,3 +4,5 @@ logs/
 __pycache__/
 *.py[cod]
 run.pid
+checkpoints/*
+results/

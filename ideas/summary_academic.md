@@ -1,402 +1,388 @@
-# HeteroInherNet-IB: Paper Framework and Revision Notes
+# Hetero: Activation-Aware Conditional-Expert Neural Network Inheritance
 
-This document is a writing guide for a possible Hetero paper built on
-InherNet.  It intentionally separates the paper narrative from engineering
-details.  The paper does not need to describe every implementation branch, but
-the theoretical claims must be stated with assumptions that we can defend.
+Hetero turns fixed-capacity neural-network inheritance into a
+**preserve-then-adapt** initialization. At the exact InherNet rank and parameter
+count, it minimizes activation-weighted local reconstruction error for the
+inherited expert mean, then introduces zero-sum expert deviations that preserve
+this reconstruction while exposing conditional router directions.
 
-Working title:
+## 1. Motivation and Contributions
 
-**HeteroInherNet-IB: Data-Aware Heterogeneous Neural Network Inheritance**
+Weight-space SVD preserves dominant parameters, but not necessarily behavior on
+task-relevant activations. Moreover, identical inherited experts make the
+router locally insensitive at initialization. Hetero addresses both limitations
+through one constrained construction:
 
-The `IB` suffix should be used only if the final theory section contains a
-clear information-bottleneck or rate-distortion derivation.  Otherwise, a safer
-title is **HeteroInherNet: Data-Aware Heterogeneous Neural Network
-Inheritance**.
+1. the expert-mean operator is selected under the empirical activation metric;
+2. expert deviations are introduced in its zero-sum subspace, preserving the
+   inherited mean while making conditional routing locally trainable.
 
----
+This construction provides exact capacity matching, a closed-form local optimum
+under the empirical activation metric, and reconstruction-preserving conditional
+directions. Unlike activation-aware decomposition or symmetry-preserving model
+transformation in isolation, Hetero studies their joint role in inheriting a
+trained conditional-expert network at the exact InherNet capacity.
 
-## 1. What InherNet Actually Contributes
+[SVD-LLM (ICLR 2025)](https://proceedings.iclr.cc/paper_files/paper/2025/hash/3104e1ab39875cf54fe1eb4473e7c5a1-Abstract-Conference.html)
+and [CorDA (NeurIPS 2024)](https://proceedings.neurips.cc/paper_files/paper/2024/hash/83f95bb0ac5046338ea2afe3390e9f4b-Abstract-Conference.html)
+establish activation-oriented decomposition, while
+[LEMON (ICLR 2024)](https://proceedings.iclr.cc/paper_files/paper/2024/hash/0e705ac30e573d1526f81a0fd071a151-Abstract-Conference.html)
+provides a precedent for symmetry-preserving transformation. Hetero's
+contribution is the inheritance-specific preserve-then-adapt constraint that
+connects these principles at fixed conditional-expert capacity.
 
-InherNet starts from a pretrained dense source network and constructs an
-inheriting network by low-rank factorizing full weights.  This is different
-from LoRA-style adaptation, where the pretrained weight is frozen and low-rank
-matrices parameterize a task-specific weight update.
+## 2. InherNet Baseline and Trained Sources
 
-For a weight matrix
+For a trained source weight
+
 $$
-W \in \mathbb{R}^{m \times n}, \qquad W = U\Sigma V^\top,
+W\in\mathbb{R}^{m\times n},\qquad W=U\Sigma V^\top,
 $$
-the rank-$r$ approximation is
+
+the rank-$r$ InherNet initialization uses balanced factors
+
 $$
-W_r = U_r \Sigma_r V_r^\top .
+W^{\mathrm{down}}=\Sigma_r^{1/2}V_r^\top,\qquad
+W_h^{\mathrm{up}}=U_r\Sigma_r^{1/2}.
 $$
-For a layer acting as $y = Wx$, the conventional two-factor initialization is
+
+The gate is a softmax over experts. Because its weights sum to one, identical
+up-projection experts reconstruct $U_r\Sigma_rV_r^\top$ at initialization.
+All methods inherit from the same task-trained dense checkpoint. The source
+remains frozen when used for distillation, ensuring that differences arise from
+the inherited parameterization and training objective rather than teacher
+drift.
+
+## 3. Hetero
+
+### 3.1 Uncentered Activation Second Moments
+
+For layer input feature $x$, Hetero estimates
+
 $$
-W^{\mathrm{down}} = \Sigma_r^{1/2}V_r^\top,\qquad
-W^{\mathrm{up}} = U_r\Sigma_r^{1/2}.
+\widehat M=\frac{1}{N}\sum_{i=1}^{N}x_ix_i^\top.
 $$
-Some papers or codebases transpose this notation depending on whether features
-are represented as row or column vectors.  The paper should therefore emphasize
-the factorization principle rather than over-commit to a notation that creates
-dimension confusion.
 
-For convolution kernels, the channel-decomposition view reshapes a kernel
-$K\in \mathbb{R}^{c_{\mathrm{out}}\times c_{\mathrm{in}}\times k_h\times k_w}$
-into a matrix
-$\widehat K\in\mathbb{R}^{c_{\mathrm{out}}\times (c_{\mathrm{in}}k_hk_w)}$
-before SVD.
+The uncentered second moment follows directly from the local reconstruction
+objective
 
-InherNet's structure inheritance uses a one-down-many-ups module:
 $$
-Y = \sum_{h=1}^{H} G_h(X)\, W_h^{\mathrm{up}}
-        \bigl(W^{\mathrm{down}}(X)\bigr),
-\qquad
-G(X)=\mathrm{softmax}(W_g\phi(X)).
+\mathbb{E}\| (W-\widehat W)x\|_2^2
+=\operatorname{tr}\!\left((W-\widehat W)M
+(W-\widehat W)^\top\right).
 $$
-Here $\phi(X)$ is a pooled or flattened routing feature.  The main message is:
 
-- SVD initialization transfers principal spectral knowledge from the dense
-  source.
-- Rank $r$ is the main knob controlling inherited knowledge.
-- Multiple heads can improve specialization, but the benefit is secondary and
-  empirically/theoretically diminishing.
-- The original convergence discussion should be treated as conditional on
-  standard nonconvex SGD assumptions, not as a universal guarantee.
+The empirical estimate is stabilized as
 
----
-
-## 2. Corrections to the Previous Drafts
-
-The earlier Markdown and LaTeX drafts contained several claims that should be
-softened or corrected before becoming a paper.
-
-1. **Do not claim that Hetero preserves InherNet's guarantees without
-   assumptions.**
-   It is safer to say that Hetero keeps the same differentiable
-   one-down-many-ups parameterization, so an analogous stationarity analysis can
-   be obtained under the same smoothness/variance assumptions plus bounded
-   routing and bounded auxiliary gradients.
-
-2. **Do not claim information-bottleneck optimality.**
-   We can claim IB consistency or a rate-distortion motivation.  A full IB
-   optimality theorem requires a specific probabilistic model, e.g.,
-   linear-Gaussian activations and task-relevance assumptions.
-
-3. **Do not present copy-based inheritance as the only valid source.**
-   The key paper principle is **trained-source inheritance**.  The source may be
-   a trained teacher, a trained compact baseline, or a copied trained base.  In
-   the current code, CIFAR-100 paper-style pairs decompose the trained teacher,
-   while the CIFAR-10 `demo_code_org.py` compatibility pair decomposes a trained
-   student source.
-
-4. **Do not put engineering cache reuse in the core contribution list.**
-   Spectral cache reuse is useful and should appear in implementation details or
-   appendix, but it is not the paper's theoretical novelty.
-
-5. **Fix the KD direction.**
-   The distillation loss used by PyTorch `kl_div(log_softmax(student),
-   softmax(teacher))` corresponds to
-   $\mathrm{KL}(p_{\mathrm{teacher}}\|p_{\mathrm{student}})$ up to the usual
-   temperature scaling.
-
-6. **Align practical defaults with the current code.**
-   The current Hetero defaults are budget ratio `0.35`, min rank `8`, entropy
-   temperature `1.4`, routing threshold/compression threshold `12`, calibration
-   batches `16`, expert noise scale `0.01`, and balance weight `0.01`.
-
----
-
-## 3. Proposed Method: HeteroInherNet-IB
-
-HeteroInherNet keeps InherNet's asymmetric inheritance backbone but changes
-rank selection from a uniform hyperparameter to a data-aware layer-wise budget.
-
-### 3.1 Trained-Source Inheritance
-
-The decomposed weights must already encode task knowledge:
 $$
-\theta_{\mathrm{source}}\in
-\{\theta_{\mathrm{teacher}},\theta_{\mathrm{trained\ compact}},
-\theta_{\mathrm{copied\ base}}\}.
+\mu=\frac{\operatorname{tr}(\widehat M)}{d},\qquad
+M_\lambda=(1-\lambda)\widehat M
++\lambda\mu I+\epsilon\mu I,
 $$
-The paper should describe this as a design principle:
 
-> HeteroInherNet decomposes a trained source network, not random weights.
+with an analogous element-wise form for diagonal moments. The reference
+configuration uses shrinkage $\lambda=0.01$, 16 calibration batches, and at
+most 4096 sampled features per layer per batch. Matrix-valued modes add
+positive diagonal jitter before Cholesky factorization. We denote the
+stabilized matrix actually factored by $\widetilde M_\lambda$.
 
-The exact source can be dataset/protocol dependent.  This avoids forcing the
-CIFAR-10 legacy workflow and the CIFAR-100 paper-style workflow into one
-incorrect statement.
+Calibration scales with layer shape:
 
-### 3.2 Data-Weighted Spectral Analysis
+- convolution patch dimension at most 256: exact unfolded patch moments;
+- wider convolutions: a stride-, dilation-, padding-, and
+  kernel-position-aware channel-block approximation;
+- linear input dimension at most 512: a full second moment;
+- wider linear layers: a diagonal second moment; and
+- transformer inputs: padding tokens are excluded using the attention mask.
 
-Uniform SVD minimizes Frobenius error in weight space.  Hetero instead estimates
-an activation covariance from a calibration set and analyzes the data-weighted
-operator.
+The full-moment construction instantiates the theorem in Section 4 exactly.
+Channel-block and diagonal statistics define memory-bounded surrogate metrics.
 
-For a linear layer, or for a convolutional layer under a channel-covariance
-approximation:
+### 3.2 Data-Weighted Preserve-Then-Adapt Decomposition
+
+Let
+
 $$
-\Sigma_x = \mathbb{E}[\phi(X)\phi(X)^\top] + \epsilon I,\qquad
-\Sigma_x = CC^\top,
+\widetilde M_\lambda=CC^\top,\qquad A=WC.
 $$
-and
+
+If $[A]_r=U_r\Sigma_rV_r^\top$, Hetero initializes
+
 $$
-\widetilde W = W C.
-$$
-The SVD of $\widetilde W$ minimizes the data-weighted reconstruction error
-$$
-\|W-\widehat W\|_{\Sigma_x}^2
-= \mathrm{tr}\left((W-\widehat W)\Sigma_x(W-\widehat W)^\top\right).
-$$
-For CNNs, the implementation uses a tractable channel-wise covariance rather
-than the full im2col covariance.  The paper can present the full linear theorem
-and state the channel version as the practical convolutional approximation.
-
-### 3.3 Spectral-Entropy Rank Allocation
-
-For layer $l$, let $\{\tilde\sigma_{l,i}\}$ be singular values of the
-data-weighted operator.  Define
-$$
-p_{l,i}=\frac{\tilde\sigma_{l,i}^2}
-{\sum_j \tilde\sigma_{l,j}^2},
-\qquad
-H_l=-\sum_i p_{l,i}\log p_{l,i}.
-$$
-This is a von-Neumann-style spectral entropy of the normalized Gram spectrum.
-It is better to call it a **spectral entropy proxy for effective rank**, not a
-direct measure of mutual information.
-
-Given total rank budget $B$, floor $r_{\min}$, and temperature $\tau$:
-$$
-r_l = r_{\min}
- + \operatorname{round}\left(
-\frac{H_l^{1/\tau}}{\sum_j H_j^{1/\tau}}
-\bigl(B-Lr_{\min}\bigr)
-\right),
-$$
-followed by clipping and integer budget correction.
-
-The defensible theory angle is:
-
-- high entropy means the layer has diffuse spectral energy and needs more rank;
-- low entropy means spectral energy is concentrated and can tolerate stronger
-  compression;
-- temperature smoothing prevents a brittle winner-take-most allocation.
-
-### 3.4 Decoupled Routing
-
-If a layer receives a small rank, routing on the compressed representation may
-be too weak.  Hetero therefore uses a routing threshold:
-
-- use compressed features when $r_l\ge r_{\mathrm{gate}}$;
-- use uncompressed pooled features when $r_l<r_{\mathrm{gate}}$.
-
-In the current code this threshold is `compress_threshold`, default `12`.
-The paper should call this a stability device, not the central theoretical
-contribution.
-
-### 3.5 Expert De-Symmetrization
-
-Identical experts can create symmetric gradients for the router.  Hetero uses
-zero-mean expert perturbations:
-$$
+W^{\mathrm{down}}
+=\Sigma_r^{1/2}V_r^\top C^{-1},\qquad
 W_h^{\mathrm{up}}
-= U_r\Sigma_r^{1/2}+\epsilon_h,\qquad
-\sum_{h=1}^{H}\epsilon_h=0.
+=U_r\Sigma_r^{1/2}+E_h,\qquad
+\sum_{h=1}^{H}E_h=0.
 $$
-Zero-mean noise preserves the average reconstruction while breaking early
-expert symmetry.  Avoid a fixed $1/H$ factor unless the aggregation formula is
-also changed accordingly; with softmax gates that sum to one, identical full
-experts already reconstruct the rank-$r$ map before perturbation.
 
-### 3.6 Load-Balance Regularization
+The first constraint preserves the source where calibration activations place
+mass. The second breaks expert symmetry without changing the average
+reconstruction. A zero-initialized softmax router consumes the compressed
+feature, so the two constraints form one preserve-then-adapt initialization
+rather than a collection of independent modules.
 
-For mean routing probabilities $\bar G_h$ in a mini-batch:
+### 3.3 Registered-Rank Capacity Matching
+
+Hetero uses the same registered layer rank, eligible layers, expert count,
+router dimensions, biases, and dense-layer decisions as its matched InherNet.
+Hetero-Lite matches InherNet-Small, while Hetero matches InherNet-Large.
+Consequently, each comparison has exact total-model parameter equality by
+construction, including fixed vision parameters and fixed BERT embeddings.
+
+The CIFAR-100 pairs use the ranks printed in the InherNet paper. Measured
+construction counts are reported for the two pairs whose printed ranks and
+reported counts disagree. Hetero fixes these registered ranks by design. The
+pre-study evaluates heterogeneous allocation under the same parameter cap only as a
+diagnostic of whether additional allocation complexity improves behavioral
+preservation.
+
+### 3.4 Routing and Training Objective
+
+For mean routing probabilities $\bar g_h$, define
+
 $$
-\mathcal{L}_{\mathrm{bal}}
-= H\sum_{h=1}^{H}\bar G_h^2.
+\mathcal L_{\mathrm{bal}}
+=H\sum_{h=1}^{H}\bar g_h^2-1\ge 0.
 $$
-This is minimized by uniform expert usage and discourages early expert collapse.
-It should be positioned as an MoE-inspired training stabilizer.
 
----
+The current reference fine-tuning objective uses
+$\lambda_{\mathrm{bal}}=0.01$:
 
-## 4. Method Comparison
-
-| Component | InherNet | HeteroInherNet-IB |
-|---|---|---|
-| Source | Trained teacher/source weights | Trained source weights; teacher or trained compact base depending on protocol |
-| Decomposition target | Raw weight $W$ | Data-weighted operator $\widetilde W = WC$ |
-| Rank policy | Uniform rank | Layer-wise entropy-budgeted rank |
-| Entropy | Not used | Spectral entropy / effective-rank proxy |
-| Routing | Standard compressed-feature gate | Decoupled routing when rank is too small |
-| Experts | Asymmetric one-down-many-ups | Same topology + zero-mean de-symmetrization |
-| Collapse control | Mostly implicit | Explicit load-balance penalty |
-| Theory emphasis | SVD inheritance and rank/head effects | Data-weighted approximation, budget allocation, routing stability |
-
----
-
-## 5. Theory Plan for a Strong Paper
-
-The paper should avoid presenting all theory as already proven unless the
-appendix contains complete derivations.  A strong theory section can be built
-around four defensible claims.
-
-### 5.1 Data-Weighted Eckart-Young-Mirsky Theorem
-
-For $\Sigma_x\succ0$, truncated SVD of $\widetilde W=WC$ is optimal for
 $$
-\min_{\mathrm{rank}(\widehat W)\le r}
-\mathrm{tr}\left((W-\widehat W)\Sigma_x(W-\widehat W)^\top\right).
+\mathcal L
+=w_{\mathrm{CE}}\mathcal L_{\mathrm{CE}}
++w_{\mathrm{KD}}T^2
+\operatorname{KL}(p_{\mathrm{teacher}}^T\|p_{\mathrm{student}}^T)
++\lambda_{\mathrm{bal}}\mathcal L_{\mathrm{bal}}.
 $$
-This is a clean theorem and should be central.
 
-### 5.2 Entropy-Budget Allocation Lemma
+For supervised configurations, the task term replaces the CE--KD mixture.
+HPO compares $\lambda_{\mathrm{bal}}\in\{0,0.01,0.03\}$, and the zero-weight
+component ablation isolates its contribution. All inherited factors and routers
+are optimized end to end.
 
-A safer derivation than the earlier draft is to define an explicit concave
-utility:
+## 4. Theoretical Analysis
+
+### 4.1 Data-Weighted Eckart--Young Theorem
+
+Let $M\succ0$, $M=CC^\top$, and $A=WC$. Among all matrices $Q$ with rank at
+most $r$,
+
 $$
-\max_{r_l\ge r_{\min}}
-\sum_l H_l^{1/\tau}\log(r_l-r_{\min}+\epsilon)
-\quad
-\text{s.t.}\quad
-\sum_l r_l=B.
+Q_r^*=[A]_rC^{-1}
 $$
-The KKT solution allocates the extra budget in proportion to
-$H_l^{1/\tau}$, matching the algorithm before integer correction.  This is
-defensible because it says Hetero is optimal for a stated entropy-weighted
-utility, not for an unsupported approximation-error model.
 
-### 5.3 Convergence Compatibility Lemma
+minimizes
 
-State that if:
+$$
+\operatorname{tr}\!\left((W-Q)M(W-Q)^\top\right)
+=\|(W-Q)C\|_F^2.
+$$
 
-- the original InherNet smoothness/variance assumptions hold;
-- routing features are bounded;
-- expert noise has bounded variance;
-- the load-balance gradient is bounded;
+The proof changes variables to $B=QC$ and applies the ordinary
+Eckart--Young--Mirsky theorem. The result is exact for the stabilized empirical
+full-moment metric.
 
-then the same stationarity rate order follows with modified constants.  Do not
-state that Hetero strictly improves the asymptotic rate.
+### 4.2 Initialization Preservation and Conditional Tangent
 
-### 5.4 Linear-Gaussian IB Interpretation
+With a zero-initialized softmax gate, $g_h=1/H$. Since $\sum_hE_h=0$,
 
-Under a linear-Gaussian approximation, the data-weighted spectrum controls how
-much input variance passes through the bottleneck.  Heterogeneous ranks then
-implement a rate-distortion-style allocation: more rank where predictive
-variance is diffuse, less rank where predictive variance is concentrated.
+$$
+\frac{1}{H}\sum_h
+(U_r\Sigma_r^{1/2}+E_h)
+\Sigma_r^{1/2}V_r^\top C^{-1}
+=[A]_rC^{-1}.
+$$
 
-This is a much more credible IB story than claiming exact IB optimality for
-deep nonlinear networks.
+Thus expert deviations preserve the rank-$r$ data-weighted reconstruction at
+initialization. Let $a_j$ be router logit $j$, let
+$z=W^{\mathrm{down}}x$, and write expert $h$ as $B+E_h$. Then
 
----
+$$
+\frac{\partial y}{\partial a_j}
+=g_j\left((B+E_j)z+b-y\right)
+=\frac{1}{H}E_jz.
+$$
 
-## 6. Narrative and Storyline for a Top-Tier AI Paper
+Identical experts give a zero router derivative at the zero-logit
+initialization; the zero-sum lift generically exposes a first-order conditional
+learning signal while preserving the inherited map.
 
-Top-tier AI introductions usually work because they make one problem feel
-inevitable, then make the proposed method feel like the simplest principled
-answer.  For this paper, the story should not be "we added many tricks to
-InherNet."  The story should be:
+### 4.3 From Local Guarantee to Empirical Evaluation
 
-> Neural network inheritance is a promising alternative to student design and
-> distillation, but current inheritance uses a uniform bottleneck across layers.
-> This is misaligned with how information is distributed in real networks.
-> HeteroInherNet makes the bottleneck data-aware.
+The theorem identifies the layer-local behavior guaranteed by the construction.
+It is exact for the stabilized full moment, while channel-block and diagonal
+statistics provide scalable surrogate metrics. Sections 6 and 7 connect these
+initialization properties to downstream accuracy and learned specialization
+through controlled empirical evaluation.
 
-Recommended introduction arc:
+## 5. Dataset and Model Protocols
 
-1. **Broad motivation.**
-   Efficient model compression is still dominated by KD and PEFT.  KD transfers
-   behavior but not structure; PEFT adapts a frozen model but does not produce a
-   standalone compact inheritor.
+| Dataset family | Teacher $\rightarrow$ student | Initialization | Inherited source/objective | Targets |
+|---|---|---|---|---|
+| CIFAR-10 | ResNet-50 $\rightarrow$ ResNet-18 with CIFAR stem | random | trained teacher / KD | convolution |
+| CIFAR-100 | eight CIFAR-native ResNet, VGG, and WRN pairs | random | trained teacher / supervised | convolution |
+| Oxford-IIIT Pet | ResNet-34 $\rightarrow$ ResNet-18 | ImageNet pretrained, new 37-class head | fine-tuned teacher / KD | convolution |
+| GLUE | BERT-Mini $\rightarrow$ BERT-Tiny | pretrained compact BERT | fine-tuned teacher / KD | linear |
 
-2. **InherNet as the starting point.**
-   InherNet reframes compression as inheritance: directly factorize a trained
-   source network and retain its spectral structure.  This is a stronger
-   starting point than training a small student from scratch.
+| Dataset family | Optimizer | Batch | Epochs | Learning rate | Weight decay | Schedule |
+|---|---|---:|---:|---:|---:|---|
+| CIFAR-10 | SGD, momentum 0.9 | 128 | 200 | 0.05 | $5\times10^{-4}$ | decay at 100, 150, 180 |
+| CIFAR-100 | SGD, momentum 0.9 | 64 | 240 | 0.05 | $5\times10^{-4}$ | decay at 150, 180, 210 |
+| Oxford-IIIT Pet | SGD, momentum 0.9 | 32 | 30 | 0.001 | $10^{-4}$ | decay at 15, 25 |
+| GLUE compact BERT | AdamW | 32 | 4 | $5\times10^{-5}$ | 0.01* | 10% linear warmup, linear decay |
 
-3. **Core gap.**
-   Uniform rank assumes every layer should pass through the same bottleneck.
-   Empirically and spectrally this is unlikely: different layers have different
-   data-conditioned spectra, different effective ranks, and different
-   sensitivity to compression.
+`*` Bias and LayerNorm parameters are excluded from weight decay, and the
+global gradient norm is clipped at 1.0.
 
-4. **Central idea.**
-   Replace a uniform architectural bottleneck with an information-aware
-   heterogeneous bottleneck.  The method estimates data-weighted spectra,
-   measures spectral entropy, and allocates rank under a global budget.
+The benchmark suite spans scratch-trained vision on CIFAR,
+ImageNet-initialized fine-grained transfer on Oxford Pets, and compact
+transformer transfer on GLUE. Convolutions are inherited for vision, while
+attention and feed-forward projections are inherited for GLUE. The small
+Oxford classifier, transformer embeddings, and normalization layers remain
+dense. The compact-BERT GLUE track is a resource-efficient cross-modal
+extension that complements the original T5 benchmark.
 
-5. **Why this is principled.**
-   The method is supported by: data-weighted low-rank approximation theory,
-   entropy-budget optimization, convergence compatibility with InherNet, and a
-   linear-Gaussian IB/rate-distortion interpretation.
+The CIFAR-100 pairs are ResNet-32/8, ResNet-32x4/8x4, VGG-13/8,
+WRN-40-2/40-1, WRN-40-2/16-2, ResNet-56/20, ResNet-110/32, and
+ResNet-110/20. GLUE covers MRPC, QQP, SST-2, MNLI, RTE, QNLI, CoLA, and
+STS-B. MRPC and QQP report accuracy and F1; SST-2, MNLI, RTE, and QNLI report
+accuracy; CoLA reports Matthews correlation; and STS-B reports Pearson and
+Spearman correlations.
 
-6. **Contributions.**
-   Keep the contribution list short and defensible:
-   - a data-aware heterogeneous inheritance framework;
-   - an entropy-budget rank allocation algorithm;
-   - routing and expert-utilization stabilizers for low-rank MoE inheritance;
-   - theory connecting the method to data-weighted SVD and rate-distortion;
-   - experiments showing better accuracy/parameter tradeoffs and diagnostics
-     explaining when heterogeneous ranks help.
+## 6. Experiment and Search Protocol
 
-Suggested opening sentence:
+Each teacher is trained for the complete dataset schedule, selected using its
+validation metric, and reused unchanged by student KD, InherNet, Hetero,
+ablations, and HPO. CIFAR search uses a fixed stratified 10% training holdout,
+Oxford uses its fixed stratified validation split, and GLUE search reserves the
+official validation split for formal reporting. Official test data are used
+only after model selection.
 
-> Neural network inheritance offers a direct route to compact models by
-> factorizing trained weights, but existing inheritance methods impose the same
-> low-rank bottleneck on every layer, ignoring the fact that task-relevant
-> information is distributed unevenly across a network.
+Every HPO candidate uses the same epoch count as formal training. Mechanism and
+learning-rate screening cover CIFAR-10, CIFAR-100 ResNet-56-to-ResNet-20,
+Oxford Pets, SST-2, and STS-B. HPO tunes Hetero at the InherNet-Large capacity;
+InherNet retains its registered settings, and Hetero-Lite inherits the selected
+Hetero recipe as a capacity ablation.
 
-Suggested one-sentence method pitch:
+The mechanism screen varies routing regularization, moment shrinkage, and
+zero-sum lift scale; learning rate and distillation settings are screened
+separately to avoid confounding optimizer and mechanism effects. Selection uses
+seeds 42, 123, and 2026, confirmation uses seed 3407, and final estimates use
+disjoint seeds 7, 17, 27, and 37.
 
-> HeteroInherNet turns inheritance from a uniform compression rule into a
-> data-aware budget allocation problem.
+For reproducibility, mechanism candidates fix the learning-rate multiplier at
+1.0, and mechanism and learning-rate candidates use the objective registered
+for each dataset profile. Distillation candidates likewise fix the multiplier
+at 1.0. These references are read from the committed confirmation registry,
+not from recipes selected after HPO; each generated command contains every
+controlled argument exactly once.
 
-Suggested reviewer-facing caution:
+The comparison includes the teacher, compact student, student KD, and
+capacity-matched InherNet under both its registered supervised objective and
+the selected Hetero objective. A supervised Hetero control accompanies every
+distilled headline recipe. Component ablations isolate activation weighting,
+the zero-sum conditional lift, learned versus fixed-uniform routing, routing
+regularization, and calibration budget. Hetero-Lite tests the
+accuracy--efficiency trade-off.
 
-> We do not claim a universal IB optimum for deep networks; instead, we provide
-> a linear/data-weighted analysis that explains the allocation rule and matches
-> the observed layer-wise behavior.
+## 7. Problem-Driven Pre-Study
 
-This framing matches common successful ML-paper practice: state the problem,
-show why it matters, identify a narrow gap, present a simple principle, then
-support it with theory and experiments.
+The pre-study asks whether the two constraints achieve their two design
+objectives before any optimizer step:
 
----
+1. activation weighting should improve teacher-behavior preservation at the
+   same rank and parameter count; and
+2. the zero-sum lift should activate router gradients without materially
+   changing the inherited predictions.
 
-## 7. Practical Configuration to Report
+Oxford Pets provides a small, fine-grained transfer setting, while CIFAR-100
+ResNet-56-to-ResNet-20 tests whether the effect transfers to scratch-trained
+vision. Fidelity and task metrics use the complete validation split. To test
+the decomposition claim without confounding it with upstream approximation
+errors, a held-out local-operator probe feeds dense-teacher activations into
+each matching inherited operator for four deterministic validation batches and
+reports the ratio of summed output errors to summed dense-output energy.
+Construction also records each layer's relative expert-mean shift, directly
+checking the zero-mean lift invariant. Router gradients are measured on the
+first deterministic evaluation minibatch—32
+Oxford examples or 64 CIFAR-100 examples—using teacher KL without an optimizer
+step. Each router dot reports
+$\max(\|\partial\mathrm{KL}/\partial W_{\mathrm{gate}}\|_2,
+\|\partial\mathrm{KL}/\partial b_{\mathrm{gate}}\|_2)$ for one inherited
+layer.
 
-Method defaults:
+### 7.1 Activation Geometry Preserves Task-Relevant Behavior
 
-- Budget ratio: `0.35`
-- Minimum rank floor: `8`
-- Entropy temperature: `1.4`
-- Routing/compression threshold: `12`
-- Calibration batches: `16`
-- Expert heads: default `3`; ablate `1,2,3`
-- Expert noise scale: `0.01`
-- Balance loss weight: `0.01`
-- Linear-layer compression: off by default in current CIFAR experiments
+At fixed capacity, activation weighting reduces teacher-output relative SSE by
+66.52% on Oxford and 17.59% on CIFAR-100. Teacher KL falls by 82.44% and 14.10%,
+respectively; agreement rises by 61.41 and 5.28 percentage points. These
+behavioral improvements coincide with gains of 59.175 points in Oxford
+balanced accuracy and 4.88 points in CIFAR-100 accuracy. Output cosine
+similarity rises by 0.419 and 0.282.
 
-Training protocol should be reported separately by dataset:
+![The fixed-capacity progression isolates activation weighting as the source of improved output fidelity and zero-step task behavior.](../figures/prestudy_inheritance_progression.png)
 
-- CIFAR-10 original-compatible workflow: Adam, LR `1e-3`, batch `256`,
-  100 epochs, trained student source, supervised compressed-model training.
-- CIFAR-100 paper-style workflow: SGD, LR `0.05`, momentum `0.9`, weight decay
-  `5e-4`, batch `64`, 240 epochs, trained teacher source, KD training.
+### 7.2 Activation Weighting Improves Every Probed Local Operator
 
----
+The held-out local probe isolates each factorized layer by replaying the same
+dense-teacher inputs through its dense and inherited operators. Activation
+weighting reduces aggregate local relative SSE from 0.1255 to 0.0598 on Oxford
+(52.3%) and from 0.2869 to 0.1849 on CIFAR-100 (35.6%). The improvement holds
+for all 65 probed operators across both architectures. This layerwise result
+connects the activation geometry used during decomposition to the end-to-end
+behavioral gains above.
 
-## 8. Final Positioning
+![Activation-aware decomposition lowers held-out local operator error for every probed layer on both architectures.](../figures/prestudy_local_operator.png)
 
-The cleanest positioning is:
+### 7.3 The Conditional Lift Exposes Router Tangents
 
-> HeteroInherNet extends InherNet from uniform low-rank inheritance to
-> data-aware heterogeneous inheritance.  Its central claim is not that every
-> engineering detail is theoretically optimal, but that the main design choice
-> - allocating rank according to data-weighted spectral complexity - is a
-> principled correction to uniform inheritance.
+The zero-sum lift changes relative SSE by only $5.89\times10^{-5}$ on Oxford
+and $1.90\times10^{-6}$ on CIFAR-100, while leaving task performance and
+teacher agreement unchanged. Normalized routing entropy remains exactly 1.0,
+while mean relative expert diversity rises from numerical zero to 0.008173 on
+Oxford and 0.008152 on CIFAR-100: the lift creates distinct experts without
+disturbing uniform mean routing. It raises router-gradient RMS from
+$1.54\times10^{-9}$ to $2.27\times10^{-4}$ on Oxford and from
+$3.20\times10^{-9}$ to $3.63\times10^{-4}$ on CIFAR-100—approximately
+$1.47\times10^5$-fold and $1.13\times10^5$-fold gains. All 28 Oxford and all
+37 CIFAR-100 router layers cross the $10^{-7}$ activity tolerance after the
+lift, whereas none cross it with identical experts.
 
-This is the strongest narrative for a top-tier submission because it gives
-reviewers a single conceptual hook and a clear theory/experiment checklist.
+![Only the zero-sum conditional lift activates every measured router across the four inheritance controls.](../figures/prestudy_router_activity.png)
+
+### 7.4 Fixed Rank Avoids a Surrogate--Task Mismatch
+
+The allocation diagnostic explains why rank reallocation is excluded from the
+method. On CIFAR-100, relative allocation lowers relative SSE from 0.8369 to
+0.8108 but also lowers zero-step accuracy from 7.42% to 6.80%. On Oxford, both
+relative and nested allocation underperform the fixed-rank activation-aware
+construction in reconstruction and balanced accuracy. Optimizing a layerwise
+allocation surrogate therefore adds complexity without reliably improving
+teacher behavior or the downstream task metric.
+
+![Budget-matched rank allocation can improve output and KL surrogates without improving task retention.](../figures/prestudy_allocation_tradeoff.png)
+
+### 7.5 Completed Zero-Step Diagnostics
+
+| Dataset | Construction | Parameters | Rank range | Relative SSE | Teacher KL / agreement | Initial metric | Router-grad RMS |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Oxford | weight-only | 5,699,257 | 64 | 0.847742 | 2.766147 / 19.57% | 18.293 BAcc | $1.63\times10^{-9}$ |
+| Oxford | activation-aware base | 5,699,257 | 64 | 0.283789 | 0.485746 / 80.98% | 77.468 BAcc | $1.54\times10^{-9}$ |
+| Oxford | Hetero conditional lift | 5,699,257 | 64 | 0.283848 | 0.485838 / 80.98% | 77.468 BAcc | $2.27\times10^{-4}$ |
+| CIFAR-100 | weight-only | 383,507 | 16 | 1.015533 | 4.350336 / 2.54% | 2.54 Acc | $2.36\times10^{-9}$ |
+| CIFAR-100 | activation-aware base | 383,507 | 16 | 0.836891 | 3.736992 / 7.82% | 7.42 Acc | $3.20\times10^{-9}$ |
+| CIFAR-100 | Hetero conditional lift | 383,507 | 16 | 0.836893 | 3.736822 / 7.82% | 7.42 Acc | $3.63\times10^{-4}$ |
+
+This seed-42 initialization study establishes the predicted preservation and
+conditional-tangent effects; full-epoch, multi-seed experiments will determine
+how they translate into the final accuracy--efficiency frontier.
+
+## 8. Conclusion
+
+Hetero recasts inheritance as a constrained initialization problem: preserve
+the teacher where task activations place mass, then expose conditional degrees
+of freedom without additional capacity or initial reconstruction error. The
+pre-study verifies both predicted initialization effects and motivates a
+single, registered-rank preserve-then-adapt mechanism for formal evaluation.

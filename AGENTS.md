@@ -1,182 +1,43 @@
-# AGENTS.md
+# Repository guidance
 
-## Purpose
+This is an ML research repository for Hetero and its InherNet baseline. Prioritize algorithmic correctness, reproducibility, and comparable experiments over broad refactoring.
 
-This file defines persistent instructions for Codex when working in this Python research-code workspace.
+## Source of truth
 
-The user is a PhD student in artificial intelligence and computer science. Treat this repository as an academic/research codebase where correctness, reproducibility, clarity, and minimal, well-motivated changes matter more than superficial speed.
+- Read `README.md` before changing training or model behavior; it defines the maintained workflow, methods, datasets, metrics, and CLI examples.
+- Use `scripts/run.sh` / `demo_code.py` for maintained experiments. All maintained shell launchers live under `scripts/`; `scripts/search.sh` is the only hyperparameter-search entry point. `GenericInherNet` is the maintained baseline; `demo_code_org.py` alone is frozen legacy-demo compatibility. Change either method's semantics only when the task explicitly targets it.
+- Discover current code and commands from the repository. Do not maintain a file inventory in this document.
 
-## Workspace boundary
+## Environment and validation
 
-- Treat `/root/nas/mingjing/InherNet-Demo` as the workspace root.
-- Only inspect, create, edit, move, or delete files inside this workspace root.
-- Do not create, edit, move, or delete files outside the workspace root, including parent directories, sibling projects, system directories, hidden global configuration files, or unrelated datasets.
-- Read-only environment discovery outside the workspace is allowed when needed to locate Python, conda, CUDA, or system package metadata for running this project. Keep this discovery narrow and do not print secrets or unrelated personal data.
-- Do not follow symlinks that resolve outside the workspace root unless the user explicitly authorizes it.
-- When testing the effect of your code changes, you can use 10 epochs for the test. For the smoke test, you can define the number of epochs to run yourself.
-- If external files, credentials, datasets, checkpoints, or system resources appear necessary, ask the user or provide a safe fallback inside the workspace. Prefer workspace-local temporary files, logs, caches, and virtual environments.
-
-## General working procedure
-
-Before modifying code:
-
-1. Inspect the project structure.
-2. Read the most relevant local documentation and configuration files, such as:
-   - `README.md`
-   - `AGENTS.md`
-   - `pyproject.toml`
-   - `setup.py`
-   - `setup.cfg`
-   - `requirements.txt`
-   - `environment.yml`
-   - `tox.ini`
-   - `.pre-commit-config.yaml`
-   - relevant scripts, tests, configs, and examples
-3. Identify the intended architecture, module boundaries, entry points, experiment workflow, and testing conventions.
-4. Prefer changes that fit the existing design instead of introducing a new structure without need.
-5. Make the smallest coherent change that solves the requested problem.
-6. Consider downstream effects on training, evaluation, reproducibility, checkpoint loading, configuration parsing, logging, and tests.
-
-Do not make broad refactors unless the user asks for them or they are required to solve the task safely.
-
-## Python environment requirement
-
-Every time Codex runs, tests, debugs, formats, lints, type-checks, benchmarks, or otherwise executes Python-related code, it should use a project environment with the dependencies in `requirements.txt`.
-
-Required environment:
+Run Python commands in the project environment:
 
 ```bash
 source /root/miniconda3/etc/profile.d/conda.sh
 conda activate inherdemo
-<command>
 ```
 
-Non-interactive shells may not have `conda` on `PATH` until the profile script is sourced. If the `inherdemo` environment cannot be activated, do not install dependencies into system Python. Run only non-import checks that do not require project dependencies and report the environment blocker clearly.
+Do not install packages into system Python. If the environment is unavailable, report that limitation instead of silently changing environments.
 
-## Python coding standards
+- Unit tests: `python -m unittest discover -s tests -v`
+- CLI options and current experiment examples: `scripts/run.sh --help` and `README.md`
+- Validate narrowly first. For an affected training path, use its documented `--smoke-test --plot-mode none` form before considering a longer run. Do not start full training or overwrite prior outputs unless explicitly requested.
 
-Write Python that is robust, readable, and maintainable.
+## Research invariants
 
-Prefer:
+- Preserve experiment comparability: seeds, data splits, preprocessing, model defaults, optimizer/scheduler behavior, checkpoint compatibility, metric definitions, and structured log fields must not drift accidentally.
+- For tensor code, verify shapes, dtypes, devices, train/eval state, gradient flow, and numerical stability. Avoid hidden detaches or in-place operations that alter optimization.
+- For algorithmic changes, test the relevant invariant (for example reconstruction, rank budget, routing, or expert gradient flow), not only that execution completes.
+- Preserve the shared `--size small|large` comparison: Hetero uses the same registered rank and exactly the same parameter count as the corresponding InherNet construction. Do not reintroduce user-facing ratio or budget-scope controls.
+- Clearly report any intentional change that can alter metrics or invalidate comparison with earlier logs.
 
-* Clear module boundaries.
-* Explicit imports.
-* Type hints for public functions, complex internal functions, dataclasses, and configuration objects.
-* Small functions with single responsibilities.
-* Descriptive names for variables, functions, classes, and configuration fields.
-* Deterministic behavior where possible.
-* Explicit error messages for invalid inputs, missing files, malformed configs, shape mismatches, and unsupported modes.
-* Path handling with `pathlib.Path`.
-* Logging instead of ad hoc `print` statements for reusable library code.
-* Tests or small validation scripts for behavior that is changed.
+## Change discipline
 
-Avoid:
+- Surface material assumptions and trade-offs, choose the simplest adequate design, and keep every changed line traceable to the request.
+- Match local style and preserve public/configuration compatibility unless the requested behavior requires a break.
+- Do not overwrite existing logs, results, checkpoints, datasets, or caches. Keep generated artifacts out of commits unless requested.
+- Add dependencies only when necessary and update tests/documentation when a user-visible or experimental contract changes.
 
-* Hidden global state.
-* Unnecessary mutation.
-* Overbroad exception handling.
-* Silent fallback behavior that can hide experimental bugs.
-* Hard-coded absolute paths.
-* Unseeded randomness in tests.
-* Large rewrites when a targeted fix is sufficient.
-* Adding dependencies unless clearly justified.
+## Completion
 
-## Research-code expectations
-
-For AI/ML code, pay special attention to:
-
-* Tensor shapes, dtypes, devices, and broadcasting behavior.
-* Correct train/eval mode handling.
-* Gradient flow and accidental `.detach()`, `.item()`, `torch.no_grad()`, or in-place operation issues.
-* Random seeds and reproducibility.
-* Dataset splits and leakage.
-* Config compatibility.
-* Checkpoint loading and backward compatibility.
-* Metrics correctness.
-* Numerical stability.
-* Memory use and unnecessary GPU synchronization.
-* Distributed-training assumptions.
-* Batch-size-dependent behavior.
-* Evaluation code matching the stated experimental protocol.
-
-You may change experimental semantics if you are requested to do so. If any finalized code modification alters reported results, state this explicitly.
-
-## Testing and validation
-
-After modifying code, run the narrowest relevant checks first, then broader checks if appropriate.
-
-Use existing project conventions when available. Typical commands may include:
-
-```bash
-python -m pytest
-python -m pytest tests/<relevant_test_file>.py
-python -m ruff check .
-python -m ruff format .
-python -m mypy .
-python -m pyright
-python -m unittest
-```
-
-All such commands must be run inside the active `inherdemo` conda environment described above.
-
-When tests cannot be run:
-
-* Explain why.
-* State what was checked instead.
-* Identify the most relevant command the user should run.
-
-Do not claim that code is tested unless a relevant command was actually run successfully.
-
-## Editing discipline
-
-When changing files:
-
-* Preserve backward compatibility where reasonable.
-* Update tests when behavior changes.
-* Update documentation or comments when user-facing behavior changes.
-* Keep diffs focused.
-* Do not reformat unrelated files.
-* Do not rename files, functions, classes, or configuration keys unless necessary.
-* Do not delete code unless it is clearly obsolete, unused, or part of the requested change.
-* Prefer local fixes over global rewrites.
-* Maintain compatibility with the project’s supported Python version.
-
-## Dependency policy
-
-Before adding a dependency:
-
-1. Check whether the project already has an equivalent dependency.
-2. Prefer standard-library solutions when adequate.
-3. Consider reproducibility and environment stability.
-
-## File and data safety
-
-* Do not overwrite existing experiment outputs unless the user explicitly asks.
-* Prefer writing temporary outputs to a clearly named temporary location inside the workspace.
-* Do not commit, expose, or print secrets, tokens, credentials, API keys, private paths, or personal data.
-
-## Communication style for Codex
-
-When reporting work:
-
-* Summarize the project context considered.
-* State the files changed.
-* State the behavioral effect of the change.
-* State the validation commands run, including whether they passed or failed.
-* Mention any remaining risks, assumptions, or follow-up checks.
-* Be concise but precise.
-
-When uncertain:
-
-* Make a reasoned best effort based on local evidence.
-* Ask a question only when ambiguity could cause an unsafe, destructive, or semantically incorrect change.
-* Prefer explaining trade-offs over making hidden assumptions.
-
-## Definition of done
-
-A task is complete when:
-
-* The requested behavior is implemented.
-* The change is consistent with the surrounding project architecture.
-* Relevant tests or checks have been run with the required conda environment activated.
-* Any failures are either fixed or clearly reported.
+Run the narrowest relevant checks and report the exact commands and outcomes. Distinguish verified facts from hypotheses and note remaining experimental validation.

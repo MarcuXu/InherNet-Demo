@@ -317,9 +317,8 @@ MODEL_REGISTRY: Dict[str, Callable[[int], nn.Module]] = {
 
 
 CIFAR100_INHERNET_WORKFLOW_DEFAULTS = {
-    "compressed_source": "teacher",
-    "compressed_train_mode": "distillation",
-    "model_profile": "paper_cifar100_teacher_inheritance",
+    "compressed_train_mode": "supervised",
+    "model_profile": "cifar100_teacher_inheritance",
 }
 
 
@@ -330,6 +329,8 @@ def make_cifar100_pair(
     small_rank: int,
     large_rank: int,
     default_head_num: int = 3,
+    protocol_source: str = "paper_cifar100",
+    rank_source: str = "paper_table_rank",
 ) -> dict[str, object]:
     return {
         **CIFAR100_INHERNET_WORKFLOW_DEFAULTS,
@@ -337,17 +338,30 @@ def make_cifar100_pair(
         "student": student,
         "rank_presets": {"small": small_rank, "large": large_rank},
         "default_head_num": default_head_num,
+        "inhernet_protocol_source": protocol_source,
+        "inhernet_rank_source": rank_source,
     }
 
 
 PAIR_REGISTRY: Dict[str, Mapping[str, object]] = {
-    "resnet32_to_resnet8": make_cifar100_pair("resnet32", "resnet8", small_rank=4, large_rank=8),
-    "resnet32x4_to_resnet8x4": make_cifar100_pair("resnet32x4", "resnet8x4", small_rank=4, large_rank=8),
+    "resnet32_to_resnet8": make_cifar100_pair(
+        "resnet32", "resnet8", small_rank=4, large_rank=8,
+        protocol_source="repository_extension", rank_source="repository_defined",
+    ),
+    # Reproduce the ranks printed in the paper. Its reported parameter counts
+    # are inconsistent with these ranks under the stated shared-down design.
+    "resnet32x4_to_resnet8x4": make_cifar100_pair(
+        "resnet32x4", "resnet8x4", small_rank=4, large_rank=8,
+    ),
     "vgg13_to_vgg8": make_cifar100_pair("vgg13", "vgg8", small_rank=128, large_rank=256),
     "wrn40_2_to_wrn40_1": make_cifar100_pair("wrn_40_2", "wrn_40_1", small_rank=16, large_rank=32),
     "wrn40_2_to_wrn16_2": make_cifar100_pair("wrn_40_2", "wrn_16_2", small_rank=16, large_rank=32),
     "resnet56_to_resnet20": make_cifar100_pair("resnet56", "resnet20", small_rank=8, large_rank=16),
-    "resnet110_to_resnet32": make_cifar100_pair("resnet110", "resnet32", small_rank=8, large_rank=32),
+    # Reproduce the printed ranks even though the paper's Large parameter count
+    # is inconsistent with r=32 under the stated shared-down design.
+    "resnet110_to_resnet32": make_cifar100_pair(
+        "resnet110", "resnet32", small_rank=8, large_rank=32,
+    ),
     "resnet110_to_resnet20": make_cifar100_pair("resnet110", "resnet20", small_rank=4, large_rank=8),
 }
 

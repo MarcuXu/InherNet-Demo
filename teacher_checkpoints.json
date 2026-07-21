@@ -1,0 +1,262 @@
+{
+  "schema_version": 1,
+  "teachers": [
+    {
+      "bytes": 94410365,
+      "dataset": "cifar10",
+      "pair": "resnet50_to_resnet18",
+      "path": "checkpoints/search/cifar10/resnet50_to_resnet18/teacher_seed_42.pt",
+      "selected_epoch": 185,
+      "selected_metrics": {
+        "final_test_metric": null,
+        "selected_evaluation_metric": 95.46
+      },
+      "selection_policy": "best_validation_accuracy",
+      "split_provenance": "embedded",
+      "teacher": "resnet50"
+    },
+    {
+      "bytes": 1973013,
+      "dataset": "cifar100",
+      "pair": "resnet32_to_resnet8",
+      "path": "checkpoints/search/cifar100/resnet32_to_resnet8/teacher_seed_42.pt",
+      "selected_epoch": 183,
+      "selected_metrics": {
+        "final_test_metric": null,
+        "selected_evaluation_metric": 69.82
+      },
+      "selection_policy": "best_validation_accuracy",
+      "split_provenance": "embedded",
+      "teacher": "resnet32"
+    },
+    {
+      "bytes": 29915925,
+      "dataset": "cifar100",
+      "pair": "resnet32x4_to_resnet8x4",
+      "path": "checkpoints/search/cifar100/resnet32x4_to_resnet8x4/teacher_seed_42.pt",
+      "selected_epoch": 200,
+      "selected_metrics": {
+        "final_test_metric": null,
+        "selected_evaluation_metric": 78.26
+      },
+      "selection_policy": "best_validation_accuracy",
+      "split_provenance": "embedded",
+      "teacher": "resnet32x4"
+    },
+    {
+      "bytes": 37884669,
+      "dataset": "cifar100",
+      "pair": "vgg13_to_vgg8",
+      "path": "checkpoints/search/cifar100/vgg13_to_vgg8/teacher_seed_42.pt",
+      "selected_epoch": 208,
+      "selected_metrics": {
+        "final_test_metric": null,
+        "selected_evaluation_metric": 72.94
+      },
+      "selection_policy": "best_validation_accuracy",
+      "split_provenance": "embedded",
+      "teacher": "vgg13"
+    },
+    {
+      "bytes": 9125110,
+      "dataset": "cifar100",
+      "pair": "wrn40_2_to_wrn40_1",
+      "path": "checkpoints/search/cifar100/wrn40_2_to_wrn40_1/teacher_seed_42.pt",
+      "selected_epoch": 194,
+      "selected_metrics": {
+        "final_test_metric": null,
+        "selected_evaluation_metric": 75.52
+      },
+      "selection_policy": "best_validation_accuracy",
+      "split_provenance": "embedded",
+      "teacher": "wrn_40_2"
+    },
+    {
+      "bytes": 9125110,
+      "dataset": "cifar100",
+      "pair": "wrn40_2_to_wrn16_2",
+      "path": "checkpoints/search/cifar100/wrn40_2_to_wrn16_2/teacher_seed_42.pt",
+      "selected_epoch": 194,
+      "selected_metrics": {
+        "final_test_metric": null,
+        "selected_evaluation_metric": 75.52
+      },
+      "selection_policy": "best_validation_accuracy",
+      "split_provenance": "embedded",
+      "teacher": "wrn_40_2"
+    },
+    {
+      "bytes": 3585797,
+      "dataset": "cifar100",
+      "pair": "resnet56_to_resnet20",
+      "path": "checkpoints/search/cifar100/resnet56_to_resnet20/teacher_seed_42.pt",
+      "selected_epoch": 188,
+      "selected_metrics": {
+        "final_test_metric": null,
+        "selected_evaluation_metric": 72.36
+      },
+      "selection_policy": "best_validation_accuracy",
+      "split_provenance": "embedded",
+      "teacher": "resnet56"
+    },
+    {
+      "bytes": 7214865,
+      "dataset": "cifar100",
+      "pair": "resnet110_to_resnet32",
+      "path": "checkpoints/search/cifar100/resnet110_to_resnet32/teacher_seed_42.pt",
+      "selected_epoch": 192,
+      "selected_metrics": {
+        "final_test_metric": null,
+        "selected_evaluation_metric": 73.36
+      },
+      "selection_policy": "best_validation_accuracy",
+      "split_provenance": "embedded",
+      "teacher": "resnet110"
+    },
+    {
+      "bytes": 7214865,
+      "dataset": "cifar100",
+      "pair": "resnet110_to_resnet20",
+      "path": "checkpoints/search/cifar100/resnet110_to_resnet20/teacher_seed_42.pt",
+      "selected_epoch": 192,
+      "selected_metrics": {
+        "final_test_metric": null,
+        "selected_evaluation_metric": 73.36
+      },
+      "selection_policy": "best_validation_accuracy",
+      "split_provenance": "embedded",
+      "teacher": "resnet110"
+    },
+    {
+      "bytes": 85361643,
+      "dataset": "oxford_pets",
+      "pair": "resnet34_to_resnet18",
+      "path": "checkpoints/search/oxford_pets/resnet34_to_resnet18/teacher_seed_42.pt",
+      "selected_epoch": 26,
+      "selected_metrics": {
+        "final_test_metric": null,
+        "selected_evaluation_metric": 93.23613086770982,
+        "selected_evaluation_metrics": {
+          "accuracy": 93.20652173913044,
+          "balanced_accuracy": 93.23613086770982,
+          "macro_f1": 93.19894981683167
+        }
+      },
+      "selection_policy": "best_validation_balanced_accuracy",
+      "split_provenance": "embedded",
+      "teacher": "resnet34"
+    },
+    {
+      "bytes": 44714659,
+      "dataset": "glue_mrpc",
+      "pair": "bert4_to_bert2",
+      "path": "checkpoints/search/glue_mrpc/bert4_to_bert2/teacher_seed_42.pt",
+      "selected_epoch": 4,
+      "selected_metrics": {
+        "final_test_metric": null,
+        "selected_evaluation_metric": 78.92156862745098
+      },
+      "selection_policy": "best_validation_accuracy",
+      "split_provenance": "embedded",
+      "teacher": "google/bert_uncased_L-4_H-256_A-4"
+    },
+    {
+      "bytes": 44714659,
+      "dataset": "glue_qqp",
+      "pair": "bert4_to_bert2",
+      "path": "checkpoints/search/glue_qqp/bert4_to_bert2/teacher_seed_42.pt",
+      "selected_epoch": 4,
+      "selected_metrics": {
+        "final_test_metric": null,
+        "selected_evaluation_metric": 88.34281474152857
+      },
+      "selection_policy": "best_validation_accuracy",
+      "split_provenance": "embedded",
+      "teacher": "google/bert_uncased_L-4_H-256_A-4"
+    },
+    {
+      "bytes": 44714659,
+      "dataset": "glue_sst2",
+      "pair": "bert4_to_bert2",
+      "path": "checkpoints/search/glue_sst2/bert4_to_bert2/teacher_seed_42.pt",
+      "selected_epoch": 3,
+      "selected_metrics": {
+        "final_test_metric": null,
+        "selected_evaluation_metric": 87.27064220183486
+      },
+      "selection_policy": "best_validation_accuracy",
+      "split_provenance": "embedded",
+      "teacher": "google/bert_uncased_L-4_H-256_A-4"
+    },
+    {
+      "bytes": 44715747,
+      "dataset": "glue_mnli",
+      "pair": "bert4_to_bert2",
+      "path": "checkpoints/search/glue_mnli/bert4_to_bert2/teacher_seed_42.pt",
+      "selected_epoch": 4,
+      "selected_metrics": {
+        "final_test_metric": null,
+        "selected_evaluation_metric": 76.03667855323485
+      },
+      "selection_policy": "best_validation_matched_accuracy",
+      "split_provenance": "embedded",
+      "teacher": "google/bert_uncased_L-4_H-256_A-4"
+    },
+    {
+      "bytes": 44714659,
+      "dataset": "glue_rte",
+      "pair": "bert4_to_bert2",
+      "path": "checkpoints/search/glue_rte/bert4_to_bert2/teacher_seed_42.pt",
+      "selected_epoch": 3,
+      "selected_metrics": {
+        "final_test_metric": null,
+        "selected_evaluation_metric": 63.898916967509024
+      },
+      "selection_policy": "best_validation_accuracy",
+      "split_provenance": "embedded",
+      "teacher": "google/bert_uncased_L-4_H-256_A-4"
+    },
+    {
+      "bytes": 44714659,
+      "dataset": "glue_qnli",
+      "pair": "bert4_to_bert2",
+      "path": "checkpoints/search/glue_qnli/bert4_to_bert2/teacher_seed_42.pt",
+      "selected_epoch": 2,
+      "selected_metrics": {
+        "final_test_metric": null,
+        "selected_evaluation_metric": 83.6536701446092
+      },
+      "selection_policy": "best_validation_accuracy",
+      "split_provenance": "embedded",
+      "teacher": "google/bert_uncased_L-4_H-256_A-4"
+    },
+    {
+      "bytes": 44714659,
+      "dataset": "glue_cola",
+      "pair": "bert4_to_bert2",
+      "path": "checkpoints/search/glue_cola/bert4_to_bert2/teacher_seed_42.pt",
+      "selected_epoch": 4,
+      "selected_metrics": {
+        "final_test_metric": null,
+        "selected_evaluation_metric": 23.676581652854086
+      },
+      "selection_policy": "best_validation_matthews_correlation",
+      "split_provenance": "embedded",
+      "teacher": "google/bert_uncased_L-4_H-256_A-4"
+    },
+    {
+      "bytes": 44713635,
+      "dataset": "glue_stsb",
+      "pair": "bert4_to_bert2",
+      "path": "checkpoints/search/glue_stsb/bert4_to_bert2/teacher_seed_42.pt",
+      "selected_epoch": 4,
+      "selected_metrics": {
+        "final_test_metric": null,
+        "selected_evaluation_metric": 85.13639083580162
+      },
+      "selection_policy": "best_validation_pearson",
+      "split_provenance": "embedded",
+      "teacher": "google/bert_uncased_L-4_H-256_A-4"
+    }
+  ]
+}

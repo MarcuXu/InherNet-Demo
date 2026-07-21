@@ -1,0 +1,8 @@
+candidate_id,kd_temperature,kd_fraction
+registered_reference,2.0,
+mix_reference,2.0,0.50
+supervised,,
+temperature_1,1.0,0.50
+temperature_4,4.0,0.50
+kd_fraction_025,2.0,0.25
+kd_fraction_075,2.0,0.75

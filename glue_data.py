@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -36,6 +37,24 @@ GLUE_TEXT_FIELDS: dict[str, tuple[str, ...]] = {
     "rte": ("sentence1", "sentence2"),
     "stsb": ("sentence1", "sentence2"),
 }
+GLUE_DATASET = "nyu-mll/glue"
+GLUE_DATASET_REVISION = "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c"
+
+
+def split_glue_training_data(
+    raw_train,
+    *,
+    problem_type: str,
+    validation_fraction: float,
+    validation_split_seed: int,
+):
+    split_kwargs: dict[str, Any] = {
+        "test_size": validation_fraction,
+        "seed": validation_split_seed,
+    }
+    if problem_type == "classification":
+        split_kwargs["stratify_by_column"] = "label"
+    return raw_train.train_test_split(**split_kwargs)
 
 
 def _load_hf_dependencies():
@@ -61,8 +80,12 @@ def build_glue_dataloaders(
     seed: int,
     pin_memory: bool,
     tokenizer_name: str,
+    tokenizer_revision: str,
     max_length: int,
-) -> tuple[DataLoader, DataLoader]:
+    search_validation: bool = False,
+    validation_fraction: float = 0.1,
+    validation_split_seed: int = 2026,
+) -> tuple[DataLoader, DataLoader, DataLoader, Mapping[str, Any]]:
     load_dataset, AutoTokenizer, DataCollatorWithPadding = _load_hf_dependencies()
 
     if task_name not in GLUE_TEXT_FIELDS:
@@ -73,8 +96,17 @@ def build_glue_dataloaders(
 
     cache_dir = Path(root) / "huggingface"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    raw = load_dataset("glue", task_name, cache_dir=str(cache_dir))
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, cache_dir=str(cache_dir))
+    raw = load_dataset(
+        GLUE_DATASET,
+        task_name,
+        revision=GLUE_DATASET_REVISION,
+        cache_dir=str(cache_dir),
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name,
+        revision=tokenizer_revision,
+        cache_dir=str(cache_dir),
+    )
     text_fields = GLUE_TEXT_FIELDS[task_name]
 
     def tokenize(batch: Mapping[str, list[str]]) -> dict[str, Any]:
@@ -85,14 +117,64 @@ def build_glue_dataloaders(
             max_length=max_length,
         )
 
-    remove_columns = [field for field in text_fields if field in raw["train"].column_names]
-    if "idx" in raw["train"].column_names:
-        remove_columns.append("idx")
-    encoded = raw.map(
-        tokenize,
-        batched=True,
-        remove_columns=remove_columns,
-    )
+    def encode_split(split):
+        remove_columns = [field for field in text_fields if field in split.column_names]
+        if "idx" in split.column_names:
+            remove_columns.append("idx")
+        return split.map(
+            tokenize,
+            batched=True,
+            remove_columns=remove_columns,
+        )
+
+    raw_full_train = raw["train"]
+    raw_official_evaluation = raw[eval_split_name]
+    if search_validation:
+        selection_split = split_glue_training_data(
+            raw_full_train,
+            problem_type=problem_type,
+            validation_fraction=validation_fraction,
+            validation_split_seed=validation_split_seed,
+        )
+        raw_train = selection_split["train"]
+        raw_evaluation = selection_split["test"]
+        evaluation_split_label = "train_holdout"
+    else:
+        raw_train = raw_full_train
+        raw_evaluation = raw_official_evaluation
+        evaluation_split_label = eval_split_name
+    encoded_train = encode_split(raw_train)
+    encoded_evaluation = encode_split(raw_evaluation)
+    calibration_count = min(16 * batch_size, len(raw_train))
+    calibration_kwargs: dict[str, Any] = {
+        "test_size": calibration_count,
+        "seed": validation_split_seed + 1,
+    }
+    if problem_type == "classification":
+        calibration_kwargs["stratify_by_column"] = "label"
+    raw_calibration = raw_train.train_test_split(**calibration_kwargs)["test"]
+    encoded_calibration = encode_split(raw_calibration)
+    provenance = {
+        "profile": "huggingface_glue",
+        "dataset": GLUE_DATASET,
+        "dataset_revision": GLUE_DATASET_REVISION,
+        "task": task_name,
+        "datasets_version": version("datasets"),
+        "train_split": "train_subset" if search_validation else "train",
+        "evaluation_split": evaluation_split_label,
+        "train_examples": len(raw_train),
+        "evaluation_examples": len(raw_evaluation),
+        "official_evaluation_split": eval_split_name,
+        "official_evaluation_examples": len(raw_official_evaluation),
+        "selection_validation_fraction": validation_fraction if search_validation else None,
+        "selection_split_seed": validation_split_seed if search_validation else None,
+        "calibration_profile": "fixed_seeded_stratified" if problem_type == "classification" else "fixed_seeded",
+        "calibration_examples": len(raw_calibration),
+        "calibration_seed": validation_split_seed + 1,
+        "tokenizer": tokenizer_name,
+        "tokenizer_revision": tokenizer_revision,
+        "max_length": max_length,
+    }
     collator = DataCollatorWithPadding(tokenizer=tokenizer, return_tensors="pt")
 
     def collate_batch(batch: list[tuple[dict[str, Any], int | float]]) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
@@ -108,7 +190,7 @@ def build_glue_dataloaders(
 
     generator = torch.Generator().manual_seed(seed)
     train_loader = DataLoader(
-        GlueTextDataset(encoded["train"], problem_type=problem_type),
+        GlueTextDataset(encoded_train, problem_type=problem_type),
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
@@ -117,15 +199,19 @@ def build_glue_dataloaders(
         collate_fn=collate_batch,
     )
     validation_loader = DataLoader(
-        GlueTextDataset(encoded[eval_split_name], problem_type=problem_type),
+        GlueTextDataset(encoded_evaluation, problem_type=problem_type),
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
         collate_fn=collate_batch,
     )
-    return train_loader, validation_loader
-
-
-def build_glue_sst2_dataloaders(**kwargs) -> tuple[DataLoader, DataLoader]:
-    return build_glue_dataloaders(task_name="sst2", eval_split_name="validation", problem_type="classification", **kwargs)
+    calibration_loader = DataLoader(
+        GlueTextDataset(encoded_calibration, problem_type=problem_type),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        collate_fn=collate_batch,
+    )
+    return train_loader, validation_loader, calibration_loader, provenance

@@ -14,13 +14,15 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 
 from experiment_registry import TrainSettings
-from model_wrappers import compute_gating_load_balance_loss
+from model_wrappers import clear_gating_router_cache, compute_gating_load_balance_loss
 
 
 RUN_LOG_ENV_VAR = "INHERNET_RUN_LOG"
 RUN_METADATA_PREFIX = "RUN_METADATA"
 RUN_METRICS_PREFIX = "RUN_METRICS"
 RUN_SUMMARY_PREFIX = "RUN_SUMMARY"
+RUN_FINAL_TEST_PREFIX = "RUN_FINAL_TEST"
+INHERITANCE_DIAGNOSTICS_PREFIX = "INHERITANCE_DIAGNOSTICS"
 
 
 class RunLogger:
@@ -323,195 +325,422 @@ def evaluate_task_metrics(
     return metrics
 
 
-def evaluate_classification_metrics(
-    model: nn.Module,
+def evaluate_inheritance_diagnostics(
+    teacher_model: nn.Module,
+    inherited_model: nn.Module,
     data_loader: DataLoader,
     device: torch.device,
-    criterion: nn.Module,
-) -> dict[str, float]:
-    return evaluate_task_metrics(
-        model,
+    *,
+    problem_type: str,
+    num_labels: int,
+    metric_names: tuple[str, ...],
+    evaluation_split: str = "validation",
+    local_operator_max_batches: int = 4,
+) -> dict[str, Any]:
+    """Measure inherited-model fidelity before the first optimizer update."""
+    teacher_was_training = teacher_model.training
+    inherited_was_training = inherited_model.training
+    teacher_model.eval()
+    inherited_model.eval()
+    criterion = build_task_criterion(problem_type)
+    total = 0
+    teacher_loss_sum = 0.0
+    inherited_loss_sum = 0.0
+    squared_error_sum = 0.0
+    teacher_squared_sum = 0.0
+    dot_sum = 0.0
+    teacher_vector_squared_sum = 0.0
+    inherited_vector_squared_sum = 0.0
+    kl_sum = 0.0
+    agreement_sum = 0
+    labels_all: list[torch.Tensor] = []
+    teacher_predictions: list[torch.Tensor] = []
+    inherited_predictions: list[torch.Tensor] = []
+
+    try:
+        with torch.no_grad():
+            for inputs, labels in data_loader:
+                inputs = move_batch_to_device(inputs, device)
+                labels = prepare_labels(labels.to(device), problem_type)
+                teacher_logits = forward_logits(teacher_model, inputs)
+                inherited_logits = forward_logits(inherited_model, inputs)
+                batch_size = int(labels.size(0))
+                total += batch_size
+
+                teacher_flat = teacher_logits.float().reshape(batch_size, -1)
+                inherited_flat = inherited_logits.float().reshape(batch_size, -1)
+                difference = inherited_flat - teacher_flat
+                squared_error_sum += float(difference.square().sum().item())
+                teacher_squared_sum += float(teacher_flat.square().sum().item())
+                dot_sum += float((teacher_flat * inherited_flat).sum().item())
+                teacher_vector_squared_sum += float(teacher_flat.square().sum().item())
+                inherited_vector_squared_sum += float(inherited_flat.square().sum().item())
+
+                if problem_type == "regression":
+                    teacher_values = prepare_regression_outputs(teacher_logits)
+                    inherited_values = prepare_regression_outputs(inherited_logits)
+                    label_values = labels.view_as(teacher_values)
+                    teacher_loss = criterion(teacher_values, label_values)
+                    inherited_loss = criterion(inherited_values, label_values)
+                    teacher_prediction = teacher_values
+                    inherited_prediction = inherited_values
+                    metric_labels = label_values
+                else:
+                    teacher_loss = criterion(teacher_logits, labels)
+                    inherited_loss = criterion(inherited_logits, labels)
+                    teacher_prediction = teacher_logits.argmax(dim=1)
+                    inherited_prediction = inherited_logits.argmax(dim=1)
+                    metric_labels = labels
+                    agreement_sum += int((teacher_prediction == inherited_prediction).sum().item())
+                    kl_sum += float(
+                        F.kl_div(
+                            F.log_softmax(inherited_logits.float(), dim=1),
+                            F.softmax(teacher_logits.float(), dim=1),
+                            reduction="batchmean",
+                        ).item()
+                    ) * batch_size
+
+                teacher_loss_sum += float(teacher_loss.item()) * batch_size
+                inherited_loss_sum += float(inherited_loss.item()) * batch_size
+                teacher_predictions.append(teacher_prediction.detach().cpu())
+                inherited_predictions.append(inherited_prediction.detach().cpu())
+                labels_all.append(metric_labels.detach().cpu())
+    finally:
+        teacher_model.train(teacher_was_training)
+        inherited_model.train(inherited_was_training)
+
+    teacher_prediction_tensor = torch.cat(teacher_predictions) if teacher_predictions else torch.empty(0)
+    inherited_prediction_tensor = torch.cat(inherited_predictions) if inherited_predictions else torch.empty(0)
+    label_tensor = torch.cat(labels_all) if labels_all else torch.empty(0)
+    teacher_metrics = compute_task_metric_values(
+        teacher_prediction_tensor,
+        label_tensor,
+        problem_type=problem_type,
+        num_labels=max(num_labels, 1),
+        metric_names=metric_names,
+    )
+    inherited_metrics = compute_task_metric_values(
+        inherited_prediction_tensor,
+        label_tensor,
+        problem_type=problem_type,
+        num_labels=max(num_labels, 1),
+        metric_names=metric_names,
+    )
+    cosine_denominator = math.sqrt(
+        max(teacher_vector_squared_sum * inherited_vector_squared_sum, 0.0)
+    )
+    diagnostics: dict[str, Any] = {
+        "examples": total,
+        "teacher_loss": teacher_loss_sum / max(total, 1),
+        "inherited_loss": inherited_loss_sum / max(total, 1),
+        "teacher_metrics": teacher_metrics,
+        "inherited_metrics": inherited_metrics,
+        "output_squared_error_per_example": squared_error_sum / max(total, 1),
+        "relative_output_squared_error": squared_error_sum / max(teacher_squared_sum, 1e-30),
+        "output_cosine_similarity": dot_sum / cosine_denominator if cosine_denominator > 0 else 0.0,
+    }
+    if problem_type == "classification":
+        diagnostics["teacher_to_inherited_kl"] = kl_sum / max(total, 1)
+        diagnostics["prediction_agreement"] = agreement_sum / max(total, 1)
+    else:
+        diagnostics["teacher_inherited_pearson"] = (
+            _pearson_correlation_percent(teacher_prediction_tensor, inherited_prediction_tensor)
+            / 100.0
+        )
+    diagnostics["router_probe"] = evaluate_router_gradient_probe(
+        teacher_model,
+        inherited_model,
         data_loader,
         device,
-        criterion,
-        problem_type="classification",
-        metric_names=("accuracy",),
+        problem_type=problem_type,
+        evaluation_split=evaluation_split,
     )
+    local_operator_probe = evaluate_local_operator_probe(
+        teacher_model,
+        inherited_model,
+        data_loader,
+        device,
+        evaluation_split=evaluation_split,
+        max_batches=local_operator_max_batches,
+    )
+    if local_operator_probe is not None:
+        diagnostics["local_operator_probe"] = local_operator_probe
+    return diagnostics
+
+
+def evaluate_local_operator_probe(
+    teacher_model: nn.Module,
+    inherited_model: nn.Module,
+    data_loader: DataLoader,
+    device: torch.device,
+    *,
+    evaluation_split: str,
+    max_batches: int = 4,
+) -> dict[str, Any] | None:
+    """Compare dense and inherited local operators on held-out teacher inputs."""
+    if max_batches <= 0:
+        raise ValueError("local-operator diagnostics require max_batches > 0.")
+    report = getattr(inherited_model, "hetero_report", None)
+    backbone = getattr(inherited_model, "backbone", None)
+    if not isinstance(report, Mapping) or not isinstance(backbone, nn.Module):
+        return None
+    allocation_layers = report.get("allocation_layers") or {}
+    layer_names = [
+        name
+        for name, layer in allocation_layers.items()
+        if isinstance(layer, Mapping) and layer.get("choice") != "dense"
+    ]
+    if not layer_names:
+        return None
+
+    second_moments = report.get("second_moments") or {}
+    accumulators = {
+        name: {
+            "squared_error_sum": 0.0,
+            "dense_squared_sum": 0.0,
+            "applications": 0,
+            "output_elements": 0,
+        }
+        for name in layer_names
+    }
+    current_attention_mask: torch.Tensor | None = None
+    hooks: list[Any] = []
+
+    def make_hook(name: str, inherited_layer: nn.Module):
+        def hook(_module: nn.Module, module_inputs: tuple[Any, ...], dense_output: Any) -> None:
+            if not module_inputs or not isinstance(module_inputs[0], torch.Tensor):
+                raise TypeError(f"Local-operator probe requires tensor input for layer {name!r}.")
+            if not isinstance(dense_output, torch.Tensor):
+                raise TypeError(f"Local-operator probe requires tensor output for layer {name!r}.")
+            inherited_output = inherited_layer(module_inputs[0])
+            if not isinstance(inherited_output, torch.Tensor):
+                raise TypeError(f"Inherited layer {name!r} did not return a tensor.")
+            dense_values = dense_output.detach().float()
+            inherited_values = inherited_output.detach().float()
+            applications = dense_values.numel() // max(int(dense_values.shape[-1]), 1)
+            if dense_values.ndim == 4:
+                applications = dense_values.numel() // max(int(dense_values.shape[1]), 1)
+            elif (
+                current_attention_mask is not None
+                and dense_values.ndim >= 3
+                and tuple(current_attention_mask.shape) == tuple(dense_values.shape[:2])
+            ):
+                mask = current_attention_mask.to(device=dense_values.device, dtype=torch.bool)
+                dense_values = dense_values[mask]
+                inherited_values = inherited_values[mask]
+                applications = int(mask.sum().item())
+            difference = inherited_values - dense_values
+            accumulator = accumulators[name]
+            accumulator["squared_error_sum"] += float(difference.square().sum().item())
+            accumulator["dense_squared_sum"] += float(dense_values.square().sum().item())
+            accumulator["applications"] += applications
+            accumulator["output_elements"] += dense_values.numel()
+
+        return hook
+
+    teacher_was_training = teacher_model.training
+    inherited_was_training = inherited_model.training
+    teacher_model.eval()
+    inherited_model.eval()
+    batches = 0
+    examples = 0
+    try:
+        for name in layer_names:
+            teacher_layer = teacher_model.get_submodule(name)
+            inherited_layer = backbone.get_submodule(name)
+            hooks.append(teacher_layer.register_forward_hook(make_hook(name, inherited_layer)))
+        with torch.no_grad():
+            for batch_index, (inputs, labels) in enumerate(data_loader):
+                if batch_index >= max_batches:
+                    break
+                inputs = move_batch_to_device(inputs, device)
+                current_attention_mask = (
+                    inputs.get("attention_mask")
+                    if isinstance(inputs, Mapping)
+                    and isinstance(inputs.get("attention_mask"), torch.Tensor)
+                    else None
+                )
+                forward_logits(teacher_model, inputs)
+                batches += 1
+                examples += int(labels.size(0))
+    finally:
+        current_attention_mask = None
+        for hook in hooks:
+            hook.remove()
+        clear_gating_router_cache(inherited_model)
+        teacher_model.train(teacher_was_training)
+        inherited_model.train(inherited_was_training)
+
+    per_layer: dict[str, dict[str, Any]] = {}
+    total_squared_error = 0.0
+    total_dense_squared = 0.0
+    for name in layer_names:
+        accumulator = accumulators[name]
+        numerator = float(accumulator["squared_error_sum"])
+        denominator = float(accumulator["dense_squared_sum"])
+        total_squared_error += numerator
+        total_dense_squared += denominator
+        moment = second_moments.get(name) or {}
+        per_layer[name] = {
+            **accumulator,
+            "relative_squared_error": numerator / max(denominator, 1e-30),
+            "moment_mode": moment.get("mode", "unknown"),
+        }
+    return {
+        "evaluation_split": evaluation_split,
+        "max_batches": max_batches,
+        "batches": batches,
+        "examples": examples,
+        "factorized_layer_count": len(per_layer),
+        "squared_error_sum": total_squared_error,
+        "dense_squared_sum": total_dense_squared,
+        "relative_squared_error": total_squared_error / max(total_dense_squared, 1e-30),
+        "aggregation": "ratio_of_summed_squared_errors",
+        "per_layer": per_layer,
+    }
+
+
+def evaluate_router_gradient_probe(
+    teacher_model: nn.Module,
+    inherited_model: nn.Module,
+    data_loader: DataLoader,
+    device: torch.device,
+    *,
+    problem_type: str,
+    evaluation_split: str = "validation",
+    batch_index: int = 0,
+    active_tolerance: float = 1e-7,
+) -> dict[str, Any]:
+    """Probe teacher-matching router gradients without updating model state."""
+    routers = [
+        (name, module)
+        for name, module in inherited_model.named_modules()
+        if isinstance(getattr(module, "gate", None), nn.Linear)
+    ]
+    if not routers:
+        return {
+            "objective": "teacher_kl" if problem_type == "classification" else "teacher_mse",
+            "evaluation_split": evaluation_split,
+            "batch_index": batch_index,
+            "router_count": 0,
+            "active_tolerance": active_tolerance,
+        }
+
+    try:
+        probe_batch = next(
+            batch for index, batch in enumerate(data_loader) if index == batch_index
+        )
+    except StopIteration as exc:
+        raise ValueError(
+            f"Router-gradient diagnostics require batch index {batch_index}, but it is unavailable."
+        ) from exc
+    inputs, _ = probe_batch
+    inputs = move_batch_to_device(inputs, device)
+    teacher_was_training = teacher_model.training
+    inherited_was_training = inherited_model.training
+    teacher_model.eval()
+    inherited_model.eval()
+    clear_gating_router_cache(inherited_model)
+    try:
+        with torch.no_grad():
+            teacher_logits = forward_logits(teacher_model, inputs).detach()
+        inherited_logits = forward_logits(inherited_model, inputs)
+        if problem_type == "classification":
+            objective = F.kl_div(
+                F.log_softmax(inherited_logits.float(), dim=-1),
+                F.softmax(teacher_logits.float(), dim=-1),
+                reduction="batchmean",
+            )
+            objective_name = "teacher_kl"
+        else:
+            objective = F.mse_loss(
+                prepare_regression_outputs(inherited_logits).float(),
+                prepare_regression_outputs(teacher_logits).float(),
+            )
+            objective_name = "teacher_mse"
+
+        parameter_entries: list[tuple[str, str, torch.Tensor]] = []
+        for name, router in routers:
+            parameter_entries.append((name, "weight", router.gate.weight))
+            if router.gate.bias is not None:
+                parameter_entries.append((name, "bias", router.gate.bias))
+        gradients = torch.autograd.grad(
+            objective,
+            [entry[2] for entry in parameter_entries],
+            allow_unused=True,
+        )
+
+        squared_sums = {"weight": 0.0, "bias": 0.0}
+        element_counts = {"weight": 0, "bias": 0}
+        per_router: dict[str, dict[str, float]] = {name: {} for name, _ in routers}
+        for (name, kind, parameter), gradient in zip(parameter_entries, gradients):
+            if gradient is None:
+                gradient = torch.zeros_like(parameter)
+            squared_sum = float(gradient.detach().float().square().sum().item())
+            squared_sums[kind] += squared_sum
+            element_counts[kind] += gradient.numel()
+            per_router[name][f"{kind}_l2"] = math.sqrt(squared_sum)
+
+        active_router_count = sum(
+            max(values.get("weight_l2", 0.0), values.get("bias_l2", 0.0))
+            > active_tolerance
+            for values in per_router.values()
+        )
+        entropies: list[float] = []
+        diversity_values: list[float] = []
+        for _, router in routers:
+            probabilities = getattr(router, "_last_gating_probs", None)
+            if probabilities is not None and probabilities.numel() > 0:
+                entropy = -(
+                    probabilities.float().clamp_min(1e-30)
+                    * probabilities.float().clamp_min(1e-30).log()
+                ).sum(dim=-1).mean()
+                entropies.append(float((entropy / math.log(router.gate.out_features)).item()))
+            experts = getattr(router, "experts", None)
+            head_num = int(getattr(router, "head_num", 0))
+            if experts is not None and head_num > 1:
+                weights = experts.weight.detach().float().reshape(head_num, -1)
+                mean_weight = weights.mean(dim=0, keepdim=True)
+                deviation_rms = weights.sub(mean_weight).square().mean().sqrt()
+                mean_rms = mean_weight.square().mean().sqrt().clamp_min(1e-30)
+                diversity_values.append(float((deviation_rms / mean_rms).item()))
+
+        return {
+            "objective": objective_name,
+            "objective_value": float(objective.detach().item()),
+            "evaluation_split": evaluation_split,
+            "batch_index": batch_index,
+            "batch_examples": int(teacher_logits.shape[0]),
+            "router_count": len(routers),
+            "active_tolerance": active_tolerance,
+            "active_router_count": active_router_count,
+            "active_router_fraction": active_router_count / len(routers),
+            "router_weight_gradient_rms": math.sqrt(
+                squared_sums["weight"] / max(element_counts["weight"], 1)
+            ),
+            "router_bias_gradient_rms": math.sqrt(
+                squared_sums["bias"] / max(element_counts["bias"], 1)
+            ),
+            "mean_normalized_route_entropy": (
+                sum(entropies) / len(entropies) if entropies else None
+            ),
+            "mean_relative_expert_diversity": (
+                sum(diversity_values) / len(diversity_values)
+                if diversity_values
+                else None
+            ),
+            "per_router_gradient_l2": per_router,
+        }
+    finally:
+        clear_gating_router_cache(inherited_model)
+        teacher_model.train(teacher_was_training)
+        inherited_model.train(inherited_was_training)
 
 
 def ensure_finite_scalar(value: float, context: str) -> float:
     if not math.isfinite(float(value)):
         raise RuntimeError(f"Non-finite metric detected: {context}={value}")
     return float(value)
-
-
-def ensure_finite_loss_tensor(loss: torch.Tensor, context: str) -> None:
-    if not torch.isfinite(loss).all():
-        raise RuntimeError(f"Non-finite optimization loss detected during {context}.")
-
-
-def _tensor_is_finite(value: torch.Tensor | None) -> bool:
-    if value is None:
-        return True
-    return bool(torch.isfinite(value).all().item())
-
-
-def _format_scalar(value: torch.Tensor | None) -> str:
-    if value is None:
-        return "n/a"
-    detached = value.detach()
-    if detached.numel() == 0:
-        return "empty"
-    scalar = detached.item() if detached.numel() == 1 else detached.mean().item()
-    return f"{float(scalar):.6g}"
-
-
-def _format_max_abs(value: torch.Tensor | None) -> str:
-    if value is None:
-        return "n/a"
-    detached = value.detach()
-    if detached.numel() == 0:
-        return "empty"
-    return f"{float(detached.abs().max().item()):.6g}"
-
-
-def _format_float(value: float | None) -> str:
-    if value is None:
-        return "n/a"
-    return f"{float(value):.6g}"
-
-
-def _collect_non_finite_distillation_issues(
-    *,
-    teacher_logits: torch.Tensor,
-    student_logits: torch.Tensor,
-    ce_loss: torch.Tensor,
-    kd_loss: torch.Tensor,
-    total_loss: torch.Tensor,
-    aux_loss: torch.Tensor | None,
-) -> list[str]:
-    issues: list[str] = []
-    for name, value in (
-        ("teacher_logits", teacher_logits),
-        ("student_logits", student_logits),
-        ("ce_loss", ce_loss),
-        ("kd_loss", kd_loss),
-        ("aux_loss", aux_loss),
-        ("total_loss", total_loss),
-    ):
-        if not _tensor_is_finite(value):
-            issues.append(name)
-    return issues
-
-
-def _safe_max_abs_tensor(value: torch.Tensor) -> float | None:
-    detached = value.detach()
-    if detached.numel() == 0:
-        return 0.0
-    finite_values = detached[torch.isfinite(detached)]
-    if finite_values.numel() == 0:
-        return None
-    return float(finite_values.abs().max().item())
-
-
-def _collect_gradient_stats(model: nn.Module) -> tuple[float | None, float | None, str | None]:
-    total_sq = 0.0
-    max_abs = 0.0
-    saw_grad = False
-    for name, parameter in model.named_parameters():
-        grad = parameter.grad
-        if grad is None:
-            continue
-        saw_grad = True
-        detached = grad.detach()
-        if detached.numel() == 0:
-            continue
-        if not torch.isfinite(detached).all():
-            return None, _safe_max_abs_tensor(detached), name
-        grad_float = detached.float()
-        total_sq += float(torch.sum(grad_float * grad_float).item())
-        grad_max_abs = _safe_max_abs_tensor(detached)
-        if grad_max_abs is not None:
-            max_abs = max(max_abs, grad_max_abs)
-    if not saw_grad:
-        return 0.0, 0.0, None
-    return math.sqrt(total_sq), max_abs, None
-
-
-def _collect_parameter_stats(model: nn.Module) -> tuple[float | None, str | None]:
-    max_abs = 0.0
-    for name, parameter in model.named_parameters():
-        detached = parameter.detach()
-        if detached.numel() == 0:
-            continue
-        if not torch.isfinite(detached).all():
-            return _safe_max_abs_tensor(detached), name
-        param_max_abs = _safe_max_abs_tensor(detached)
-        if param_max_abs is not None:
-            max_abs = max(max_abs, param_max_abs)
-    return max_abs, None
-
-
-def _should_collect_detailed_finiteness_stats(
-    *,
-    epoch: int,
-    batch_idx: int,
-    detailed_check_batches: int,
-) -> bool:
-    return detailed_check_batches > 0 and epoch == 1 and batch_idx <= detailed_check_batches
-
-
-def _build_non_finite_distillation_error(
-    *,
-    phase: str,
-    epoch: int,
-    batch_idx: int,
-    run_label: str,
-    stage: str,
-    teacher_logits: torch.Tensor,
-    student_logits: torch.Tensor,
-    ce_loss: torch.Tensor,
-    kd_loss: torch.Tensor,
-    total_loss: torch.Tensor,
-    aux_loss: torch.Tensor | None,
-    backend_label: str | None = None,
-    grad_norm: float | None = None,
-    grad_max_abs: float | None = None,
-    param_max_abs: float | None = None,
-    non_finite_grad: str | None = None,
-    non_finite_param: str | None = None,
-) -> RuntimeError:
-    issues = _collect_non_finite_distillation_issues(
-        teacher_logits=teacher_logits,
-        student_logits=student_logits,
-        ce_loss=ce_loss,
-        kd_loss=kd_loss,
-        total_loss=total_loss,
-        aux_loss=aux_loss,
-    )
-    if non_finite_grad is not None:
-        issues.append("gradients")
-    if non_finite_param is not None:
-        issues.append("parameters")
-    issue_text = ", ".join(issues) if issues else "unknown"
-    backend_text = f", backend={backend_label}" if backend_label is not None else ""
-    return RuntimeError(
-        "Non-finite distillation values detected for "
-        f"{run_label} during {phase} epoch {epoch} batch {batch_idx} "
-        f"(stage={stage}{backend_text}). "
-        f"issues={issue_text} | "
-        f"teacher_max_abs={_format_max_abs(teacher_logits)} | "
-        f"student_max_abs={_format_max_abs(student_logits)} | "
-        f"ce_loss={_format_scalar(ce_loss)} | "
-        f"kd_loss={_format_scalar(kd_loss)} | "
-        f"aux_loss={_format_scalar(aux_loss)} | "
-        f"total_loss={_format_scalar(total_loss)} | "
-        f"grad_norm={_format_float(grad_norm)} | "
-        f"grad_max_abs={_format_float(grad_max_abs)} | "
-        f"param_max_abs={_format_float(param_max_abs)} | "
-        f"non_finite_grad={non_finite_grad or 'n/a'} | "
-        f"non_finite_param={non_finite_param or 'n/a'}"
-    )
 
 
 def compute_distillation_objective(
@@ -550,164 +779,9 @@ def compute_distillation_objective(
         aux_loss = compute_gating_load_balance_loss(student_model)
         if aux_loss is not None:
             total_loss = total_loss + aux_loss_weight * aux_loss
+    elif student_model is not None:
+        clear_gating_router_cache(student_model)
     return ce_loss, kd_loss, aux_loss, total_loss
-
-
-def probe_distillation_warmup(
-    teacher_model: nn.Module,
-    student_model: nn.Module,
-    train_loader: DataLoader,
-    settings: TrainSettings,
-    device: torch.device,
-    *,
-    aux_loss_weight: float = 0.0,
-    gradient_clip_norm: float | None = None,
-    warmup_batches: int = 20,
-    run_label: str = "distillation_probe",
-    phase: str = "warmup_probe",
-    backend_label: str | None = None,
-    check_post_step_finiteness: bool = True,
-    detailed_check_batches: int = 0,
-    problem_type: str = "classification",
-) -> None:
-    if warmup_batches <= 0:
-        return
-
-    optimizer = build_optimizer(student_model, settings)
-    hard_loss = build_task_criterion(problem_type)
-    teacher_was_training = teacher_model.training
-    student_was_training = student_model.training
-    teacher_model.eval()
-    student_model.train()
-    try:
-        for batch_idx, (inputs, labels) in enumerate(train_loader, start=1):
-            if batch_idx > warmup_batches:
-                break
-            inputs = move_batch_to_device(inputs, device)
-            labels = prepare_labels(labels.to(device), problem_type)
-            optimizer.zero_grad(set_to_none=True)
-            with torch.no_grad():
-                teacher_logits = forward_logits(teacher_model, inputs)
-            student_logits = forward_logits(student_model, inputs)
-            ce_loss, kd_loss, aux_loss, loss = compute_distillation_objective(
-                teacher_logits,
-                student_logits,
-                labels,
-                settings,
-                student_model=student_model,
-                aux_loss_weight=aux_loss_weight,
-                criterion=hard_loss,
-                problem_type=problem_type,
-            )
-            collect_detailed_stats = check_post_step_finiteness and _should_collect_detailed_finiteness_stats(
-                epoch=1,
-                batch_idx=batch_idx,
-                detailed_check_batches=detailed_check_batches,
-            )
-            param_max_abs = None
-            if collect_detailed_stats:
-                param_max_abs, _ = _collect_parameter_stats(student_model)
-            if _collect_non_finite_distillation_issues(
-                teacher_logits=teacher_logits,
-                student_logits=student_logits,
-                ce_loss=ce_loss,
-                kd_loss=kd_loss,
-                total_loss=loss,
-                aux_loss=aux_loss,
-            ):
-                if param_max_abs is None:
-                    param_max_abs, _ = _collect_parameter_stats(student_model)
-                raise _build_non_finite_distillation_error(
-                    phase=phase,
-                    epoch=1,
-                    batch_idx=batch_idx,
-                    run_label=run_label,
-                    stage="pre-step",
-                    teacher_logits=teacher_logits,
-                    student_logits=student_logits,
-                    ce_loss=ce_loss,
-                    kd_loss=kd_loss,
-                    total_loss=loss,
-                    aux_loss=aux_loss,
-                    backend_label=backend_label,
-                    param_max_abs=param_max_abs,
-                )
-            loss.backward()
-            grad_norm = None
-            grad_max_abs = None
-            if collect_detailed_stats:
-                grad_norm, grad_max_abs, non_finite_grad = _collect_gradient_stats(student_model)
-                if non_finite_grad is not None:
-                    raise _build_non_finite_distillation_error(
-                        phase=phase,
-                        epoch=1,
-                        batch_idx=batch_idx,
-                        run_label=run_label,
-                        stage="post-backward",
-                        teacher_logits=teacher_logits,
-                        student_logits=student_logits,
-                        ce_loss=ce_loss,
-                        kd_loss=kd_loss,
-                        total_loss=loss,
-                        aux_loss=aux_loss,
-                        backend_label=backend_label,
-                        grad_norm=grad_norm,
-                        grad_max_abs=grad_max_abs,
-                        param_max_abs=param_max_abs,
-                        non_finite_grad=non_finite_grad,
-                    )
-            if gradient_clip_norm is not None:
-                clipped_grad_norm = nn.utils.clip_grad_norm_(student_model.parameters(), max_norm=gradient_clip_norm)
-                if bool(torch.isfinite(clipped_grad_norm).item()):
-                    if grad_norm is None:
-                        grad_norm = float(clipped_grad_norm.item())
-                elif check_post_step_finiteness:
-                    grad_norm, grad_max_abs, non_finite_grad = _collect_gradient_stats(student_model)
-                    if param_max_abs is None:
-                        param_max_abs, _ = _collect_parameter_stats(student_model)
-                    raise _build_non_finite_distillation_error(
-                        phase=phase,
-                        epoch=1,
-                        batch_idx=batch_idx,
-                        run_label=run_label,
-                        stage="post-backward",
-                        teacher_logits=teacher_logits,
-                        student_logits=student_logits,
-                        ce_loss=ce_loss,
-                        kd_loss=kd_loss,
-                        total_loss=loss,
-                        aux_loss=aux_loss,
-                        backend_label=backend_label,
-                        grad_norm=grad_norm,
-                        grad_max_abs=grad_max_abs,
-                        param_max_abs=param_max_abs,
-                        non_finite_grad=non_finite_grad or "unknown",
-                    )
-            optimizer.step()
-            if collect_detailed_stats:
-                param_max_abs, non_finite_param = _collect_parameter_stats(student_model)
-                if non_finite_param is not None:
-                    raise _build_non_finite_distillation_error(
-                        phase=phase,
-                        epoch=1,
-                        batch_idx=batch_idx,
-                        run_label=run_label,
-                        stage="post-step",
-                        teacher_logits=teacher_logits,
-                        student_logits=student_logits,
-                        ce_loss=ce_loss,
-                        kd_loss=kd_loss,
-                        total_loss=loss,
-                        aux_loss=aux_loss,
-                        backend_label=backend_label,
-                        grad_norm=grad_norm,
-                        grad_max_abs=grad_max_abs,
-                        param_max_abs=param_max_abs,
-                        non_finite_param=non_finite_param,
-                    )
-    finally:
-        teacher_model.train(teacher_was_training)
-        student_model.train(student_was_training)
 
 
 def build_optimizer(model: nn.Module, settings: TrainSettings) -> optim.Optimizer:
@@ -720,17 +794,70 @@ def build_optimizer(model: nn.Module, settings: TrainSettings) -> optim.Optimize
         )
     if settings.optimizer_name.lower() == "adam":
         return optim.Adam(model.parameters(), lr=settings.lr, weight_decay=settings.weight_decay)
+    if settings.optimizer_name.lower() == "adamw":
+        if settings.exclude_bias_norm_from_weight_decay:
+            norm_parameter_ids = {
+                id(parameter)
+                for module in model.modules()
+                if isinstance(module, nn.LayerNorm)
+                for parameter in module.parameters(recurse=False)
+            }
+            decay_parameters = []
+            no_decay_parameters = []
+            for name, parameter in model.named_parameters():
+                if not parameter.requires_grad:
+                    continue
+                if name.endswith(".bias") or id(parameter) in norm_parameter_ids:
+                    no_decay_parameters.append(parameter)
+                else:
+                    decay_parameters.append(parameter)
+            parameter_groups = [
+                {"params": decay_parameters, "weight_decay": settings.weight_decay},
+                {"params": no_decay_parameters, "weight_decay": 0.0},
+            ]
+            return optim.AdamW(parameter_groups, lr=settings.lr)
+        return optim.AdamW(model.parameters(), lr=settings.lr, weight_decay=settings.weight_decay)
     raise ValueError(f"Unsupported optimizer: {settings.optimizer_name}")
 
 
-def build_scheduler(optimizer: optim.Optimizer, settings: TrainSettings):
-    if not settings.lr_milestones:
+def build_scheduler(
+    optimizer: optim.Optimizer,
+    settings: TrainSettings,
+    *,
+    steps_per_epoch: int,
+):
+    if settings.scheduler_name == "none":
         return None
-    return optim.lr_scheduler.MultiStepLR(
-        optimizer,
-        milestones=list(settings.lr_milestones),
-        gamma=settings.lr_gamma,
-    )
+    if settings.scheduler_name == "multistep":
+        if not settings.lr_milestones:
+            return None
+        return optim.lr_scheduler.MultiStepLR(
+            optimizer,
+            milestones=list(settings.lr_milestones),
+            gamma=settings.lr_gamma,
+        )
+    if settings.scheduler_name == "linear":
+        total_steps = max(1, settings.epochs * steps_per_epoch)
+        warmup_steps = round(total_steps * settings.warmup_ratio)
+
+        def lr_multiplier(step: int) -> float:
+            if warmup_steps > 0 and step < warmup_steps:
+                return float(step) / float(warmup_steps)
+            return max(
+                0.0,
+                float(total_steps - step) / float(max(1, total_steps - warmup_steps)),
+            )
+
+        return optim.lr_scheduler.LambdaLR(optimizer, lr_multiplier)
+    raise ValueError(f"Unsupported scheduler: {settings.scheduler_name}")
+
+
+def scheduler_steps_per_batch(settings: TrainSettings) -> bool:
+    return settings.scheduler_name == "linear"
+
+
+def _average_train_batch_ms(train_time_seconds: float, batch_count: int) -> float:
+    return 1000.0 * train_time_seconds / max(batch_count, 1)
 
 
 def _finalize_test_metrics(
@@ -782,9 +909,12 @@ def _record_epoch_metrics(
     train_metrics: Mapping[str, float],
     test_metrics: Mapping[str, float],
     epoch_time_seconds: float,
+    train_time_seconds: float,
+    eval_time_seconds: float,
     avg_train_batch_ms: float,
     eval_split_name: str = "test",
     primary_metric_name: str = "accuracy",
+    train_components: Mapping[str, float] | None = None,
 ) -> None:
     eval_loss = float(test_metrics["loss"])
     train_primary = float(train_metrics[primary_metric_name])
@@ -797,6 +927,13 @@ def _record_epoch_metrics(
     history["train_accuracy"].append(train_primary)
     history["test_loss"].append(eval_loss)
     history["test_accuracy"].append(eval_primary)
+    for component_name, component_value in (train_components or {}).items():
+        history.setdefault(f"train_component_{component_name}", []).append(float(component_value))
+    for metric_name, metric_value in train_metrics.items():
+        history.setdefault(f"train_metric_{metric_name}", []).append(float(metric_value))
+    for metric_name, metric_value in test_metrics.items():
+        if metric_name != "loss":
+            history.setdefault(f"eval_metric_{metric_name}", []).append(float(metric_value))
     metrics_payload = {
         "epoch": epoch,
         "epochs": settings.epochs,
@@ -805,14 +942,17 @@ def _record_epoch_metrics(
         "train_objective": train_objective,
         "train_loss": train_loss,
         "eval_loss": eval_loss,
-        "test_loss": eval_loss,
         f"{split_key_prefix}_loss": eval_loss,
         "primary_metric_name": primary_metric_name,
         "primary_metric_value": eval_primary,
         "train_primary_metric_value": train_primary,
         "epoch_time_seconds": epoch_time_seconds,
+        "train_time_seconds": train_time_seconds,
+        "eval_time_seconds": eval_time_seconds,
         "avg_train_batch_ms": avg_train_batch_ms,
     }
+    if split_key_prefix == "test":
+        metrics_payload["test_loss"] = eval_loss
     for metric_name, metric_value in train_metrics.items():
         metrics_payload[f"train_{metric_name}"] = float(metric_value)
     for metric_name, metric_value in test_metrics.items():
@@ -820,8 +960,9 @@ def _record_epoch_metrics(
             continue
         metric_value = float(metric_value)
         metrics_payload[f"eval_{metric_name}"] = metric_value
-        metrics_payload[f"test_{metric_name}"] = metric_value
         metrics_payload[f"{split_key_prefix}_{metric_name}"] = metric_value
+    for component_name, component_value in (train_components or {}).items():
+        metrics_payload[f"train_{component_name}"] = float(component_value)
     logger.metrics(metrics_payload)
     train_metric_label = f"train_{primary_metric_name}"
     eval_metric_label = f"{eval_split_name}_{primary_metric_name}"
@@ -832,6 +973,8 @@ def _record_epoch_metrics(
         f"{train_metric_label}={train_primary:.2f} | "
         f"{eval_split_name}_loss={eval_loss:.4f} | "
         f"{eval_metric_label}={eval_primary:.2f} | "
+        f"train_time={train_time_seconds:.2f}s | "
+        f"eval_time={eval_time_seconds:.2f}s | "
         f"epoch_time={epoch_time_seconds:.2f}s | "
         f"avg_batch={avg_train_batch_ms:.2f}ms"
     )
@@ -843,20 +986,32 @@ def _summarize_history(
     eval_split_name: str,
     primary_metric_name: str,
     primary_metric_display: str,
-) -> dict[str, float | int | str | None]:
+) -> dict[str, Any]:
     train_loss = history.get("train_loss", [])
     train_primary = history.get("train_accuracy", [])
     eval_loss = history.get("test_loss", [])
     eval_primary = history.get("test_accuracy", [])
     best_eval_metric = max(eval_primary) if eval_primary else None
     best_eval_epoch = eval_primary.index(best_eval_metric) + 1 if best_eval_metric is not None else 0
-    summary: dict[str, float | int | str | None] = {
+    selected_eval_metrics = {
+        key.removeprefix("eval_metric_"): float(values[best_eval_epoch - 1])
+        for key, values in history.items()
+        if key.startswith("eval_metric_") and best_eval_epoch > 0 and len(values) >= best_eval_epoch
+    }
+    final_eval_metrics = {
+        key.removeprefix("eval_metric_"): float(values[-1])
+        for key, values in history.items()
+        if key.startswith("eval_metric_") and values
+    }
+    summary: dict[str, Any] = {
         "epochs_completed": len(eval_primary),
         "eval_split": eval_split_name,
         "primary_metric_name": primary_metric_name,
         "primary_metric_display": primary_metric_display,
         "best_eval_metric": best_eval_metric,
         "best_eval_epoch": best_eval_epoch,
+        "selected_eval_metrics": selected_eval_metrics,
+        "final_eval_metrics": final_eval_metrics,
     }
     if primary_metric_name == "accuracy":
         summary["best_eval_accuracy"] = best_eval_metric
@@ -902,6 +1057,58 @@ def _log_training_summary(
     )
 
 
+def _copy_state_dict_to_cpu(model: nn.Module) -> dict[str, torch.Tensor]:
+    return {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
+
+
+def _restore_best_and_evaluate_final_test(
+    model: nn.Module,
+    best_state: Mapping[str, torch.Tensor] | None,
+    best_epoch: int,
+    final_test_loader: DataLoader | None,
+    device: torch.device,
+    criterion: nn.Module,
+    logger: RunLogger,
+    *,
+    phase: str,
+    problem_type: str,
+    num_labels: int,
+    metric_names: tuple[str, ...],
+    primary_metric_name: str,
+    final_test_split_name: str,
+) -> dict[str, float] | None:
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    if final_test_loader is None:
+        return None
+    metrics = _finalize_test_metrics(
+        model,
+        final_test_loader,
+        device,
+        criterion,
+        phase,
+        best_epoch,
+        problem_type=problem_type,
+        num_labels=max(num_labels, 1),
+        metric_names=metric_names,
+        primary_metric_name=primary_metric_name,
+    )
+    payload: dict[str, float | int | str] = {
+        "phase": phase,
+        "selection_epoch": best_epoch,
+        "split": final_test_split_name,
+        "primary_metric_name": primary_metric_name,
+    }
+    payload.update({name: float(value) for name, value in metrics.items()})
+    logger.structured(RUN_FINAL_TEST_PREFIX, payload)
+    logger.info(
+        f"Final {final_test_split_name} evaluation | selected_epoch={best_epoch} | "
+        f"{primary_metric_name}={float(metrics[primary_metric_name]):.2f} | "
+        f"loss={float(metrics['loss']):.4f}"
+    )
+    return metrics
+
+
 def train_supervised(
     model: nn.Module,
     train_loader: DataLoader,
@@ -917,21 +1124,25 @@ def train_supervised(
     metric_names: tuple[str, ...] = ("accuracy",),
     problem_type: str = "classification",
     num_labels: int = 0,
+    final_test_loader: DataLoader | None = None,
+    final_test_split_name: str = "test",
+    restore_best_state: bool = False,
 ) -> dict[str, list[float]]:
     criterion = build_task_criterion(problem_type)
     optimizer = build_optimizer(model, settings)
-    scheduler = build_scheduler(optimizer, settings)
+    scheduler = build_scheduler(optimizer, settings, steps_per_epoch=len(train_loader))
     history = create_history_template()
     logger = logger or build_run_logger()
+    best_eval_metric = -math.inf
+    best_epoch = 0
+    best_state: dict[str, torch.Tensor] | None = None
 
-    if settings.legacy_eval_sticky:
-        model.train()
     for epoch in range(settings.epochs):
         epoch_start = time.perf_counter()
-        if not settings.legacy_eval_sticky:
-            model.train()
+        model.train()
         running_objective = 0.0
-        running_ce_loss = 0.0
+        running_ce_loss = torch.zeros((), device=device)
+        running_aux_loss = torch.zeros((), device=device)
         total_examples = 0
         batch_count = 0
         train_predictions: list[torch.Tensor] = []
@@ -955,24 +1166,35 @@ def train_supervised(
                 aux_loss = compute_gating_load_balance_loss(model)
                 if aux_loss is not None:
                     loss = loss + aux_loss_weight * aux_loss
-            ensure_finite_loss_tensor(loss, f"{phase} epoch {epoch + 1} supervised training")
+                    running_aux_loss += aux_loss.detach() * labels.size(0)
+            else:
+                clear_gating_router_cache(model)
+            loss_value = ensure_finite_scalar(
+                float(loss.detach()),
+                f"{phase} epoch {epoch + 1} supervised training",
+            )
             loss.backward()
+            if settings.max_grad_norm > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), settings.max_grad_norm)
             optimizer.step()
+            if scheduler is not None and scheduler_steps_per_batch(settings):
+                scheduler.step()
             batch_size = labels.size(0)
-            running_objective += loss.item() * batch_size
-            running_ce_loss += ce_loss.item() * batch_size
+            running_objective += loss_value * batch_size
+            running_ce_loss += ce_loss.detach() * batch_size
             total_examples += batch_size
             train_predictions.append(predictions.detach().cpu())
             train_labels.append(metric_labels.detach().cpu())
-        if scheduler is not None:
+        if scheduler is not None and not scheduler_steps_per_batch(settings):
             scheduler.step()
+        train_time_seconds = time.perf_counter() - epoch_start
 
         train_objective = ensure_finite_scalar(
             running_objective / max(total_examples, 1),
             f"{phase} epoch {epoch + 1} train_objective",
         )
         train_loss = ensure_finite_scalar(
-            running_ce_loss / max(total_examples, 1),
+            float(running_ce_loss) / max(total_examples, 1),
             f"{phase} epoch {epoch + 1} train_loss",
         )
         train_metrics = compute_task_metric_values(
@@ -987,6 +1209,7 @@ def train_supervised(
                 metric_value,
                 f"{phase} epoch {epoch + 1} train_{metric_name}",
             )
+        eval_start = time.perf_counter()
         test_metrics = _finalize_test_metrics(
             model,
             test_loader,
@@ -999,14 +1222,14 @@ def train_supervised(
             metric_names=metric_names,
             primary_metric_name=primary_metric_name,
         )
-        epoch_time_seconds = ensure_finite_scalar(
-            time.perf_counter() - epoch_start,
-            f"{phase} epoch {epoch + 1} epoch_time_seconds",
-        )
-        avg_train_batch_ms = ensure_finite_scalar(
-            1000.0 * epoch_time_seconds / max(batch_count, 1),
-            f"{phase} epoch {epoch + 1} avg_train_batch_ms",
-        )
+        eval_time_seconds = time.perf_counter() - eval_start
+        current_metric = float(test_metrics[primary_metric_name])
+        if (restore_best_state or final_test_loader is not None) and current_metric > best_eval_metric:
+            best_eval_metric = current_metric
+            best_epoch = epoch + 1
+            best_state = _copy_state_dict_to_cpu(model)
+        epoch_time_seconds = time.perf_counter() - epoch_start
+        avg_train_batch_ms = _average_train_batch_ms(train_time_seconds, batch_count)
         _record_epoch_metrics(
             history,
             logger,
@@ -1018,9 +1241,16 @@ def train_supervised(
             train_metrics=train_metrics,
             test_metrics=test_metrics,
             epoch_time_seconds=epoch_time_seconds,
+            train_time_seconds=train_time_seconds,
+            eval_time_seconds=eval_time_seconds,
             avg_train_batch_ms=avg_train_batch_ms,
             eval_split_name=eval_split_name,
             primary_metric_name=primary_metric_name,
+            train_components=(
+                {"aux_loss": float(running_aux_loss) / max(total_examples, 1)}
+                if aux_loss_weight > 0
+                else None
+            ),
         )
     _log_training_summary(
         history,
@@ -1029,6 +1259,24 @@ def train_supervised(
         primary_metric_name=primary_metric_name,
         primary_metric_display=primary_metric_display,
     )
+    final_metrics = _restore_best_and_evaluate_final_test(
+        model,
+        best_state,
+        best_epoch,
+        final_test_loader,
+        device,
+        criterion,
+        logger,
+        phase=phase,
+        problem_type=problem_type,
+        num_labels=num_labels,
+        metric_names=metric_names,
+        primary_metric_name=primary_metric_name,
+        final_test_split_name=final_test_split_name,
+    )
+    if final_metrics is not None:
+        history["final_test_loss"] = [float(final_metrics["loss"])]
+        history["final_test_accuracy"] = [float(final_metrics[primary_metric_name])]
     return history
 
 
@@ -1040,36 +1288,37 @@ def train_distillation(
     settings: TrainSettings,
     device: torch.device,
     aux_loss_weight: float = 0.0,
-    gradient_clip_norm: float | None = None,
     logger: RunLogger | None = None,
     phase: str = "target",
     run_label: str | None = None,
-    backend_label: str | None = None,
-    check_post_step_finiteness: bool = False,
-    detailed_check_batches: int = 0,
     eval_split_name: str = "test",
     primary_metric_name: str = "accuracy",
     primary_metric_display: str = "Accuracy (%)",
     metric_names: tuple[str, ...] = ("accuracy",),
     problem_type: str = "classification",
     num_labels: int = 0,
+    final_test_loader: DataLoader | None = None,
+    final_test_split_name: str = "test",
+    restore_best_state: bool = False,
 ) -> dict[str, list[float]]:
     hard_loss = build_task_criterion(problem_type)
     optimizer = build_optimizer(student_model, settings)
-    scheduler = build_scheduler(optimizer, settings)
+    scheduler = build_scheduler(optimizer, settings, steps_per_epoch=len(train_loader))
     history = create_history_template()
     logger = logger or build_run_logger()
     run_label = run_label or phase
+    best_eval_metric = -math.inf
+    best_epoch = 0
+    best_state: dict[str, torch.Tensor] | None = None
 
     teacher_model.eval()
-    if settings.legacy_eval_sticky:
-        student_model.train()
     for epoch in range(settings.epochs):
         epoch_start = time.perf_counter()
-        if not settings.legacy_eval_sticky:
-            student_model.train()
+        student_model.train()
         running_objective = 0.0
-        running_ce_loss = 0.0
+        running_ce_loss = torch.zeros((), device=device)
+        running_kd_loss = torch.zeros((), device=device)
+        running_aux_loss = torch.zeros((), device=device)
         total_examples = 0
         batch_count = 0
         train_predictions: list[torch.Tensor] = []
@@ -1092,115 +1341,22 @@ def train_distillation(
                 criterion=hard_loss,
                 problem_type=problem_type,
             )
-            collect_detailed_stats = check_post_step_finiteness and _should_collect_detailed_finiteness_stats(
-                epoch=epoch + 1,
-                batch_idx=batch_idx,
-                detailed_check_batches=detailed_check_batches,
+            loss_value = ensure_finite_scalar(
+                float(loss.detach()),
+                f"{run_label} epoch {epoch + 1} batch {batch_idx}",
             )
-            param_max_abs = None
-            if collect_detailed_stats:
-                param_max_abs, _ = _collect_parameter_stats(student_model)
-            if _collect_non_finite_distillation_issues(
-                teacher_logits=teacher_logits,
-                student_logits=student_logits,
-                ce_loss=ce_loss,
-                kd_loss=kd_loss,
-                total_loss=loss,
-                aux_loss=aux_loss,
-            ):
-                if param_max_abs is None:
-                    param_max_abs, _ = _collect_parameter_stats(student_model)
-                raise _build_non_finite_distillation_error(
-                    phase=phase,
-                    epoch=epoch + 1,
-                    batch_idx=batch_idx,
-                    run_label=run_label,
-                    stage="pre-step",
-                    teacher_logits=teacher_logits,
-                    student_logits=student_logits,
-                    ce_loss=ce_loss,
-                    kd_loss=kd_loss,
-                    total_loss=loss,
-                    aux_loss=aux_loss,
-                    backend_label=backend_label,
-                    param_max_abs=param_max_abs,
-                )
             loss.backward()
-            grad_norm = None
-            grad_max_abs = None
-            if collect_detailed_stats:
-                grad_norm, grad_max_abs, non_finite_grad = _collect_gradient_stats(student_model)
-                if non_finite_grad is not None:
-                    raise _build_non_finite_distillation_error(
-                        phase=phase,
-                        epoch=epoch + 1,
-                        batch_idx=batch_idx,
-                        run_label=run_label,
-                        stage="post-backward",
-                        teacher_logits=teacher_logits,
-                        student_logits=student_logits,
-                        ce_loss=ce_loss,
-                        kd_loss=kd_loss,
-                        total_loss=loss,
-                        aux_loss=aux_loss,
-                        backend_label=backend_label,
-                        grad_norm=grad_norm,
-                        grad_max_abs=grad_max_abs,
-                        param_max_abs=param_max_abs,
-                        non_finite_grad=non_finite_grad,
-                    )
-            if gradient_clip_norm is not None:
-                clipped_grad_norm = nn.utils.clip_grad_norm_(student_model.parameters(), max_norm=gradient_clip_norm)
-                if bool(torch.isfinite(clipped_grad_norm).item()):
-                    if grad_norm is None:
-                        grad_norm = float(clipped_grad_norm.item())
-                elif check_post_step_finiteness:
-                    grad_norm, grad_max_abs, non_finite_grad = _collect_gradient_stats(student_model)
-                    if param_max_abs is None:
-                        param_max_abs, _ = _collect_parameter_stats(student_model)
-                    raise _build_non_finite_distillation_error(
-                        phase=phase,
-                        epoch=epoch + 1,
-                        batch_idx=batch_idx,
-                        run_label=run_label,
-                        stage="post-backward",
-                        teacher_logits=teacher_logits,
-                        student_logits=student_logits,
-                        ce_loss=ce_loss,
-                        kd_loss=kd_loss,
-                        total_loss=loss,
-                        aux_loss=aux_loss,
-                        backend_label=backend_label,
-                        grad_norm=grad_norm,
-                        grad_max_abs=grad_max_abs,
-                        param_max_abs=param_max_abs,
-                        non_finite_grad=non_finite_grad or "unknown",
-                    )
+            if settings.max_grad_norm > 0:
+                nn.utils.clip_grad_norm_(student_model.parameters(), settings.max_grad_norm)
             optimizer.step()
-            if collect_detailed_stats:
-                param_max_abs, non_finite_param = _collect_parameter_stats(student_model)
-                if non_finite_param is not None:
-                    raise _build_non_finite_distillation_error(
-                        phase=phase,
-                        epoch=epoch + 1,
-                        batch_idx=batch_idx,
-                        run_label=run_label,
-                        stage="post-step",
-                        teacher_logits=teacher_logits,
-                        student_logits=student_logits,
-                        ce_loss=ce_loss,
-                        kd_loss=kd_loss,
-                        total_loss=loss,
-                        aux_loss=aux_loss,
-                        backend_label=backend_label,
-                        grad_norm=grad_norm,
-                        grad_max_abs=grad_max_abs,
-                        param_max_abs=param_max_abs,
-                        non_finite_param=non_finite_param,
-                    )
+            if scheduler is not None and scheduler_steps_per_batch(settings):
+                scheduler.step()
             batch_size = labels.size(0)
-            running_objective += loss.item() * batch_size
-            running_ce_loss += ce_loss.item() * batch_size
+            running_objective += loss_value * batch_size
+            running_ce_loss += ce_loss.detach() * batch_size
+            running_kd_loss += kd_loss.detach() * batch_size
+            if aux_loss is not None:
+                running_aux_loss += aux_loss.detach() * batch_size
             total_examples += batch_size
             if problem_type == "regression":
                 predictions = prepare_regression_outputs(student_logits)
@@ -1210,15 +1366,16 @@ def train_distillation(
                 metric_labels = labels
             train_predictions.append(predictions.detach().cpu())
             train_labels.append(metric_labels.detach().cpu())
-        if scheduler is not None:
+        if scheduler is not None and not scheduler_steps_per_batch(settings):
             scheduler.step()
+        train_time_seconds = time.perf_counter() - epoch_start
 
         train_objective = ensure_finite_scalar(
             running_objective / max(total_examples, 1),
             f"{phase} epoch {epoch + 1} train_objective",
         )
         train_loss = ensure_finite_scalar(
-            running_ce_loss / max(total_examples, 1),
+            float(running_ce_loss) / max(total_examples, 1),
             f"{phase} epoch {epoch + 1} train_loss",
         )
         train_metrics = compute_task_metric_values(
@@ -1233,6 +1390,7 @@ def train_distillation(
                 metric_value,
                 f"{phase} epoch {epoch + 1} train_{metric_name}",
             )
+        eval_start = time.perf_counter()
         test_metrics = _finalize_test_metrics(
             student_model,
             test_loader,
@@ -1245,14 +1403,14 @@ def train_distillation(
             metric_names=metric_names,
             primary_metric_name=primary_metric_name,
         )
-        epoch_time_seconds = ensure_finite_scalar(
-            time.perf_counter() - epoch_start,
-            f"{phase} epoch {epoch + 1} epoch_time_seconds",
-        )
-        avg_train_batch_ms = ensure_finite_scalar(
-            1000.0 * epoch_time_seconds / max(batch_count, 1),
-            f"{phase} epoch {epoch + 1} avg_train_batch_ms",
-        )
+        eval_time_seconds = time.perf_counter() - eval_start
+        current_metric = float(test_metrics[primary_metric_name])
+        if (restore_best_state or final_test_loader is not None) and current_metric > best_eval_metric:
+            best_eval_metric = current_metric
+            best_epoch = epoch + 1
+            best_state = _copy_state_dict_to_cpu(student_model)
+        epoch_time_seconds = time.perf_counter() - epoch_start
+        avg_train_batch_ms = _average_train_batch_ms(train_time_seconds, batch_count)
         _record_epoch_metrics(
             history,
             logger,
@@ -1264,9 +1422,15 @@ def train_distillation(
             train_metrics=train_metrics,
             test_metrics=test_metrics,
             epoch_time_seconds=epoch_time_seconds,
+            train_time_seconds=train_time_seconds,
+            eval_time_seconds=eval_time_seconds,
             avg_train_batch_ms=avg_train_batch_ms,
             eval_split_name=eval_split_name,
             primary_metric_name=primary_metric_name,
+            train_components={
+                "kd_loss": float(running_kd_loss) / max(total_examples, 1),
+                "aux_loss": float(running_aux_loss) / max(total_examples, 1),
+            },
         )
     _log_training_summary(
         history,
@@ -1275,6 +1439,24 @@ def train_distillation(
         primary_metric_name=primary_metric_name,
         primary_metric_display=primary_metric_display,
     )
+    final_metrics = _restore_best_and_evaluate_final_test(
+        student_model,
+        best_state,
+        best_epoch,
+        final_test_loader,
+        device,
+        hard_loss,
+        logger,
+        phase=phase,
+        problem_type=problem_type,
+        num_labels=num_labels,
+        metric_names=metric_names,
+        primary_metric_name=primary_metric_name,
+        final_test_split_name=final_test_split_name,
+    )
+    if final_metrics is not None:
+        history["final_test_loss"] = [float(final_metrics["loss"])]
+        history["final_test_accuracy"] = [float(final_metrics[primary_metric_name])]
     return history
 
 
