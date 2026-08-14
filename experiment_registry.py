@@ -24,7 +24,20 @@ from pet_models import build_model as build_pet_model
 
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-METHOD_CHOICES = ["teacher", "student", "student_kd", "inhernet", "hetero"]
+METHOD_CHOICES = [
+    "teacher",
+    "student",
+    "student_kd",
+    "student_dkd",
+    "student_kd_logit_standardized",
+    "student_ctkd",
+    "student_catkd",
+    "student_simkd",
+    "student_reviewkd",
+    "student_crd",
+    "inhernet",
+    "inheract",
+]
 TRAIN_SETTING_OVERRIDE_KEYS = {
     "optimizer_name",
     "batch_size",
@@ -63,6 +76,84 @@ class TrainSettings:
     warmup_ratio: float = 0.0
     max_grad_norm: float = 0.0
     exclude_bias_norm_from_weight_decay: bool = False
+
+
+@dataclass(frozen=True)
+class DecoupledDistillationSettings:
+    """Published DKD settings for a specific teacher/student benchmark."""
+
+    ce_weight: float
+    alpha: float
+    beta: float
+    temperature: float
+    warmup_epochs: int
+    source: str
+
+
+@dataclass(frozen=True)
+class LogitStandardizedKDSettings:
+    """Released standalone KD + Logit Standardization plug-in settings."""
+
+    ce_weight: float
+    kd_weight: float
+    temperature: float
+    source: str
+
+
+@dataclass(frozen=True)
+class CurriculumTemperatureDistillationSettings:
+    """Global CTKD recipe from the released implementation."""
+
+    ce_weight: float
+    kd_weight: float
+    t_start: float
+    t_end: float
+    decay_max: float
+    decay_min: float
+    decay_loops: int
+    source: str
+
+
+@dataclass(frozen=True)
+class CATKDSettings:
+    """CAT-KD objective/config adaptation for one CIFAR-100 pair."""
+
+    ce_weight: float
+    feature_weight: float
+    cam_resolution: int
+    source: str
+
+
+@dataclass(frozen=True)
+class SimKDSettings:
+    """Released SimKD final-feature transfer recipe."""
+
+    feature_weight: float
+    projector_factor: int
+    source: str
+
+
+@dataclass(frozen=True)
+class ReviewKDSettings:
+    """Released ReviewKD recipe for one CIFAR-100 architecture pair."""
+
+    ce_weight: float
+    feature_weight: float
+    warmup_epochs: int
+    source: str
+
+
+@dataclass(frozen=True)
+class CRDSettings:
+    """RepDistiller CRD recipe used by the InherNet CIFAR-100 table."""
+
+    ce_weight: float
+    contrastive_weight: float
+    embedding_dim: int
+    num_negatives: int
+    temperature: float
+    memory_momentum: float
+    source: str
 
 
 @dataclass(frozen=True)
@@ -267,6 +358,260 @@ DATASET_REGISTRY: dict[str, DatasetSpec] = {
 }
 
 
+DECOUPLED_DISTILLATION_REGISTRY = {
+    ("cifar100", "resnet32x4_to_resnet8x4"): DecoupledDistillationSettings(
+        ce_weight=1.0,
+        alpha=1.0,
+        beta=8.0,
+        temperature=4.0,
+        warmup_epochs=20,
+        source="official_mdistiller_cifar100",
+    ),
+    ("cifar100", "vgg13_to_vgg8"): DecoupledDistillationSettings(
+        ce_weight=1.0,
+        alpha=1.0,
+        beta=6.0,
+        temperature=4.0,
+        warmup_epochs=20,
+        source="official_mdistiller_cifar100",
+    ),
+    ("cifar100", "wrn40_2_to_wrn40_1"): DecoupledDistillationSettings(
+        ce_weight=1.0,
+        alpha=1.0,
+        beta=6.0,
+        temperature=4.0,
+        warmup_epochs=20,
+        source="official_mdistiller_cifar100",
+    ),
+    ("cifar100", "wrn40_2_to_wrn16_2"): DecoupledDistillationSettings(
+        ce_weight=1.0,
+        alpha=1.0,
+        beta=6.0,
+        temperature=4.0,
+        warmup_epochs=20,
+        source="official_mdistiller_cifar100",
+    ),
+    ("cifar100", "resnet56_to_resnet20"): DecoupledDistillationSettings(
+        ce_weight=1.0,
+        alpha=1.0,
+        beta=2.0,
+        temperature=4.0,
+        warmup_epochs=20,
+        source="official_mdistiller_cifar100",
+    ),
+    ("cifar100", "resnet110_to_resnet32"): DecoupledDistillationSettings(
+        ce_weight=1.0,
+        alpha=1.0,
+        beta=2.0,
+        temperature=4.0,
+        warmup_epochs=20,
+        source="official_mdistiller_cifar100",
+    ),
+    ("cifar10", "resnet50_to_resnet18"): DecoupledDistillationSettings(
+        ce_weight=1.0,
+        alpha=1.0,
+        beta=0.5,
+        temperature=1.0,
+        warmup_epochs=1,
+        source="repository_adaptation_mdistiller_imagenet_resnet34_to_resnet18",
+    ),
+}
+
+
+# Sun et al. (CVPR 2024) report this plug-in KD protocol for the seven
+# standard CIFAR-100 teacher/student pairs used by InherNet: 0.1 CE +
+# 9 * T^2 * KL after per-example Z-score normalization, with T=2.
+LOGIT_STANDARDIZED_KD_REGISTRY = {
+    ("cifar100", "resnet32x4_to_resnet8x4"): LogitStandardizedKDSettings(
+        ce_weight=0.1, kd_weight=9.0, temperature=2.0,
+        source="official_logit_standardization_kd_plugin_cifar100",
+    ),
+    ("cifar100", "vgg13_to_vgg8"): LogitStandardizedKDSettings(
+        ce_weight=0.1, kd_weight=9.0, temperature=2.0,
+        source="official_logit_standardization_kd_plugin_cifar100",
+    ),
+    ("cifar100", "wrn40_2_to_wrn40_1"): LogitStandardizedKDSettings(
+        ce_weight=0.1, kd_weight=9.0, temperature=2.0,
+        source="official_logit_standardization_kd_plugin_cifar100",
+    ),
+    ("cifar100", "wrn40_2_to_wrn16_2"): LogitStandardizedKDSettings(
+        ce_weight=0.1, kd_weight=9.0, temperature=2.0,
+        source="official_logit_standardization_kd_plugin_cifar100",
+    ),
+    ("cifar100", "resnet56_to_resnet20"): LogitStandardizedKDSettings(
+        ce_weight=0.1, kd_weight=9.0, temperature=2.0,
+        source="official_logit_standardization_kd_plugin_cifar100",
+    ),
+    ("cifar100", "resnet110_to_resnet32"): LogitStandardizedKDSettings(
+        ce_weight=0.1, kd_weight=9.0, temperature=2.0,
+        source="official_logit_standardization_kd_plugin_cifar100",
+    ),
+    ("cifar100", "resnet110_to_resnet20"): LogitStandardizedKDSettings(
+        ce_weight=0.1, kd_weight=9.0, temperature=2.0,
+        source="official_logit_standardization_kd_plugin_cifar100",
+    ),
+}
+
+
+# The six CIFAR-100 pairs below are reported in CTKD's released main-results
+# table.  Its global-temperature recipe uses 0.1 CE + 0.9 KL, t=1+20*sigmoid,
+# and a cosine gradient multiplier from 0 to -1 over ten epochs.  The CIFAR-10
+# ResNet-50/18 row is deliberately marked as a repository adaptation: it uses
+# the same global-temperature schedule and the official ImageNet ResNet loss
+# weights (1.0 CE + 1.0 KL), while retaining this repository's CIFAR-10 data
+# and optimizer profile.
+CURRICULUM_TEMPERATURE_DISTILLATION_REGISTRY = {
+    ("cifar100", "vgg13_to_vgg8"): CurriculumTemperatureDistillationSettings(
+        ce_weight=0.1,
+        kd_weight=0.9,
+        t_start=1.0,
+        t_end=20.0,
+        decay_max=0.0,
+        decay_min=-1.0,
+        decay_loops=10,
+        source="official_ctkd_cifar100",
+    ),
+    ("cifar100", "wrn40_2_to_wrn40_1"): CurriculumTemperatureDistillationSettings(
+        ce_weight=0.1,
+        kd_weight=0.9,
+        t_start=1.0,
+        t_end=20.0,
+        decay_max=0.0,
+        decay_min=-1.0,
+        decay_loops=10,
+        source="official_ctkd_cifar100",
+    ),
+    ("cifar100", "wrn40_2_to_wrn16_2"): CurriculumTemperatureDistillationSettings(
+        ce_weight=0.1,
+        kd_weight=0.9,
+        t_start=1.0,
+        t_end=20.0,
+        decay_max=0.0,
+        decay_min=-1.0,
+        decay_loops=10,
+        source="official_ctkd_cifar100",
+    ),
+    ("cifar100", "resnet56_to_resnet20"): CurriculumTemperatureDistillationSettings(
+        ce_weight=0.1,
+        kd_weight=0.9,
+        t_start=1.0,
+        t_end=20.0,
+        decay_max=0.0,
+        decay_min=-1.0,
+        decay_loops=10,
+        source="official_ctkd_cifar100",
+    ),
+    ("cifar100", "resnet110_to_resnet32"): CurriculumTemperatureDistillationSettings(
+        ce_weight=0.1,
+        kd_weight=0.9,
+        t_start=1.0,
+        t_end=20.0,
+        decay_max=0.0,
+        decay_min=-1.0,
+        decay_loops=10,
+        source="official_ctkd_cifar100",
+    ),
+    ("cifar100", "resnet110_to_resnet20"): CurriculumTemperatureDistillationSettings(
+        ce_weight=0.1,
+        kd_weight=0.9,
+        t_start=1.0,
+        t_end=20.0,
+        decay_max=0.0,
+        decay_min=-1.0,
+        decay_loops=10,
+        source="official_ctkd_cifar100",
+    ),
+    ("cifar10", "resnet50_to_resnet18"): CurriculumTemperatureDistillationSettings(
+        ce_weight=1.0,
+        kd_weight=1.0,
+        t_start=1.0,
+        t_end=20.0,
+        decay_max=0.0,
+        decay_min=-1.0,
+        decay_loops=5,
+        source="repository_adaptation_official_ctkd_imagenet_resnet",
+    ),
+}
+
+
+# Pair-specific values are taken from the methods' released CIFAR-100
+# configurations.  Unsupported repository extensions are intentionally absent
+# rather than assigned an invented coefficient.
+CAT_KD_REGISTRY = {
+    ("cifar100", pair): CATKDSettings(
+        ce_weight=1.0,
+        feature_weight=feature_weight,
+        cam_resolution=2,
+        source="catkd_objective_config_adaptation_cifar100",
+    )
+    for pair, feature_weight in {
+        "resnet32x4_to_resnet8x4": 15.0,
+        "vgg13_to_vgg8": 4.5,
+        "wrn40_2_to_wrn40_1": 1.5,
+        "wrn40_2_to_wrn16_2": 12.0,
+        "resnet56_to_resnet20": 0.7,
+        "resnet110_to_resnet32": 1.8,
+    }.items()
+}
+
+
+SIM_KD_REGISTRY = {
+    ("cifar100", pair): SimKDSettings(
+        feature_weight=1.0,
+        projector_factor=2,
+        source="official_simkd_cifar100",
+    )
+    for pair in (
+        "resnet32x4_to_resnet8x4",
+        "vgg13_to_vgg8",
+        "wrn40_2_to_wrn40_1",
+        "wrn40_2_to_wrn16_2",
+        "resnet56_to_resnet20",
+        "resnet110_to_resnet32",
+        "resnet110_to_resnet20",
+    )
+}
+
+
+REVIEW_KD_REGISTRY = {
+    ("cifar100", pair): ReviewKDSettings(
+        ce_weight=1.0,
+        feature_weight=feature_weight,
+        warmup_epochs=20,
+        source="official_reviewkd_cifar100",
+    )
+    for pair, feature_weight in {
+        "resnet32x4_to_resnet8x4": 5.0,
+        "wrn40_2_to_wrn40_1": 5.0,
+        "wrn40_2_to_wrn16_2": 5.0,
+        "resnet56_to_resnet20": 0.6,
+        "resnet110_to_resnet32": 1.0,
+    }.items()
+}
+
+
+CRD_REGISTRY = {
+    ("cifar100", pair): CRDSettings(
+        ce_weight=1.0,
+        contrastive_weight=0.8,
+        embedding_dim=128,
+        num_negatives=16_384,
+        temperature=0.07,
+        memory_momentum=0.5,
+        source="official_repdistiller_crd_cifar100",
+    )
+    for pair in (
+        "resnet32x4_to_resnet8x4",
+        "vgg13_to_vgg8",
+        "wrn40_2_to_wrn40_1",
+        "wrn40_2_to_wrn16_2",
+        "resnet56_to_resnet20",
+        "resnet110_to_resnet32",
+        "resnet110_to_resnet20",
+    )
+}
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
@@ -312,6 +657,7 @@ def build_pair_model(
     num_classes: int,
     *,
     initialize_pretrained: bool = True,
+    cache_dir: str | Path | None = None,
 ):
     pair_spec = get_pair_spec(dataset_name, pair_name)
     builder_key = f"{role}_builder"
@@ -325,7 +671,12 @@ def build_pair_model(
     if dataset_name == "oxford_pets":
         return build_pet_model(model_name, num_classes, pretrained=initialize_pretrained)
     if DATASET_REGISTRY[dataset_name].task_type == "text":
-        return build_glue_model(model_name, num_classes, pretrained=initialize_pretrained)
+        return build_glue_model(
+            model_name,
+            num_classes,
+            pretrained=initialize_pretrained,
+            cache_dir=cache_dir,
+        )
     raise ValueError(f"No builder registered for {dataset_name}:{pair_name}:{role}")
 
 
@@ -545,11 +896,14 @@ def get_dataloaders(
         pin_memory=pin_memory,
         generator=generator,
     )
+    # Evaluation and calibration are deterministic and do not benefit enough
+    # from repeatedly forking a CUDA-owning training process to justify the
+    # additional host-memory failure mode.
     evaluation_loader = DataLoader(
         evaluation_set,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=0,
         pin_memory=pin_memory,
     )
     final_test_loader = None
@@ -558,14 +912,14 @@ def get_dataloaders(
             final_test_set,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=num_workers,
+            num_workers=0,
             pin_memory=pin_memory,
         )
     calibration_loader = DataLoader(
         calibration_set,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=0,
         pin_memory=pin_memory,
     )
     split_metadata = {
@@ -653,6 +1007,86 @@ def resolve_compressed_train_mode(args: argparse.Namespace, pair_spec: Mapping[s
     return str(train_mode)
 
 
+def resolve_decoupled_distillation_settings(
+    dataset: str,
+    pair: str,
+) -> DecoupledDistillationSettings:
+    try:
+        return DECOUPLED_DISTILLATION_REGISTRY[(dataset, pair)]
+    except KeyError as exc:
+        raise ValueError(
+            "student_dkd is registered only for source-backed teacher/student benchmarks; "
+            f"no DKD recipe is registered for {dataset}/{pair}."
+        ) from exc
+
+
+def resolve_logit_standardized_kd_settings(
+    dataset: str,
+    pair: str,
+) -> LogitStandardizedKDSettings:
+    try:
+        return LOGIT_STANDARDIZED_KD_REGISTRY[(dataset, pair)]
+    except KeyError as exc:
+        raise ValueError(
+            "student_kd_logit_standardized is registered only for the seven "
+            f"published CIFAR-100 pairs; no recipe is registered for {dataset}/{pair}."
+        ) from exc
+
+
+def resolve_curriculum_temperature_distillation_settings(
+    dataset: str,
+    pair: str,
+) -> CurriculumTemperatureDistillationSettings:
+    try:
+        return CURRICULUM_TEMPERATURE_DISTILLATION_REGISTRY[(dataset, pair)]
+    except KeyError as exc:
+        raise ValueError(
+            "student_ctkd is registered only for six published CIFAR-100 pairs "
+            "and the explicit CIFAR-10 ResNet-50/18 adaptation; "
+            f"no CTKD recipe is registered for {dataset}/{pair}."
+        ) from exc
+
+
+def resolve_cat_kd_settings(dataset: str, pair: str) -> CATKDSettings:
+    try:
+        return CAT_KD_REGISTRY[(dataset, pair)]
+    except KeyError as exc:
+        raise ValueError(
+            "student_catkd has no released recipe for "
+            f"{dataset}/{pair}."
+        ) from exc
+
+
+def resolve_sim_kd_settings(dataset: str, pair: str) -> SimKDSettings:
+    try:
+        return SIM_KD_REGISTRY[(dataset, pair)]
+    except KeyError as exc:
+        raise ValueError(
+            "student_simkd has no released recipe for "
+            f"{dataset}/{pair}."
+        ) from exc
+
+
+def resolve_review_kd_settings(dataset: str, pair: str) -> ReviewKDSettings:
+    try:
+        return REVIEW_KD_REGISTRY[(dataset, pair)]
+    except KeyError as exc:
+        raise ValueError(
+            "student_reviewkd has no released recipe for "
+            f"{dataset}/{pair}."
+        ) from exc
+
+
+def resolve_crd_settings(dataset: str, pair: str) -> CRDSettings:
+    try:
+        return CRD_REGISTRY[(dataset, pair)]
+    except KeyError as exc:
+        raise ValueError(
+            "student_crd has no released recipe for "
+            f"{dataset}/{pair}."
+        ) from exc
+
+
 def resolve_head_num(args: argparse.Namespace, pair_spec: Mapping[str, Any], settings: TrainSettings) -> int:
     if args.head_num is not None:
         return args.head_num
@@ -670,7 +1104,7 @@ def resolve_capacity_size(args: argparse.Namespace) -> str:
     """Resolve the public capacity default without mutating parsed arguments."""
     if args.size is not None:
         return str(args.size)
-    return "large" if args.method == "hetero" else "small"
+    return "large" if args.method == "inheract" else "small"
 
 
 def resolve_fixed_rank(args: argparse.Namespace, pair_spec: Mapping[str, Any]) -> int:
@@ -707,40 +1141,54 @@ def validate_args(args: argparse.Namespace, pair_spec: Mapping[str, Any]) -> Non
         raise ValueError("--head-num must be positive.")
     if args.rank is not None and args.rank <= 0:
         raise ValueError("--rank must be positive.")
-    if args.method == "hetero" and args.rank is not None:
+    if args.method == "inheract" and args.rank is not None:
         raise ValueError(
-            "Hetero uses only registered --size small|large ranks; "
+            "InherAct uses only registered --size small|large ranks; "
             "--rank is retained for InherNet baseline diagnostics."
         )
+    if args.method == "student_dkd":
+        resolve_decoupled_distillation_settings(args.dataset, args.pair)
+    if args.method == "student_kd_logit_standardized":
+        resolve_logit_standardized_kd_settings(args.dataset, args.pair)
+    if args.method == "student_ctkd":
+        resolve_curriculum_temperature_distillation_settings(args.dataset, args.pair)
+    if args.method == "student_catkd":
+        resolve_cat_kd_settings(args.dataset, args.pair)
+    if args.method == "student_simkd":
+        resolve_sim_kd_settings(args.dataset, args.pair)
+    if args.method == "student_reviewkd":
+        resolve_review_kd_settings(args.dataset, args.pair)
+    if args.method == "student_crd":
+        resolve_crd_settings(args.dataset, args.pair)
     if args.search_validation:
         supported = args.dataset in {"cifar10", "cifar100"} or args.dataset.startswith("glue_")
         if not supported:
             raise ValueError("--search-validation is only supported for CIFAR and GLUE datasets.")
-    if args.method == "hetero" and args.hetero_expert_noise_scale < 0:
-        raise ValueError("--hetero-expert-noise-scale must be non-negative.")
-    if args.method == "hetero" and args.max_calib_batches <= 0:
+    if args.method == "inheract" and args.inheract_expert_noise_scale < 0:
+        raise ValueError("--inheract-expert-noise-scale must be non-negative.")
+    if args.method == "inheract" and args.max_calib_batches <= 0:
         raise ValueError("--max-calib-batches must be positive.")
-    if args.method == "hetero" and args.hetero_max_features_per_batch <= 0:
-        raise ValueError("--hetero-max-features-per-batch must be positive.")
-    if args.method == "hetero" and not 0.0 <= args.hetero_second_moment_shrinkage <= 1.0:
-        raise ValueError("--hetero-second-moment-shrinkage must be in [0, 1].")
-    if args.method == "hetero" and args.aux_loss_weight < 0:
+    if args.method == "inheract" and args.inheract_max_features_per_batch <= 0:
+        raise ValueError("--inheract-max-features-per-batch must be positive.")
+    if args.method == "inheract" and not 0.0 <= args.inheract_second_moment_shrinkage <= 1.0:
+        raise ValueError("--inheract-second-moment-shrinkage must be in [0, 1].")
+    if args.method == "inheract" and args.aux_loss_weight < 0:
         raise ValueError("--aux-loss-weight must be non-negative.")
     if (
-        args.method == "hetero"
-        and args.hetero_allocation_scale.startswith("research_")
+        args.method == "inheract"
+        and args.inheract_allocation_scale.startswith("research_")
         and not args.inheritance_diagnostics_only
     ):
         raise ValueError(
             "research_* rank policies are restricted to initialization-only pre-study runs."
         )
-    if args.hetero_recipe_id is not None and args.method != "hetero":
-        raise ValueError("--hetero-recipe-id applies only to --method hetero.")
-    if args.freeze_hetero_router and args.method != "hetero":
-        raise ValueError("--freeze-hetero-router applies only to --method hetero.")
-    if args.inheritance_diagnostics and args.method not in {"inhernet", "hetero"}:
+    if args.inheract_recipe_id is not None and args.method != "inheract":
+        raise ValueError("--inheract-recipe-id applies only to --method inheract.")
+    if args.freeze_inheract_router and args.method != "inheract":
+        raise ValueError("--freeze-inheract-router applies only to --method inheract.")
+    if args.inheritance_diagnostics and args.method not in {"inhernet", "inheract"}:
         raise ValueError("--inheritance-diagnostics applies only to inherited methods.")
-    if args.inheritance_diagnostics_only and args.method not in {"inhernet", "hetero"}:
+    if args.inheritance_diagnostics_only and args.method not in {"inhernet", "inheract"}:
         raise ValueError("--inheritance-diagnostics-only applies only to inherited methods.")
     if args.method == "inhernet":
         rank = resolve_fixed_rank(args, pair_spec)
@@ -757,6 +1205,62 @@ def build_method_tag(
     head_num = resolve_head_num(args, pair_spec, settings)
     if method in {"teacher", "student", "student_kd"}:
         tag = "default"
+    elif method == "student_dkd":
+        dkd = resolve_decoupled_distillation_settings(args.dataset, args.pair)
+        tag = (
+            f"{sanitize_tag(dkd.source)}_alpha_{format_float_tag(dkd.alpha)}_"
+            f"beta_{format_float_tag(dkd.beta)}_"
+            f"temperature_{format_float_tag(dkd.temperature)}_"
+            f"warmup_{dkd.warmup_epochs}"
+        )
+    elif method == "student_kd_logit_standardized":
+        standardized_kd = resolve_logit_standardized_kd_settings(args.dataset, args.pair)
+        tag = (
+            f"{sanitize_tag(standardized_kd.source)}_"
+            f"ce_{format_float_tag(standardized_kd.ce_weight)}_"
+            f"kd_{format_float_tag(standardized_kd.kd_weight)}_"
+            f"temperature_{format_float_tag(standardized_kd.temperature)}"
+        )
+    elif method == "student_ctkd":
+        ctkd = resolve_curriculum_temperature_distillation_settings(args.dataset, args.pair)
+        tag = (
+            f"{sanitize_tag(ctkd.source)}_"
+            f"ce_{format_float_tag(ctkd.ce_weight)}_"
+            f"kd_{format_float_tag(ctkd.kd_weight)}_"
+            f"tstart_{format_float_tag(ctkd.t_start)}_"
+            f"tend_{format_float_tag(ctkd.t_end)}_"
+            f"cosine_{format_float_tag(ctkd.decay_max)}_"
+            f"to_{format_float_tag(ctkd.decay_min)}_"
+            f"loops_{ctkd.decay_loops}"
+        )
+    elif method == "student_catkd":
+        catkd = resolve_cat_kd_settings(args.dataset, args.pair)
+        tag = (
+            f"{sanitize_tag(catkd.source)}_"
+            f"beta_{format_float_tag(catkd.feature_weight)}_"
+            f"resolution_{catkd.cam_resolution}"
+        )
+    elif method == "student_simkd":
+        simkd = resolve_sim_kd_settings(args.dataset, args.pair)
+        tag = (
+            f"{sanitize_tag(simkd.source)}_"
+            f"factor_{simkd.projector_factor}_teacher_classifier"
+        )
+    elif method == "student_reviewkd":
+        reviewkd = resolve_review_kd_settings(args.dataset, args.pair)
+        tag = (
+            f"{sanitize_tag(reviewkd.source)}_"
+            f"weight_{format_float_tag(reviewkd.feature_weight)}_"
+            f"warmup_{reviewkd.warmup_epochs}"
+        )
+    elif method == "student_crd":
+        crd = resolve_crd_settings(args.dataset, args.pair)
+        tag = (
+            f"{sanitize_tag(crd.source)}_"
+            f"weight_{format_float_tag(crd.contrastive_weight)}_"
+            f"dim_{crd.embedding_dim}_k_{crd.num_negatives}_"
+            f"temperature_{format_float_tag(crd.temperature)}"
+        )
     elif method == "inhernet":
         rank = resolve_fixed_rank(args, pair_spec)
         rank_source = "custom" if args.rank is not None else resolve_capacity_size(args)
@@ -766,22 +1270,22 @@ def build_method_tag(
         compressed_train_mode = resolve_compressed_train_mode(args, pair_spec)
         if compressed_train_mode != "distillation":
             tag = f"{tag}_{compressed_train_mode}"
-    elif method == "hetero":
+    elif method == "inheract":
         compress_linear = resolve_compress_linear(pair_spec)
         reference_rank = resolve_fixed_rank(args, pair_spec)
         capacity_size = resolve_capacity_size(args)
         tag = (
             f"{capacity_size}_matched_rank_{reference_rank}_heads_{head_num}_"
             f"calib_{args.max_calib_batches}_"
-            f"samples_{args.hetero_max_features_per_batch}_"
-            f"shrink_{format_float_tag(args.hetero_second_moment_shrinkage)}_"
-            f"allocation_{sanitize_tag(args.hetero_allocation_scale)}_"
-            f"noise_{format_float_tag(args.hetero_expert_noise_scale)}_"
+            f"samples_{args.inheract_max_features_per_batch}_"
+            f"shrink_{format_float_tag(args.inheract_second_moment_shrinkage)}_"
+            f"allocation_{sanitize_tag(args.inheract_allocation_scale)}_"
+            f"noise_{format_float_tag(args.inheract_expert_noise_scale)}_"
             f"aux_{format_float_tag(args.aux_loss_weight)}"
         )
         if compress_linear:
             tag = f"{tag}_linear"
-        if args.freeze_hetero_router:
+        if args.freeze_inheract_router:
             tag = f"{tag}_frozen_router"
         compressed_train_mode = resolve_compressed_train_mode(args, pair_spec)
         if compressed_train_mode != "distillation":
@@ -805,7 +1309,13 @@ def build_training_dataloaders(
         tokenizer_name = str(pair_spec.get("tokenizer_name", get_role_name(pair_spec, "teacher")))
         if dataset_spec.text_task_name is None:
             raise ValueError(f"Text dataset '{args.dataset}' is missing a GLUE task name.")
-        train_loader, eval_loader, calibration_loader, split_metadata = build_glue_dataloaders(
+        (
+            train_loader,
+            eval_loader,
+            final_eval_loader,
+            calibration_loader,
+            split_metadata,
+        ) = build_glue_dataloaders(
             task_name=dataset_spec.text_task_name,
             eval_split_name=dataset_spec.eval_split_name,
             problem_type=dataset_spec.problem_type,
@@ -818,6 +1328,7 @@ def build_training_dataloaders(
             tokenizer_revision=str(pair_spec["tokenizer_revision"]),
             max_length=dataset_spec.text_max_length,
             search_validation=args.search_validation,
+            include_final_evaluation=args.final_test,
             validation_split_seed=dataset_spec.validation_split_seed,
         )
         split_metadata = dict(split_metadata)
@@ -825,9 +1336,15 @@ def build_training_dataloaders(
         return TrainingLoaders(
             train_loader,
             eval_loader,
+            final_test=final_eval_loader if args.final_test else None,
             calibration=calibration_loader,
             split_metadata=split_metadata,
             eval_split_name=str(split_metadata["evaluation_split"]),
+            final_test_split_name=(
+                dataset_spec.eval_split_name
+                if args.search_validation and args.final_test
+                else None
+            ),
             restore_best_state=True,
         )
     search_validation = args.search_validation

@@ -5,8 +5,8 @@ original_args=("$@")
 
 phase="${1:-all}"
 if (($# > 0)); then shift; fi
-case "$phase" in teachers|mechanism|optimization|distillation|confirmation|all) ;; *)
-    echo "Usage: $0 {teachers|mechanism|optimization|distillation|confirmation|all} [DATASET PAIR] [runtime arguments...]" >&2
+case "$phase" in teachers|mechanism|optimization|distillation|all) ;; *)
+    echo "Usage: $0 {teachers|mechanism|optimization|distillation|all} [DATASET PAIR] [runtime arguments...]" >&2
     exit 2
 esac
 
@@ -30,7 +30,6 @@ distillation_targets=(
     "glue_sst2 bert4_to_bert2"
     "glue_stsb bert4_to_bert2"
 )
-confirmation_targets=("${mechanism_targets[@]}")
 search_teacher_targets=(
     "cifar10 resnet50_to_resnet18"
     "cifar100 resnet56_to_resnet20"
@@ -87,7 +86,11 @@ if [[ "$search_artifact_scope" == "registry" && "$phase" != "teachers" ]]; then
     echo "Registry artifact scope is restricted to teacher maintenance." >&2
     exit 2
 fi
-search_seed_spec="${SEARCH_SEEDS:-42,123,2026}"
+if [[ -n "${SEARCH_SEEDS+x}" ]]; then
+    search_seed_spec="$SEARCH_SEEDS"
+else
+    search_seed_spec=42,123,2026
+fi
 IFS=',' read -r -a search_seeds <<<"$search_seed_spec"
 if ((${#search_seeds[@]} == 0)); then
     echo "SEARCH_SEEDS must contain at least one integer seed." >&2
@@ -107,18 +110,6 @@ for search_seed in "${search_seeds[@]}"; do
 done
 export SEARCH_SEEDS="$search_seed_spec"
 
-read -r reference_aux_weight reference_shrinkage reference_noise_scale < <(
-    awk -F, '$1 == "reference" { print $2, $3, $4; exit }' \
-        "$PROJECT_DIR/configs/hetero_search_candidates.csv"
-)
-REFERENCE_HETERO_MECHANISM_ARGS=(
-    --aux-loss-weight "$reference_aux_weight"
-    --hetero-second-moment-shrinkage "$reference_shrinkage"
-    --hetero-expert-noise-scale "$reference_noise_scale"
-    --hetero-allocation-scale weighted_uniform
-)
-REFERENCE_HETERO_OPTIMIZER_ARGS=(--lr-scale 1.0)
-
 device="$DEVICE"
 
 candidate_selected() {
@@ -135,10 +126,9 @@ validate_candidate_filter() {
         exit 2
     fi
     case "$selected_phase" in
-        mechanism) config="$PROJECT_DIR/configs/hetero_search_candidates.csv" ;;
+        mechanism) config="$PROJECT_DIR/configs/inheract_search_candidates.csv" ;;
         optimization) config="$PROJECT_DIR/configs/lr_scale_search_candidates.csv" ;;
         distillation) config="$PROJECT_DIR/configs/distillation_search_candidates.csv" ;;
-        confirmation) config="$PROJECT_DIR/configs/hetero_confirmation_candidates.csv" ;;
     esac
     IFS=',' read -r -a requested <<<"$SEARCH_CANDIDATES"
     for candidate_id in "${requested[@]}"; do
@@ -167,15 +157,23 @@ run_logged_case() {
         fi
         exit 1
     fi
+    local legacy_log
+    legacy_log="$("$PYTHON_BIN" "$PROJECT_DIR/scripts/inheract_artifacts.py" "$log_path")"
+    if [[ -n "$legacy_log" && "${RESUME:-0}" == "1" ]] && rg -q '^RUN_SUMMARY ' "$legacy_log"; then
+        "$PYTHON_BIN" "$PROJECT_DIR/scripts/validate_completed_log.py" "$legacy_log" -- "$@"
+        echo "Adopting compatible historical candidate: $label"
+        return
+    fi
+    mkdir -p "$(dirname "$log_path")"
     INHERNET_RUN_LOG="$log_path" run_case "$label" "$@"
 }
 
 run_target_phase() {
     local selected_phase="$1" dataset="$2" pair="$3"
     local checkpoint log_root candidate_id lr_scale aux_weight shrinkage noise_scale
-    local temperature kd_weight ce_weight size candidate_log replacement_log applicable method
-    local train_mode profile target_profile
-    local -a requested_candidates
+    local temperature candidate_log replacement_log applicable inherited_log
+    local search_validation_enabled=0
+    local -a requested_candidates reuse_candidates
     if [[ "$search_artifact_scope" == "selection" ]]; then
         checkpoint="$PROJECT_DIR/checkpoints/search/selection/$dataset/$pair/teacher_seed_${seed}.pt"
         log_root="$PROJECT_DIR/logs/search/selection/$dataset/$pair/seed_${seed}"
@@ -188,37 +186,55 @@ run_target_phase() {
     if [[ "$dataset" == "cifar10" || "$dataset" == "cifar100" || \
         ( "$search_artifact_scope" == "selection" && "$dataset" == glue_* ) ]]; then
         validation_args+=(--search-validation)
+        search_validation_enabled=1
     fi
     common=(--dataset "$dataset" --pair "$pair" --seed "$seed" --device "$device" \
         --plot-mode none --no-final-test "${validation_args[@]}" "${extra[@]}")
-    mapfile -t REGISTERED_OBJECTIVE_ARGS < <(
-        "$PYTHON_BIN" "$PROJECT_DIR/scripts/hetero_recipes.py" registered-objective "$dataset"
+    mapfile -t REFERENCE_OBJECTIVE_ARGS < <(
+        "$PYTHON_BIN" "$PROJECT_DIR/scripts/inheract_recipes.py" reference-objective "$dataset"
+    )
+    mapfile -t REFERENCE_MECHANISM_ARGS < <(
+        "$PYTHON_BIN" "$PROJECT_DIR/scripts/inheract_recipes.py" reference-mechanism "$dataset"
+    )
+    mapfile -t REFERENCE_OPTIMIZER_ARGS < <(
+        "$PYTHON_BIN" "$PROJECT_DIR/scripts/inheract_recipes.py" reference-optimizer "$dataset"
     )
 
     if [[ "$selected_phase" == "teachers" ]]; then
-        if [[ "$search_artifact_scope" == "selection" && "${OVERWRITE_TEACHER:-0}" == "1" ]]; then
+        if [[ "$search_artifact_scope" == "selection" ]]; then
             inherited_log=$(rg --files "$log_root" 2>/dev/null \
-                | rg '/(mechanism|optimization|distillation|confirmation)/.*\.log$' \
+                | rg '/(mechanism|optimization|distillation)/.*\.log$' \
                 | head -n 1 || true)
-            if [[ -n "$inherited_log" ]]; then
+            if [[ -n "$inherited_log" && \
+                ( "${OVERWRITE_TEACHER:-0}" == "1" || ! -f "$checkpoint" ) ]]; then
                 echo "Cannot replace a selection teacher after inherited logs exist: $inherited_log" >&2
                 echo "Use a fresh selection namespace instead of mixing teacher states." >&2
                 exit 1
             fi
         fi
         if [[ -f "$checkpoint" && "${OVERWRITE_TEACHER:-0}" != "1" ]]; then
-            echo "Reusing teacher checkpoint: $checkpoint"
-            if [[ "${DRY_RUN:-0}" != "1" ]]; then
-                if [[ "$search_artifact_scope" == "selection" ]]; then
-                    checkpoint_root="$PROJECT_DIR/checkpoints/search/selection"
-                else
-                    checkpoint_root="$PROJECT_DIR/checkpoints/search"
-                fi
-                "$PYTHON_BIN" "$PROJECT_DIR/scripts/audit_teachers.py" \
-                    --checkpoint-root "$checkpoint_root" \
-                    --dataset "$dataset" --pair "$pair" --seed "$seed"
-            fi
+            validate_compatible_teacher_checkpoint \
+                "$checkpoint" "$dataset" "$pair" "$seed" "$search_validation_enabled"
+            echo "Reusing compatible teacher checkpoint: $checkpoint"
             return
+        fi
+        if [[ "${OVERWRITE_TEACHER:-0}" != "1" ]]; then
+            if [[ "$search_artifact_scope" == "selection" ]]; then
+                reuse_candidates=(
+                    "$PROJECT_DIR/checkpoints/search/$dataset/$pair/teacher_seed_${seed}.pt"
+                    "$PROJECT_DIR/checkpoints/$dataset/$pair/teacher_seed_${seed}.pt"
+                )
+            else
+                reuse_candidates=(
+                    "$PROJECT_DIR/checkpoints/$dataset/$pair/teacher_seed_${seed}.pt"
+                    "$PROJECT_DIR/checkpoints/search/selection/$dataset/$pair/teacher_seed_${seed}.pt"
+                )
+            fi
+            if reuse_compatible_teacher_checkpoint \
+                "$checkpoint" "$dataset" "$pair" "$seed" "$search_validation_enabled" \
+                "${reuse_candidates[@]}"; then
+                return
+            fi
         fi
         teacher_args=(--teacher-checkpoint "$checkpoint")
         [[ "${OVERWRITE_TEACHER:-0}" == "1" ]] && teacher_args+=(--overwrite-teacher-checkpoint)
@@ -250,29 +266,27 @@ run_target_phase() {
         while IFS=, read -r candidate_id aux_weight shrinkage noise_scale; do
             [[ "$candidate_id" == "candidate_id" || -z "$candidate_id" ]] && continue
             candidate_selected "$candidate_id" || continue
-            candidate_log="$log_root/mechanism/hetero/size_large/${candidate_id}.log"
-            mkdir -p "$(dirname "$candidate_log")"
-            run_logged_case "$dataset Hetero candidate=$candidate_id" "$candidate_log" \
-                "${common[@]}" --method hetero --teacher-checkpoint "$checkpoint" \
+            candidate_log="$log_root/mechanism/inheract/size_large/${candidate_id}.log"
+            run_logged_case "$dataset InherAct candidate=$candidate_id" "$candidate_log" \
+                "${common[@]}" --method inheract --teacher-checkpoint "$checkpoint" \
                 --size large --search-candidate "mechanism_${candidate_id}" \
                 --aux-loss-weight "$aux_weight" \
-                --hetero-second-moment-shrinkage "$shrinkage" \
-                --hetero-expert-noise-scale "$noise_scale" \
-                --hetero-allocation-scale weighted_uniform \
-                "${REFERENCE_HETERO_OPTIMIZER_ARGS[@]}" \
-                "${REGISTERED_OBJECTIVE_ARGS[@]}"
-        done <"$PROJECT_DIR/configs/hetero_search_candidates.csv"
+                --inheract-second-moment-shrinkage "$shrinkage" \
+                --inheract-expert-noise-scale "$noise_scale" \
+                --inheract-allocation-scale weighted_uniform \
+                "${REFERENCE_OPTIMIZER_ARGS[@]}" \
+                "${REFERENCE_OBJECTIVE_ARGS[@]}"
+        done <"$PROJECT_DIR/configs/inheract_search_candidates.csv"
     elif [[ "$selected_phase" == "optimization" ]]; then
         while IFS=, read -r candidate_id lr_scale; do
             [[ "$candidate_id" == "candidate_id" || -z "$candidate_id" ]] && continue
             candidate_selected "$candidate_id" || continue
-            candidate_log="$log_root/optimization/hetero/size_large/${candidate_id}.log"
-            mkdir -p "$(dirname "$candidate_log")"
-            run_logged_case "$dataset Hetero candidate=$candidate_id" "$candidate_log" \
-                "${common[@]}" --method hetero --teacher-checkpoint "$checkpoint" \
+            candidate_log="$log_root/optimization/inheract/size_large/${candidate_id}.log"
+            run_logged_case "$dataset InherAct candidate=$candidate_id" "$candidate_log" \
+                "${common[@]}" --method inheract --teacher-checkpoint "$checkpoint" \
                 --size large --search-candidate "optimization_${candidate_id}" \
-                "${REFERENCE_HETERO_MECHANISM_ARGS[@]}" \
-                "${REGISTERED_OBJECTIVE_ARGS[@]}" \
+                "${REFERENCE_MECHANISM_ARGS[@]}" \
+                "${REFERENCE_OBJECTIVE_ARGS[@]}" \
                 --lr-scale "$lr_scale"
         done <"$PROJECT_DIR/configs/lr_scale_search_candidates.csv"
     elif [[ "$selected_phase" == "distillation" ]]; then
@@ -301,52 +315,20 @@ run_target_phase() {
             [[ "$candidate_id" == "candidate_id" || -z "$candidate_id" ]] && continue
             candidate_selected "$candidate_id" || continue
             distillation_candidate_applies "$candidate_id" || continue
-            candidate_log="$log_root/distillation/hetero/size_large/${candidate_id}.log"
-            mkdir -p "$(dirname "$candidate_log")"
+            candidate_log="$log_root/distillation/inheract/size_large/${candidate_id}.log"
             if [[ "$candidate_id" == "supervised" ]]; then
                 distillation_args=(--compressed-train-mode supervised)
             else
                 distillation_args=(--compressed-train-mode distillation --kd-temperature "$temperature")
                 [[ -n "$kd_fraction" ]] && distillation_args+=(--kd-fraction "$kd_fraction")
             fi
-            run_logged_case "$dataset Hetero candidate=$candidate_id" "$candidate_log" \
-                "${common[@]}" --method hetero --teacher-checkpoint "$checkpoint" \
+            run_logged_case "$dataset InherAct candidate=$candidate_id" "$candidate_log" \
+                "${common[@]}" --method inheract --teacher-checkpoint "$checkpoint" \
                 --size large --search-candidate "distillation_${candidate_id}" \
-                "${REFERENCE_HETERO_MECHANISM_ARGS[@]}" \
-                "${REFERENCE_HETERO_OPTIMIZER_ARGS[@]}" \
+                "${REFERENCE_MECHANISM_ARGS[@]}" \
+                "${REFERENCE_OPTIMIZER_ARGS[@]}" \
                 "${distillation_args[@]}"
         done <"$PROJECT_DIR/configs/distillation_search_candidates.csv"
-    elif [[ "$selected_phase" == "confirmation" ]]; then
-        target_profile="$(hetero_recipe_profile "$dataset")"
-        while IFS=, read -r candidate_id profile aux_weight shrinkage noise_scale allocation_scale lr_scale \
-            train_mode temperature kd_fraction; do
-            [[ "$candidate_id" == "candidate_id" || -z "$candidate_id" ]] && continue
-            candidate_selected "$candidate_id" || continue
-            [[ "$profile" == "$target_profile" ]] || continue
-            candidate_log="$log_root/confirmation/hetero/size_large/${candidate_id}.log"
-            mkdir -p "$(dirname "$candidate_log")"
-            confirmation_args=(
-                --hetero-recipe-id "$candidate_id"
-                --aux-loss-weight "$aux_weight"
-                --hetero-second-moment-shrinkage "$shrinkage"
-                --hetero-expert-noise-scale "$noise_scale"
-                --hetero-allocation-scale "$allocation_scale"
-                --lr-scale "$lr_scale"
-            )
-            if [[ "$train_mode" == "supervised" ]]; then
-                confirmation_args+=(--compressed-train-mode supervised)
-            else
-                confirmation_args+=(
-                    --compressed-train-mode distillation
-                    --kd-temperature "$temperature"
-                )
-                [[ -n "$kd_fraction" ]] && confirmation_args+=(--kd-fraction "$kd_fraction")
-            fi
-            run_logged_case "$dataset Hetero finalist=$candidate_id" "$candidate_log" \
-                "${common[@]}" --method hetero --teacher-checkpoint "$checkpoint" \
-                --size large --search-candidate "confirmation_${candidate_id}" \
-                "${confirmation_args[@]}"
-        done <"$PROJECT_DIR/configs/hetero_confirmation_candidates.csv"
     fi
     [[ "${DRY_RUN:-0}" == "1" ]] || "$PYTHON_BIN" "$PROJECT_DIR/scripts/summarize_search.py" "$log_root"
 }
@@ -382,7 +364,6 @@ run_phase() {
             mechanism) phase_targets=("${mechanism_targets[@]}") ;;
             optimization) phase_targets=("${optimization_targets[@]}") ;;
             distillation) phase_targets=("${distillation_targets[@]}") ;;
-            confirmation) phase_targets=("${confirmation_targets[@]}") ;;
         esac
     fi
     for item in "${phase_targets[@]}"; do
@@ -396,13 +377,6 @@ if [[ "$phase" == "all" && -n "${SEARCH_CANDIDATES:-}" ]]; then
     exit 2
 elif [[ "$phase" != "all" ]]; then
     validate_candidate_filter "$phase"
-fi
-if [[ "$phase" == "confirmation" ]]; then
-    finalist_count=$("$PYTHON_BIN" "$PROJECT_DIR/scripts/hetero_recipes.py" validate-confirmation)
-    if ((finalist_count < 2)); then
-        echo "Confirmation requires the registered reference and at least one manually committed finalist." >&2
-        exit 2
-    fi
 fi
 if [[ "$phase" == "teachers" && "$explicit_target" == "0" ]]; then
     if [[ "$search_artifact_scope" == "selection" && "${TEACHER_GROUP:-all}" != "all" ]]; then

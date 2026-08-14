@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Dict, Mapping
 
 import torch.nn as nn
@@ -49,7 +50,13 @@ PAIR_REGISTRY: Dict[str, Mapping[str, object]] = {
 }
 
 
-def build_model(model_name: str, num_classes: int, *, pretrained: bool = True) -> nn.Module:
+def build_model(
+    model_name: str,
+    num_classes: int,
+    *,
+    pretrained: bool = True,
+    cache_dir: str | Path | None = None,
+) -> nn.Module:
     try:
         from transformers import BertConfig, BertForPreTraining, BertForSequenceClassification
     except ImportError as exc:
@@ -59,9 +66,14 @@ def build_model(model_name: str, num_classes: int, *, pretrained: bool = True) -
         ) from exc
 
     if pretrained:
+        pretrained_kwargs = {
+            "revision": SMALL_BERT_REVISIONS[model_name],
+        }
+        if cache_dir is not None:
+            pretrained_kwargs["cache_dir"] = str(cache_dir)
         pretrained_model = BertForPreTraining.from_pretrained(
             model_name,
-            revision=SMALL_BERT_REVISIONS[model_name],
+            **pretrained_kwargs,
         )
         config = pretrained_model.config
         config.num_labels = num_classes

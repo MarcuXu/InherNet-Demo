@@ -38,20 +38,11 @@ default_background() {
     fi
 }
 
-hetero_display_name() {
+inheract_display_name() {
     case "$1" in
-        large) printf 'Hetero\n' ;;
-        small) printf 'Hetero-Lite\n' ;;
-        *) echo "Unknown Hetero size: $1" >&2; return 2 ;;
-    esac
-}
-
-hetero_recipe_profile() {
-    case "$1" in
-        cifar10|cifar100|oxford_pets) printf '%s\n' "$1" ;;
-        glue_stsb) printf 'glue_regression\n' ;;
-        glue_*) printf 'glue_classification\n' ;;
-        *) echo "No Hetero recipe profile for dataset: $1" >&2; return 2 ;;
+        large) printf 'InherAct\n' ;;
+        small) printf 'InherAct-Lite\n' ;;
+        *) echo "Unknown InherAct size: $1" >&2; return 2 ;;
     esac
 }
 
@@ -69,6 +60,66 @@ checkpoint_for() {
     printf '%s/checkpoints/%s/%s/teacher_seed_%s.pt\n' "$PROJECT_DIR" "$dataset" "$pair" "$seed"
 }
 
+formal_checkpoint_for() {
+    local run_id="$1"
+    local dataset="$2"
+    local pair="$3"
+    local seed="$4"
+    printf '%s/checkpoints/formal/%s/%s/%s/teacher_seed_%s.pt\n' \
+        "$PROJECT_DIR" "$run_id" "$dataset" "$pair" "$seed"
+}
+
+new_formal_run_id() {
+    printf 'formal_%s\n' "$(date -u +%Y%m%d_%H%M%S_%N)"
+}
+
+validate_formal_run_id() {
+    local run_id="$1"
+    if [[ ! "$run_id" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+        echo "FORMAL_RUN_ID must contain only letters, digits, '.', '_' or '-' and start with a letter or digit." >&2
+        exit 2
+    fi
+}
+
+reuse_compatible_teacher_checkpoint() {
+    local destination="$1" dataset="$2" pair="$3" seed="$4" search_validation="$5"
+    shift 5
+    local source
+    local -a command=(
+        "$PYTHON_BIN" "$PROJECT_DIR/scripts/reuse_teacher_checkpoint.py"
+        --destination "$destination"
+        --dataset "$dataset"
+        --pair "$pair"
+        --seed "$seed"
+    )
+    [[ "$search_validation" == "1" ]] && command+=(--search-validation)
+    [[ "${DRY_RUN:-0}" == "1" ]] && command+=(--dry-run)
+    command+=("$@")
+    if ! source="$("${command[@]}")"; then
+        return 1
+    fi
+    if [[ "${DRY_RUN:-0}" == "1" ]]; then
+        echo "Would snapshot compatible teacher: $source -> $destination"
+    else
+        echo "Snapshotted compatible teacher: $source -> $destination"
+    fi
+}
+
+validate_compatible_teacher_checkpoint() {
+    local checkpoint="$1" dataset="$2" pair="$3" seed="$4" search_validation="$5"
+    local -a command=(
+        "$PYTHON_BIN" "$PROJECT_DIR/scripts/reuse_teacher_checkpoint.py"
+        --dry-run
+        --destination "$checkpoint"
+        --dataset "$dataset"
+        --pair "$pair"
+        --seed "$seed"
+    )
+    [[ "$search_validation" == "1" ]] && command+=(--search-validation)
+    command+=("$checkpoint")
+    "${command[@]}" >/dev/null
+}
+
 reject_identity_overrides() {
     local argument
     for argument in "$@"; do
@@ -79,7 +130,7 @@ reject_identity_overrides() {
             --size|--size=*|--compressed-train-mode|\
             --compressed-train-mode=*|--smoke-test|--device|--device=*|\
             --search-candidate|--search-candidate=*|--search-validation|\
-            --hetero-recipe-id|--hetero-recipe-id=*|--inheritance-diagnostics-only)
+            --inheract-recipe-id|--inheract-recipe-id=*|--inheritance-diagnostics-only)
                 echo "Reserved experiment-matrix argument is not allowed in extras: $argument" >&2
                 exit 2
                 ;;
@@ -87,13 +138,13 @@ reject_identity_overrides() {
     done
 }
 
-load_hetero_recipe() {
+load_inheract_recipe() {
     local dataset="$1"
-    mapfile -t HETERO_RECIPE_ARGS < <(
-        "$PYTHON_BIN" "$PROJECT_DIR/scripts/hetero_recipes.py" selected "$dataset"
+    mapfile -t INHERACT_RECIPE_ARGS < <(
+        "$PYTHON_BIN" "$PROJECT_DIR/scripts/inheract_recipes.py" selected "$dataset"
     )
-    if ((${#HETERO_RECIPE_ARGS[@]} == 0)); then
-        echo "No selected Hetero recipe resolved for $dataset." >&2
+    if ((${#INHERACT_RECIPE_ARGS[@]} == 0)); then
+        echo "No selected InherAct recipe resolved for $dataset." >&2
         return 1
     fi
 }
@@ -103,17 +154,17 @@ reject_search_overrides() {
     for argument in "$@"; do
         case "$argument" in
             --epochs|--epochs=*|--lr|--lr=*|--lr-scale|--lr-scale=*|--aux-loss-weight|\
-            --aux-loss-weight=*|--hetero-second-moment-shrinkage|\
-            --hetero-second-moment-shrinkage=*|--hetero-expert-noise-scale|\
-            --hetero-expert-noise-scale=*|--hetero-allocation-scale|\
-            --hetero-allocation-scale=*|--kd-temperature|--kd-temperature=*|\
-            --freeze-hetero-router|\
+            --aux-loss-weight=*|--inheract-second-moment-shrinkage|\
+            --inheract-second-moment-shrinkage=*|--inheract-expert-noise-scale|\
+            --inheract-expert-noise-scale=*|--inheract-allocation-scale|\
+            --inheract-allocation-scale=*|--kd-temperature|--kd-temperature=*|\
+            --freeze-inheract-router|\
             --kd-weight|--kd-weight=*|--ce-weight|--ce-weight=*|--kd-fraction|\
             --kd-fraction=*|--optimizer|--optimizer=*|\
             --batch-size|--batch-size=*|--momentum|--momentum=*|--weight-decay|\
             --weight-decay=*|--rank|--rank=*|--head-num|--head-num=*|\
-            --max-calib-batches|--max-calib-batches=*|--hetero-max-features-per-batch|\
-            --hetero-max-features-per-batch=*|--final-test|--no-final-test)
+            --max-calib-batches|--max-calib-batches=*|--inheract-max-features-per-batch|\
+            --inheract-max-features-per-batch=*|--final-test|--no-final-test)
                 echo "Search-controlled argument is not allowed in extras: $argument" >&2
                 exit 2
                 ;;
@@ -132,11 +183,11 @@ reject_formal_training_overrides() {
             --kd-fraction=*|--rank|--rank=*|\
             --size|--size=*|--head-num|--head-num=*|\
             --aux-loss-weight|--aux-loss-weight=*|\
-            --max-calib-batches|--max-calib-batches=*|--hetero-max-features-per-batch|\
-            --hetero-max-features-per-batch=*|--hetero-second-moment-shrinkage|\
-            --hetero-second-moment-shrinkage=*|--hetero-expert-noise-scale|\
-            --hetero-expert-noise-scale=*|--hetero-allocation-scale|\
-            --hetero-allocation-scale=*|--freeze-hetero-router|\
+            --max-calib-batches|--max-calib-batches=*|--inheract-max-features-per-batch|\
+            --inheract-max-features-per-batch=*|--inheract-second-moment-shrinkage|\
+            --inheract-second-moment-shrinkage=*|--inheract-expert-noise-scale|\
+            --inheract-expert-noise-scale=*|--inheract-allocation-scale|\
+            --inheract-allocation-scale=*|--freeze-inheract-router|\
             --final-test|--no-final-test)
                 echo "Formal launcher training override is not allowed: $argument" >&2
                 echo "Freeze settings through search, then run the selected method explicitly with scripts/run.sh." >&2

@@ -15,24 +15,24 @@ SVD_BACKEND_AUTO = "auto"
 SVD_BACKEND_DEVICE = "device"
 SVD_BACKEND_CPU = "cpu"
 CPU_SVD_DTYPE = torch.float64
-FINAL_HETERO_ALLOCATION = "weighted_uniform"
-MAINTAINED_HETERO_POLICIES = (
-    FINAL_HETERO_ALLOCATION,
+FINAL_INHERACT_ALLOCATION = "weighted_uniform"
+MAINTAINED_INHERACT_POLICIES = (
+    FINAL_INHERACT_ALLOCATION,
     "unweighted_uniform",
 )
-RESEARCH_HETERO_RANK_POLICIES = (
+RESEARCH_INHERACT_RANK_POLICIES = (
     "research_nested_relative",
     "research_total_output",
     "research_relative",
 )
-HETERO_ALLOCATION_SCALES = (
-    *MAINTAINED_HETERO_POLICIES,
-    *RESEARCH_HETERO_RANK_POLICIES,
+INHERACT_ALLOCATION_SCALES = (
+    *MAINTAINED_INHERACT_POLICIES,
+    *RESEARCH_INHERACT_RANK_POLICIES,
 )
 
 
 @dataclass(frozen=True)
-class HeteroConfig:
+class InherActConfig:
     """Validated configuration for data-aware conditional inheritance."""
 
     head_num: int = 3
@@ -42,7 +42,7 @@ class HeteroConfig:
     compress_linear: bool = False
     max_features_per_batch: int = 4096
     second_moment_shrinkage: float = 0.01
-    allocation_scale: str = FINAL_HETERO_ALLOCATION
+    allocation_scale: str = FINAL_INHERACT_ALLOCATION
     research_protected_rank: int | None = None
 
     def __post_init__(self) -> None:
@@ -58,7 +58,7 @@ class HeteroConfig:
             raise ValueError("max_features_per_batch must be positive.")
         if not 0.0 <= self.second_moment_shrinkage <= 1.0:
             raise ValueError("second_moment_shrinkage must be in [0, 1].")
-        if self.allocation_scale not in HETERO_ALLOCATION_SCALES:
+        if self.allocation_scale not in INHERACT_ALLOCATION_SCALES:
             raise ValueError(f"Unknown allocation_scale: {self.allocation_scale}")
         if self.research_protected_rank is not None and self.research_protected_rank <= 0:
             raise ValueError("research_protected_rank must be positive when provided.")
@@ -448,7 +448,7 @@ class GenericInherNet(BackboneWrapper):
         raise RuntimeError("No SVD backend candidate was available for InherNet.")
 
 
-class GenericHeteroNet(BackboneWrapper):
+class GenericInherActNet(BackboneWrapper):
     def __init__(self, backbone: nn.Module) -> None:
         super().__init__(backbone)
         self._cached_routers: tuple[LoadBalancedRouter, ...] = ()
@@ -459,7 +459,7 @@ class GenericHeteroNet(BackboneWrapper):
             router.set_attention_mask(attention_mask)
         return super().forward(*args, **kwargs)
 
-    def _collect_hetero_target_layers(self, include_linear: bool = False) -> OrderedDict[str, nn.Module]:
+    def _collect_inheract_target_layers(self, include_linear: bool = False) -> OrderedDict[str, nn.Module]:
         layers: OrderedDict[str, nn.Module] = OrderedDict()
         for name, module in self.backbone.named_modules():
             if (
@@ -669,7 +669,7 @@ class GenericHeteroNet(BackboneWrapper):
         max_features_per_batch: int = 4096,
         shrinkage: float = 0.01,
     ) -> tuple[dict[str, torch.Tensor], dict[str, dict[str, object]]]:
-        target_layers = self._collect_hetero_target_layers(include_linear=include_linear)
+        target_layers = self._collect_inheract_target_layers(include_linear=include_linear)
         stats = {
             name: {
                 "sum_outer": None,
@@ -784,7 +784,7 @@ class GenericHeteroNet(BackboneWrapper):
         svd_backend: str,
         include_linear: bool = False,
     ) -> dict[str, dict[str, torch.Tensor]]:
-        target_layers = self._collect_hetero_target_layers(include_linear=include_linear)
+        target_layers = self._collect_inheract_target_layers(include_linear=include_linear)
         svd_cache: dict[str, dict[str, torch.Tensor]] = {}
         for name, module in target_layers.items():
             working_weight = _move_tensor_for_svd_backend(module.weight.detach(), svd_backend)
@@ -859,8 +859,8 @@ class GenericHeteroNet(BackboneWrapper):
         allocation_scale: str,
     ) -> tuple[dict[str, int], dict[str, object]]:
         """Construct the maintained fixed-rank policy without invoking research allocation."""
-        if allocation_scale not in {FINAL_HETERO_ALLOCATION, "unweighted_uniform"}:
-            raise ValueError(f"Not a registered-rank Hetero policy: {allocation_scale}")
+        if allocation_scale not in {FINAL_INHERACT_ALLOCATION, "unweighted_uniform"}:
+            raise ValueError(f"Not a registered-rank InherAct policy: {allocation_scale}")
         source_total = sum(parameter.numel() for parameter in self.parameters())
         dense_target_total = sum(
             module.weight.numel() + (module.bias.numel() if module.bias is not None else 0)
@@ -905,7 +905,7 @@ class GenericHeteroNet(BackboneWrapper):
             }
         if selected_cost != parameter_budget:
             raise RuntimeError(
-                "Registered-rank Hetero construction disagrees with the InherNet count: "
+                "Registered-rank InherAct construction disagrees with the InherNet count: "
                 f"selected={selected_cost}, inhernet={parameter_budget}."
             )
         residuals = [
@@ -915,7 +915,7 @@ class GenericHeteroNet(BackboneWrapper):
         report: dict[str, object] = {
             "protocol": (
                 "activation_weighted_registered_rank"
-                if allocation_scale == FINAL_HETERO_ALLOCATION
+                if allocation_scale == FINAL_INHERACT_ALLOCATION
                 else "weight_only_registered_rank"
             ),
             "allocator": "fixed_registered_rank",
@@ -923,7 +923,7 @@ class GenericHeteroNet(BackboneWrapper):
             "allocation_objective": "fixed_registered_rank",
             "decomposition_metric": (
                 "activation_weighted"
-                if allocation_scale == FINAL_HETERO_ALLOCATION
+                if allocation_scale == FINAL_INHERACT_ALLOCATION
                 else "weight_only"
             ),
             "reference_inhernet_rank": reference_rank,
@@ -964,7 +964,7 @@ class GenericHeteroNet(BackboneWrapper):
         applications_per_example: Mapping[str, float],
         allocation_scale: str,
     ) -> tuple[dict[str, int], dict[str, object]]:
-        """Diagnostic rank allocator; unreachable from maintained Hetero runs."""
+        """Diagnostic rank allocator; unreachable from maintained InherAct runs."""
         if not allocation_scale.startswith("research_"):
             raise ValueError(f"Not a research rank policy: {allocation_scale}")
         source_total = sum(parameter.numel() for parameter in self.parameters())
@@ -1002,7 +1002,7 @@ class GenericHeteroNet(BackboneWrapper):
             layer_candidates: list[tuple[int, int, float]] = []
             if allocation_scale == "research_nested_relative" and reference_rank >= max_rank:
                 # Do not introduce a new bottleneck where matched InherNet leaves
-                # the layer dense. Heterogeneity redistributes capacity only
+                # the layer dense. The diagnostic allocator redistributes capacity only
                 # among layers that the reference model actually factorizes.
                 candidates[name] = [(0, dense, 0.0)]
             else:
@@ -1034,7 +1034,7 @@ class GenericHeteroNet(BackboneWrapper):
         minimum_target_cost = minimum_feasible - fixed_cost
         if requested_target_budget < minimum_target_cost:
             raise ValueError(
-                "Hetero cannot fit under its reference InherNet parameter cap: "
+                "InherAct cannot fit under its reference InherNet parameter cap: "
                 f"budget={requested_budget}, minimum={minimum_feasible}."
             )
 
@@ -1121,7 +1121,7 @@ class GenericHeteroNet(BackboneWrapper):
         report["sum_predicted_relative_residual"] = sum(selected_residuals)
         return rank_map, report
 
-    def _replace_conv_with_hetero_svd(
+    def _replace_conv_with_inheract_svd(
         self,
         module: nn.Conv2d,
         rank: int,
@@ -1180,10 +1180,10 @@ class GenericHeteroNet(BackboneWrapper):
             fused_bias,
             head_num,
         )
-        replacement._hetero_lift_statistics = lift_statistics
+        replacement._inheract_lift_statistics = lift_statistics
         return replacement
 
-    def _replace_linear_with_hetero_svd(
+    def _replace_linear_with_inheract_svd(
         self,
         module: nn.Linear,
         rank: int,
@@ -1227,10 +1227,10 @@ class GenericHeteroNet(BackboneWrapper):
             fused_bias,
             head_num,
         )
-        replacement._hetero_lift_statistics = lift_statistics
+        replacement._inheract_lift_statistics = lift_statistics
         return replacement
 
-    def _replace_module_with_hetero_svd(
+    def _replace_module_with_inheract_svd(
         self,
         module: nn.Module,
         rank: int,
@@ -1239,7 +1239,7 @@ class GenericHeteroNet(BackboneWrapper):
         expert_noise_scale: float,
     ) -> nn.Module:
         if isinstance(module, nn.Conv2d):
-            replacement = self._replace_conv_with_hetero_svd(
+            replacement = self._replace_conv_with_inheract_svd(
                 module,
                 rank,
                 head_num,
@@ -1248,7 +1248,7 @@ class GenericHeteroNet(BackboneWrapper):
             )
             return self._match_module_device_dtype(replacement, module)
         if isinstance(module, nn.Linear):
-            replacement = self._replace_linear_with_hetero_svd(
+            replacement = self._replace_linear_with_inheract_svd(
                 module,
                 rank,
                 head_num,
@@ -1256,9 +1256,9 @@ class GenericHeteroNet(BackboneWrapper):
                 expert_noise_scale,
             )
             return self._match_module_device_dtype(replacement, module)
-        raise TypeError(f"Unsupported Hetero target layer: {type(module).__name__}")
+        raise TypeError(f"Unsupported InherAct target layer: {type(module).__name__}")
 
-    def apply_hetero_svd(
+    def apply_inheract_svd(
         self,
         calib_loader: DataLoader,
         head_num: int = 3,
@@ -1269,11 +1269,11 @@ class GenericHeteroNet(BackboneWrapper):
         compress_linear: bool = False,
         max_features_per_batch: int = 4096,
         second_moment_shrinkage: float = 0.01,
-        allocation_scale: str = FINAL_HETERO_ALLOCATION,
+        allocation_scale: str = FINAL_INHERACT_ALLOCATION,
         research_protected_rank: int | None = None,
         allow_research_rank_probe: bool = False,
     ) -> tuple[dict[str, int], str]:
-        config = HeteroConfig(
+        config = InherActConfig(
             head_num=head_num,
             reference_rank=reference_rank,
             max_calib_batches=max_calib_batches,
@@ -1285,7 +1285,7 @@ class GenericHeteroNet(BackboneWrapper):
             research_protected_rank=research_protected_rank,
         )
         if (
-            config.allocation_scale in RESEARCH_HETERO_RANK_POLICIES
+            config.allocation_scale in RESEARCH_INHERACT_RANK_POLICIES
             and not allow_research_rank_probe
         ):
             raise ValueError(
@@ -1316,7 +1316,7 @@ class GenericHeteroNet(BackboneWrapper):
                     svd_backend=backend,
                     include_linear=config.compress_linear,
                 )
-                target_layers = self._collect_hetero_target_layers(include_linear=config.compress_linear)
+                target_layers = self._collect_inheract_target_layers(include_linear=config.compress_linear)
                 parameter_budget = self._inhernet_parameter_budget(
                     target_layers,
                     config.reference_rank,
@@ -1326,7 +1326,7 @@ class GenericHeteroNet(BackboneWrapper):
                     name: float(layer_metadata["applications_per_example"])
                     for name, layer_metadata in moment_metadata.items()
                 }
-                if config.allocation_scale in {FINAL_HETERO_ALLOCATION, "unweighted_uniform"}:
+                if config.allocation_scale in {FINAL_INHERACT_ALLOCATION, "unweighted_uniform"}:
                     rank_map, report = self._registered_rank_configuration(
                         target_layers,
                         svd_cache,
@@ -1352,7 +1352,7 @@ class GenericHeteroNet(BackboneWrapper):
                     if name not in rank_map:
                         continue
                     parent, child_name = self._get_parent_module(name)
-                    replacement = self._replace_module_with_hetero_svd(
+                    replacement = self._replace_module_with_inheract_svd(
                         module,
                         rank=rank_map[name],
                         head_num=config.head_num,
@@ -1371,21 +1371,21 @@ class GenericHeteroNet(BackboneWrapper):
             actual_parameters = sum(parameter.numel() for parameter in self.parameters())
             if actual_parameters != report["selected_parameters"]:
                 raise RuntimeError(
-                    "Hetero allocator/implementation parameter mismatch: "
+                    "InherAct allocator/implementation parameter mismatch: "
                     f"predicted={report['selected_parameters']}, actual={actual_parameters}."
                 )
             if actual_parameters > report["requested_parameters"]:
-                raise RuntimeError("Hetero model exceeded its requested parameter budget.")
-            if config.allocation_scale in {FINAL_HETERO_ALLOCATION, "unweighted_uniform"}:
+                raise RuntimeError("InherAct model exceeded its requested parameter budget.")
+            if config.allocation_scale in {FINAL_INHERACT_ALLOCATION, "unweighted_uniform"}:
                 if actual_parameters != parameter_budget:
                     raise RuntimeError(
-                        "Registered-rank Hetero must exactly match its InherNet parameter count: "
-                        f"hetero={actual_parameters}, inhernet={parameter_budget}."
+                        "Registered-rank InherAct must exactly match its InherNet parameter count: "
+                        f"inheract={actual_parameters}, inhernet={parameter_budget}."
                     )
                 if any(rank != config.reference_rank for rank in rank_map.values()):
-                    raise RuntimeError("Registered-rank Hetero produced a non-uniform factor rank.")
+                    raise RuntimeError("Registered-rank InherAct produced a non-uniform factor rank.")
             lift_layers = {
-                name: dict(getattr(replacement, "_hetero_lift_statistics"))
+                name: dict(getattr(replacement, "_inheract_lift_statistics"))
                 for name, _, _, replacement in replacements
             }
             mean_shifts = [
@@ -1412,11 +1412,11 @@ class GenericHeteroNet(BackboneWrapper):
             report["actual_parameters"] = actual_parameters
             report["second_moments"] = moment_metadata
             self.rank_map = dict(rank_map)
-            self.hetero_report = report
+            self.inheract_report = report
             return rank_map, backend
         if last_error is not None:
             raise last_error
-        raise RuntimeError("No SVD backend candidate was available for HeteroNet.")
+        raise RuntimeError("No SVD backend candidate was available for InherActNet.")
 
 
 def _gating_routers(model: nn.Module) -> tuple[LoadBalancedRouter, ...]:

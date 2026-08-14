@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate and resolve manually reviewed Hetero experiment recipes."""
+"""Validate and resolve manually reviewed InherAct experiment recipes."""
 
 from __future__ import annotations
 
@@ -13,12 +13,11 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from model_wrappers import FINAL_HETERO_ALLOCATION
+from model_wrappers import FINAL_INHERACT_ALLOCATION
 
 
-SELECTED_PATH = PROJECT_DIR / "configs/hetero_selected_recipes.csv"
-CONFIRMATION_PATH = PROJECT_DIR / "configs/hetero_confirmation_candidates.csv"
-REGISTERED_REFERENCE_ID = "weighted_uniform"
+SELECTED_PATH = PROJECT_DIR / "configs/inheract_selected_recipes.csv"
+REFERENCE_PATH = PROJECT_DIR / "configs/inheract_reference_recipes.csv"
 PROFILES = (
     "cifar10",
     "cifar100",
@@ -46,7 +45,7 @@ def dataset_profile(dataset: str) -> str:
         return "glue_regression"
     if dataset.startswith("glue_"):
         return "glue_classification"
-    raise ValueError(f"No Hetero recipe profile for dataset: {dataset}")
+    raise ValueError(f"No InherAct recipe profile for dataset: {dataset}")
 
 
 def _number(row: dict[str, str], field: str, *, allow_blank: bool = False) -> float | None:
@@ -64,7 +63,7 @@ def validate_recipe(row: dict[str, str]) -> None:
     if missing:
         raise ValueError(f"Recipe is missing columns: {', '.join(missing)}")
     if row["profile"] not in PROFILES:
-        raise ValueError(f"Unknown Hetero recipe profile: {row['profile']}")
+        raise ValueError(f"Unknown InherAct recipe profile: {row['profile']}")
     aux = _number(row, "aux_loss_weight")
     shrinkage = _number(row, "second_moment_shrinkage")
     noise = _number(row, "expert_noise_scale")
@@ -80,13 +79,13 @@ def validate_recipe(row: dict[str, str]) -> None:
     if kd_fraction is not None and not 0 <= kd_fraction <= 1:
         raise ValueError("KD fraction must be in [0, 1].")
     mode = row["train_mode"]
-    if row["allocation_scale"] != FINAL_HETERO_ALLOCATION:
+    if row["allocation_scale"] != FINAL_INHERACT_ALLOCATION:
         raise ValueError(
-            "Selected and confirmation recipes must use the frozen Hetero mechanism "
-            f"{FINAL_HETERO_ALLOCATION!r}; research controls belong only in pre-study."
+            "Selected and reference recipes must use the frozen InherAct mechanism "
+            f"{FINAL_INHERACT_ALLOCATION!r}; research controls belong only in pre-study."
         )
     if mode not in {"supervised", "distillation"}:
-        raise ValueError(f"Unknown Hetero train mode: {mode}")
+        raise ValueError(f"Unknown InherAct train mode: {mode}")
     if mode == "distillation" and (kd_temperature is None or kd_temperature <= 0):
         raise ValueError("Distillation recipes require a positive KD temperature.")
     if mode == "supervised" and (kd_temperature is not None or kd_fraction is not None):
@@ -103,56 +102,57 @@ def load_selected(path: Path = SELECTED_PATH) -> dict[str, dict[str, str]]:
         validate_recipe(row)
         profile = row["profile"]
         if profile in selected:
-            raise ValueError(f"Duplicate selected Hetero profile: {profile}")
+            raise ValueError(f"Duplicate selected InherAct profile: {profile}")
         selected[profile] = row
     missing = sorted(set(PROFILES) - set(selected))
     if missing:
-        raise ValueError(f"Selected Hetero recipes are missing profiles: {', '.join(missing)}")
+        raise ValueError(f"Selected InherAct recipes are missing profiles: {', '.join(missing)}")
     return selected
 
 
-def load_confirmation(path: Path = CONFIRMATION_PATH) -> dict[str, dict[str, dict[str, str]]]:
+def load_reference(path: Path = REFERENCE_PATH) -> dict[str, dict[str, str]]:
     with path.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
-    candidates: dict[str, dict[str, dict[str, str]]] = {}
+    reference: dict[str, dict[str, str]] = {}
     for row in rows:
-        candidate = row.get("candidate_id", "").strip()
-        if not IDENTIFIER.fullmatch(candidate):
-            raise ValueError("Every confirmation recipe requires a candidate_id.")
+        if row.get("recipe_id", "").strip() != "weighted_uniform":
+            raise ValueError("Every reference recipe requires recipe_id=weighted_uniform.")
         validate_recipe(row)
-        by_profile = candidates.setdefault(candidate, {})
         profile = row["profile"]
-        if profile in by_profile:
-            raise ValueError(f"Duplicate confirmation row: {candidate}/{profile}")
-        by_profile[profile] = row
-    for candidate, by_profile in candidates.items():
-        missing = sorted(set(PROFILES) - set(by_profile))
-        if missing:
-            raise ValueError(
-                f"Confirmation candidate {candidate} is missing profiles: {', '.join(missing)}"
-            )
-    return candidates
+        if profile in reference:
+            raise ValueError(f"Duplicate reference InherAct profile: {profile}")
+        reference[profile] = row
+    missing = sorted(set(PROFILES) - set(reference))
+    if missing:
+        raise ValueError(f"Reference InherAct recipes are missing profiles: {', '.join(missing)}")
+    return reference
 
 
-def load_registered_reference(dataset: str) -> dict[str, str]:
-    return load_confirmation()[REGISTERED_REFERENCE_ID][dataset_profile(dataset)]
+def load_reference_recipe(dataset: str) -> dict[str, str]:
+    return load_reference()[dataset_profile(dataset)]
 
 
 def recipe_arguments(row: dict[str, str]) -> list[str]:
     args = [
-        "--hetero-recipe-id", row.get("recipe_id") or row["candidate_id"],
-        "--aux-loss-weight", row["aux_loss_weight"],
-        "--hetero-second-moment-shrinkage", row["second_moment_shrinkage"],
-        "--hetero-expert-noise-scale", row["expert_noise_scale"],
-        "--hetero-allocation-scale", row["allocation_scale"],
-        "--lr-scale", row["lr_scale"],
-        "--compressed-train-mode", row["train_mode"],
+        "--inheract-recipe-id", row["recipe_id"],
+        *mechanism_arguments(row),
+        *optimizer_arguments(row),
+        *objective_arguments(row),
     ]
-    if row["train_mode"] == "distillation":
-        args.extend(("--kd-temperature", row["kd_temperature"]))
-        if row["kd_fraction"].strip():
-            args.extend(("--kd-fraction", row["kd_fraction"]))
     return args
+
+
+def mechanism_arguments(row: dict[str, str]) -> list[str]:
+    return [
+        "--aux-loss-weight", row["aux_loss_weight"],
+        "--inheract-second-moment-shrinkage", row["second_moment_shrinkage"],
+        "--inheract-expert-noise-scale", row["expert_noise_scale"],
+        "--inheract-allocation-scale", row["allocation_scale"],
+    ]
+
+
+def optimizer_arguments(row: dict[str, str]) -> list[str]:
+    return ["--lr-scale", row["lr_scale"]]
 
 
 def objective_arguments(row: dict[str, str]) -> list[str]:
@@ -179,30 +179,34 @@ def main() -> None:
     for command in (
         "selected",
         "selected-objective",
+        "selected-optimizer",
         "selected-supervised",
-        "registered-objective",
+        "reference-objective",
+        "reference-mechanism",
+        "reference-optimizer",
     ):
         selected_parser = subparsers.add_parser(command)
         selected_parser.add_argument("dataset")
-    subparsers.add_parser("validate-confirmation")
     args = parser.parse_args()
-    if args.command != "validate-confirmation":
-        row = (
-            load_registered_reference(args.dataset)
-            if args.command == "registered-objective"
-            else load_selected()[dataset_profile(args.dataset)]
-        )
-        if args.command in {"selected-objective", "registered-objective"}:
-            resolved = objective_arguments(row)
-        elif args.command == "selected-supervised":
-            resolved = supervised_control_arguments(row)
-        else:
-            resolved = recipe_arguments(row)
-        for argument in resolved:
-            print(argument)
+    row = (
+        load_reference_recipe(args.dataset)
+        if args.command.startswith("reference-")
+        else load_selected()[dataset_profile(args.dataset)]
+    )
+    if args.command in {"selected-objective", "reference-objective"}:
+        resolved = objective_arguments(row)
+    elif args.command == "selected-optimizer":
+        resolved = optimizer_arguments(row)
+    elif args.command == "reference-mechanism":
+        resolved = mechanism_arguments(row)
+    elif args.command == "reference-optimizer":
+        resolved = optimizer_arguments(row)
+    elif args.command == "selected-supervised":
+        resolved = supervised_control_arguments(row)
     else:
-        candidates = load_confirmation()
-        print(len(candidates))
+        resolved = recipe_arguments(row)
+    for argument in resolved:
+        print(argument)
 
 
 if __name__ == "__main__":

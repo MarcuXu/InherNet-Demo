@@ -13,6 +13,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from checkpointing import load_teacher_checkpoint, save_teacher_checkpoint
+from contrastive_distillation import CRDDistiller, build_crd_train_loader
 from experiment_registry import (
     DATASET_REGISTRY,
     METHOD_CHOICES,
@@ -25,6 +26,13 @@ from experiment_registry import (
     get_pair_spec,
     get_role_name,
     resolve_compressed_train_mode,
+    resolve_cat_kd_settings,
+    resolve_crd_settings,
+    resolve_curriculum_temperature_distillation_settings,
+    resolve_decoupled_distillation_settings,
+    resolve_logit_standardized_kd_settings,
+    resolve_review_kd_settings,
+    resolve_sim_kd_settings,
     resolve_capacity_size,
     resolve_device,
     resolve_fixed_rank,
@@ -35,10 +43,10 @@ from experiment_registry import (
     validate_args,
 )
 from model_wrappers import (
-    FINAL_HETERO_ALLOCATION,
-    HETERO_ALLOCATION_SCALES,
-    RESEARCH_HETERO_RANK_POLICIES,
-    GenericHeteroNet,
+    FINAL_INHERACT_ALLOCATION,
+    INHERACT_ALLOCATION_SCALES,
+    RESEARCH_INHERACT_RANK_POLICIES,
+    GenericInherActNet,
     GenericInherNet,
     freeze_gating_routers,
 )
@@ -52,6 +60,14 @@ from training_utils import (
     forward_logits,
     train_distillation,
     train_supervised,
+    train_vision_distillation,
+)
+from vision_distillation import (
+    CATKDDistiller,
+    ReviewKDDistiller,
+    SimKDDistiller,
+    extract_vision_features,
+    review_feature_maps,
 )
 
 
@@ -119,6 +135,7 @@ def build_run_metadata(
         "student_arch": get_role_name(pair_spec, "student"),
         "num_parameters": count_parameters(model),
         "train_settings": asdict(settings),
+        "lr_scale": args.lr_scale,
         "seed": args.seed,
         "argv": list(sys.argv),
         "python_executable": sys.executable,
@@ -303,6 +320,37 @@ def load_frozen_teacher(
     return teacher.to(device), info
 
 
+def pretrained_model_cache_dir(args: argparse.Namespace, dataset_spec: DatasetSpec) -> Path | None:
+    if dataset_spec.task_type != "text":
+        return None
+    return Path(args.data_root) / "huggingface"
+
+
+def vision_feature_dimensions(
+    model: nn.Module,
+    dataset_spec: DatasetSpec,
+    device: torch.device,
+) -> tuple[int, tuple[int, ...], nn.Linear]:
+    """Inspect the explicit feature path once without changing model state."""
+
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        features = extract_vision_features(
+            model,
+            torch.zeros(
+                1,
+                3,
+                dataset_spec.image_size,
+                dataset_spec.image_size,
+                device=device,
+            ),
+        )
+    model.train(was_training)
+    review_channels = tuple(feature.shape[1] for feature in review_feature_maps(features))
+    return int(features.final_map.shape[1]), review_channels, features.classifier
+
+
 def train_method_from_scratch(
     args: argparse.Namespace,
     method: str,
@@ -318,6 +366,7 @@ def train_method_from_scratch(
     set_seed(args.seed)
     loaders = build_training_dataloaders(args, settings, device)
     train_loader, test_loader = loaders.train, loaders.evaluation
+    model_cache_dir = pretrained_model_cache_dir(args, dataset_spec)
     config_tag = build_method_tag(method, args, pair_spec, settings)
     head_num = resolve_head_num(args, pair_spec, settings)
     compressed_train_mode = resolve_compressed_train_mode(args, pair_spec)
@@ -353,7 +402,13 @@ def train_method_from_scratch(
         teacher_lineage["teacher_checkpoint"] = dict(teacher_checkpoint_info)
 
     if method == "teacher":
-        model = build_pair_model(args.dataset, args.pair, "teacher", dataset_spec.num_classes).to(device)
+        model = build_pair_model(
+            args.dataset,
+            args.pair,
+            "teacher",
+            dataset_spec.num_classes,
+            cache_dir=model_cache_dir,
+        ).to(device)
         metadata = build_run_metadata(
             method,
             args,
@@ -375,7 +430,13 @@ def train_method_from_scratch(
             **metric_log_kwargs,
         )
     elif method == "student":
-        model = build_pair_model(args.dataset, args.pair, "student", dataset_spec.num_classes).to(device)
+        model = build_pair_model(
+            args.dataset,
+            args.pair,
+            "student",
+            dataset_spec.num_classes,
+            cache_dir=model_cache_dir,
+        ).to(device)
         metadata = build_run_metadata(
             method,
             args,
@@ -396,12 +457,47 @@ def train_method_from_scratch(
             logger=logger,
             **metric_log_kwargs,
         )
-    elif method == "student_kd":
+    elif method in {
+        "student_kd",
+        "student_dkd",
+        "student_kd_logit_standardized",
+        "student_ctkd",
+    }:
         if teacher_model is None:
-            raise ValueError("student_kd requires a frozen teacher model loaded from a checkpoint.")
+            raise ValueError(f"{method} requires a frozen teacher model loaded from a checkpoint.")
         teacher_model = teacher_model.to(device)
         teacher_model.eval()
-        model = build_pair_model(args.dataset, args.pair, "student", dataset_spec.num_classes).to(device)
+        model = build_pair_model(
+            args.dataset,
+            args.pair,
+            "student",
+            dataset_spec.num_classes,
+            cache_dir=model_cache_dir,
+        ).to(device)
+        dkd_settings = (
+            resolve_decoupled_distillation_settings(args.dataset, args.pair)
+            if method == "student_dkd"
+            else None
+        )
+        logit_standardized_kd_settings = (
+            resolve_logit_standardized_kd_settings(args.dataset, args.pair)
+            if method == "student_kd_logit_standardized"
+            else None
+        )
+        ctkd_settings = (
+            resolve_curriculum_temperature_distillation_settings(args.dataset, args.pair)
+            if method == "student_ctkd"
+            else None
+        )
+        baseline_extra = dict(teacher_lineage)
+        if dkd_settings is not None:
+            baseline_extra["decoupled_distillation"] = asdict(dkd_settings)
+        if logit_standardized_kd_settings is not None:
+            baseline_extra["logit_standardized_distillation"] = asdict(
+                logit_standardized_kd_settings
+            )
+        if ctkd_settings is not None:
+            baseline_extra["curriculum_temperature_distillation"] = asdict(ctkd_settings)
         metadata = build_run_metadata(
             method,
             args,
@@ -409,11 +505,128 @@ def train_method_from_scratch(
             settings,
             model,
             config_tag,
-            extra=teacher_lineage,
+            extra=baseline_extra,
         )
         logger.metadata(metadata)
         set_seed(args.seed)
         history = train_distillation(
+            teacher_model,
+            model,
+            train_loader,
+            test_loader,
+            settings,
+            device,
+            logger=logger,
+            run_label=method,
+            dkd_settings=dkd_settings,
+            logit_standardized_kd_settings=logit_standardized_kd_settings,
+            ctkd_settings=ctkd_settings,
+            **metric_log_kwargs,
+        )
+    elif method in {"student_catkd", "student_simkd", "student_reviewkd", "student_crd"}:
+        if teacher_model is None:
+            raise ValueError(f"{method} requires a frozen teacher model loaded from a checkpoint.")
+        if dataset_spec.task_type != "vision" or dataset_spec.problem_type != "classification":
+            raise ValueError(f"{method} is a vision-classification baseline.")
+        teacher_model = teacher_model.to(device)
+        teacher_model.eval()
+        for parameter in teacher_model.parameters():
+            parameter.requires_grad_(False)
+        student = build_pair_model(
+            args.dataset,
+            args.pair,
+            "student",
+            dataset_spec.num_classes,
+            cache_dir=model_cache_dir,
+        ).to(device)
+        student_final_channels, student_review_channels, _ = vision_feature_dimensions(
+            student, dataset_spec, device
+        )
+        teacher_final_channels, teacher_review_channels, teacher_classifier = (
+            vision_feature_dimensions(teacher_model, dataset_spec, device)
+        )
+        method_settings: Any
+        if method == "student_catkd":
+            method_settings = resolve_cat_kd_settings(args.dataset, args.pair)
+            model = CATKDDistiller(
+                student,
+                beta=method_settings.feature_weight,
+                ce_weight=method_settings.ce_weight,
+                cam_resolution=method_settings.cam_resolution,
+            ).to(device)
+        elif method == "student_simkd":
+            method_settings = resolve_sim_kd_settings(args.dataset, args.pair)
+            model = SimKDDistiller(
+                student,
+                student_channels=student_final_channels,
+                teacher_channels=teacher_final_channels,
+                teacher_classifier=teacher_classifier,
+                feature_weight=method_settings.feature_weight,
+                projector_factor=method_settings.projector_factor,
+            ).to(device)
+        elif method == "student_reviewkd":
+            method_settings = resolve_review_kd_settings(args.dataset, args.pair)
+            model = ReviewKDDistiller(
+                student,
+                student_channels=student_review_channels,
+                teacher_channels=teacher_review_channels,
+                weight=method_settings.feature_weight,
+                warmup_epochs=method_settings.warmup_epochs,
+                ce_weight=method_settings.ce_weight,
+            ).to(device)
+        else:
+            method_settings = resolve_crd_settings(args.dataset, args.pair)
+            train_loader = build_crd_train_loader(
+                train_loader,
+                num_negatives=method_settings.num_negatives,
+                seed=args.seed,
+            )
+            model = CRDDistiller(
+                student,
+                student_dim=student_final_channels,
+                teacher_dim=teacher_final_channels,
+                num_samples=len(train_loader.dataset),
+                embedding_dim=method_settings.embedding_dim,
+                num_negatives=method_settings.num_negatives,
+                temperature=method_settings.temperature,
+                momentum=method_settings.memory_momentum,
+                memory_seed=args.seed,
+                ce_weight=method_settings.ce_weight,
+                contrastive_weight=method_settings.contrastive_weight,
+            ).to(device)
+        if isinstance(model, CRDDistiller):
+            deployment_parameters = model.deployment_parameter_count
+            training_auxiliary_parameters = model.train_only_auxiliary_parameter_count
+            optimization_parameters = count_parameters(model)
+        else:
+            parameter_counts = model.parameter_counts()
+            deployment_parameters = parameter_counts.deployment_parameters
+            training_auxiliary_parameters = parameter_counts.training_only_auxiliary_parameters
+            optimization_parameters = parameter_counts.optimization_parameters
+        baseline_extra = {
+            **teacher_lineage,
+            "baseline_settings": asdict(method_settings),
+            "num_parameters": deployment_parameters,
+            "deployment_parameters": deployment_parameters,
+            "training_only_auxiliary_parameters": training_auxiliary_parameters,
+            "optimization_parameters": optimization_parameters,
+        }
+        if not isinstance(model, CRDDistiller):
+            baseline_extra["replaced_student_parameters"] = (
+                parameter_counts.replaced_student_parameters
+            )
+        metadata = build_run_metadata(
+            method,
+            args,
+            pair_spec,
+            settings,
+            model,
+            config_tag,
+            extra=baseline_extra,
+        )
+        logger.metadata(metadata)
+        set_seed(args.seed)
+        history = train_vision_distillation(
             teacher_model,
             model,
             train_loader,
@@ -516,14 +729,14 @@ def train_method_from_scratch(
                 run_label=method,
                 **metric_log_kwargs,
             )
-    elif method == "hetero":
+    elif method == "inheract":
         if teacher_model is None:
-            raise ValueError("Hetero requires a frozen teacher model loaded from a checkpoint.")
+            raise ValueError("InherAct requires a frozen teacher model loaded from a checkpoint.")
         teacher_model = teacher_model.to(device)
         teacher_model.eval()
         dense_source_model = teacher_model
         dense_source_role = "teacher"
-        model = GenericHeteroNet(
+        model = GenericInherActNet(
             build_pair_model(
                 args.dataset,
                 args.pair,
@@ -536,26 +749,26 @@ def train_method_from_scratch(
         reference_rank = resolve_fixed_rank(args, pair_spec)
         research_protected_rank = (
             min(reference_rank, int(pair_spec["rank_presets"]["small"]))
-            if args.hetero_allocation_scale == "research_nested_relative"
+            if args.inheract_allocation_scale == "research_nested_relative"
             else None
         )
         synchronize_device(device)
         setup_start = time.perf_counter()
-        rank_map, used_backend = model.apply_hetero_svd(
+        rank_map, used_backend = model.apply_inheract_svd(
             calib_loader=loaders.calibration or train_loader,
             head_num=head_num,
             reference_rank=reference_rank,
             max_calib_batches=args.max_calib_batches,
             svd_backend=args.svd_backend,
-            expert_noise_scale=args.hetero_expert_noise_scale,
+            expert_noise_scale=args.inheract_expert_noise_scale,
             compress_linear=compress_linear,
-            max_features_per_batch=args.hetero_max_features_per_batch,
-            second_moment_shrinkage=args.hetero_second_moment_shrinkage,
-            allocation_scale=args.hetero_allocation_scale,
+            max_features_per_batch=args.inheract_max_features_per_batch,
+            second_moment_shrinkage=args.inheract_second_moment_shrinkage,
+            allocation_scale=args.inheract_allocation_scale,
             research_protected_rank=research_protected_rank,
             allow_research_rank_probe=args.inheritance_diagnostics_only,
         )
-        if args.freeze_hetero_router:
+        if args.freeze_inheract_router:
             freeze_gating_routers(model)
         synchronize_device(device)
         inheritance_setup_seconds = time.perf_counter() - setup_start
@@ -564,19 +777,19 @@ def train_method_from_scratch(
         target_layer_types = ["linear"] if dataset_spec.task_type == "text" else ["conv2d"]
         if compress_linear and "linear" not in target_layer_types:
             target_layer_types.append("linear")
-        hetero_extra = {
+        inheract_extra = {
             "head_num": head_num,
             "size": resolve_capacity_size(args),
             "reference_inhernet_rank": reference_rank,
             "max_calib_batches": args.max_calib_batches,
             "aux_loss_weight": args.aux_loss_weight,
-            "hetero_expert_noise_scale": args.hetero_expert_noise_scale,
+            "inheract_expert_noise_scale": args.inheract_expert_noise_scale,
             "compress_linear": compress_linear,
-            "hetero_max_features_per_batch": args.hetero_max_features_per_batch,
-            "hetero_second_moment_shrinkage": args.hetero_second_moment_shrinkage,
-            "hetero_allocation_scale": args.hetero_allocation_scale,
-            "freeze_hetero_router": args.freeze_hetero_router,
-            "hetero_report": model.hetero_report,
+            "inheract_max_features_per_batch": args.inheract_max_features_per_batch,
+            "inheract_second_moment_shrinkage": args.inheract_second_moment_shrinkage,
+            "inheract_allocation_scale": args.inheract_allocation_scale,
+            "freeze_inheract_router": args.freeze_inheract_router,
+            "inheract_report": model.inheract_report,
             "target_layer_types": target_layer_types,
             "rank_map": {name: int(rank) for name, rank in rank_map.items()},
             "avg_rank": avg_rank,
@@ -584,15 +797,15 @@ def train_method_from_scratch(
             "rank_max": max(rank_values) if rank_values else None,
             "compressed_from": dense_source_role,
             "compressed_train_mode": compressed_train_mode,
-            "hetero_recipe_id": args.hetero_recipe_id,
+            "inheract_recipe_id": args.inheract_recipe_id,
             "inheritance_setup_seconds": inheritance_setup_seconds,
         }
-        hetero_extra["svd_backend"] = describe_svd_backend(used_backend, device)
-        logger.info(f"{method} decomposition backend: {hetero_extra['svd_backend']}")
-        hetero_extra.update(teacher_lineage)
+        inheract_extra["svd_backend"] = describe_svd_backend(used_backend, device)
+        logger.info(f"{method} decomposition backend: {inheract_extra['svd_backend']}")
+        inheract_extra.update(teacher_lineage)
         if rank_values:
-            decomposition_report = hetero_extra["hetero_report"]
-            if args.hetero_allocation_scale in RESEARCH_HETERO_RANK_POLICIES:
+            decomposition_report = inheract_extra["inheract_report"]
+            if args.inheract_allocation_scale in RESEARCH_INHERACT_RANK_POLICIES:
                 logger.info(
                     "Research rank probe: "
                     f"factorized={decomposition_report['factorized_layer_count']}/"
@@ -603,16 +816,16 @@ def train_method_from_scratch(
                 )
             else:
                 logger.info(
-                    "Hetero registered-rank decomposition: "
+                    "InherAct registered-rank decomposition: "
                     f"factorized={decomposition_report['factorized_layer_count']}/"
                     f"{decomposition_report['target_layer_count']}, "
                     f"rank={min(rank_values)}, exact_matched_parameters="
                     f"{decomposition_report['actual_parameters']}"
                 )
         else:
-            decomposition_report = hetero_extra["hetero_report"]
+            decomposition_report = inheract_extra["inheract_report"]
             logger.info(
-                "Hetero decomposition kept all eligible layers dense; "
+                "InherAct decomposition kept all eligible layers dense; "
                 f"parameters={decomposition_report['actual_parameters']}"
             )
         metadata = build_run_metadata(
@@ -622,7 +835,7 @@ def train_method_from_scratch(
             settings,
             model,
             config_tag,
-            extra=hetero_extra,
+            extra=inheract_extra,
         )
         logger.metadata(metadata)
         maybe_log_inheritance_diagnostics(
@@ -742,7 +955,12 @@ def run_single_method_smoke_test(
         with torch.no_grad():
             output = forward_logits(model, sample)
         return {"method": method, "shape": tuple(output.shape), "params": count_parameters(model)}
-    if method == "student_kd":
+    if method in {
+        "student_kd",
+        "student_dkd",
+        "student_kd_logit_standardized",
+        "student_ctkd",
+    }:
         teacher = build_smoke_model("teacher").to(device)
         student = build_smoke_model("student").to(device)
         with torch.no_grad():
@@ -752,6 +970,87 @@ def run_single_method_smoke_test(
             "method": method,
             "teacher_shape": tuple(teacher_out.shape),
             "student_shape": tuple(student_out.shape),
+        }
+    if method in {"student_catkd", "student_simkd", "student_reviewkd", "student_crd"}:
+        teacher = build_smoke_model("teacher").to(device).eval()
+        student = build_smoke_model("student").to(device)
+        student_final_channels, student_review_channels, _ = vision_feature_dimensions(
+            student, dataset_spec, device
+        )
+        teacher_final_channels, teacher_review_channels, teacher_classifier = (
+            vision_feature_dimensions(teacher, dataset_spec, device)
+        )
+        labels = torch.zeros(sample.shape[0], dtype=torch.long, device=device)
+        criterion = nn.CrossEntropyLoss()
+        if method == "student_catkd":
+            method_settings = resolve_cat_kd_settings(dataset_name, pair_name)
+            model = CATKDDistiller(
+                student,
+                beta=method_settings.feature_weight,
+                ce_weight=method_settings.ce_weight,
+                cam_resolution=method_settings.cam_resolution,
+            ).to(device)
+            objective = model.training_objective(teacher, sample, labels, 1, criterion)
+            transfer_loss = objective.feature_loss
+        elif method == "student_simkd":
+            method_settings = resolve_sim_kd_settings(dataset_name, pair_name)
+            model = SimKDDistiller(
+                student,
+                student_channels=student_final_channels,
+                teacher_channels=teacher_final_channels,
+                teacher_classifier=teacher_classifier,
+                feature_weight=method_settings.feature_weight,
+                projector_factor=method_settings.projector_factor,
+            ).to(device)
+            objective = model.training_objective(teacher, sample, labels, 1, criterion)
+            transfer_loss = objective.feature_loss
+        elif method == "student_reviewkd":
+            method_settings = resolve_review_kd_settings(dataset_name, pair_name)
+            model = ReviewKDDistiller(
+                student,
+                student_channels=student_review_channels,
+                teacher_channels=teacher_review_channels,
+                weight=method_settings.feature_weight,
+                warmup_epochs=method_settings.warmup_epochs,
+                ce_weight=method_settings.ce_weight,
+            ).to(device)
+            objective = model.training_objective(teacher, sample, labels, 20, criterion)
+            transfer_loss = objective.feature_loss
+        else:
+            method_settings = resolve_crd_settings(dataset_name, pair_name)
+            model = CRDDistiller(
+                student,
+                student_dim=student_final_channels,
+                teacher_dim=teacher_final_channels,
+                num_samples=sample.shape[0],
+                num_negatives=1,
+                memory_seed=args.seed,
+                ce_weight=method_settings.ce_weight,
+                contrastive_weight=method_settings.contrastive_weight,
+            ).to(device)
+            sample_indices = torch.arange(sample.shape[0], device=device)
+            contrast_indices = torch.stack(
+                [sample_indices, sample_indices.roll(1)], dim=1
+            )
+            objective = model.training_objective(
+                teacher,
+                sample,
+                labels,
+                sample_indices,
+                contrast_indices,
+                1,
+                criterion,
+            )
+            transfer_loss = objective.contrastive
+        total_loss = objective.total if isinstance(model, CRDDistiller) else objective.total_loss
+        total_loss.backward()
+        with torch.no_grad():
+            output = model(sample)
+        return {
+            "method": method,
+            "shape": tuple(output.shape),
+            "params": count_parameters(model),
+            "transfer_loss": float(transfer_loss.detach()),
         }
     if method == "inhernet":
         source_role = "teacher"
@@ -781,34 +1080,34 @@ def run_single_method_smoke_test(
             "svd_backend": describe_svd_backend(svd_backend, device),
             "inheritance_setup_seconds": inheritance_setup_seconds,
         }
-    if method == "hetero":
+    if method == "inheract":
         source_role = "teacher"
         dense_source = build_smoke_model(source_role).to(device)
-        model = GenericHeteroNet(copy.deepcopy(dense_source)).to(device)
+        model = GenericInherActNet(copy.deepcopy(dense_source)).to(device)
         model.load_dense_state_dict(dense_source.state_dict())
         reference_rank = resolve_fixed_rank(args, pair_spec)
         research_protected_rank = (
             min(reference_rank, int(pair_spec["rank_presets"]["small"]))
-            if args.hetero_allocation_scale == "research_nested_relative"
+            if args.inheract_allocation_scale == "research_nested_relative"
             else None
         )
         synchronize_device(device)
         setup_start = time.perf_counter()
-        rank_map, svd_backend = model.apply_hetero_svd(
+        rank_map, svd_backend = model.apply_inheract_svd(
             calib_loader=calib_loader,
             head_num=head_num,
             reference_rank=reference_rank,
             max_calib_batches=min(args.max_calib_batches, len(calib_loader)),
             svd_backend=args.svd_backend,
-            expert_noise_scale=args.hetero_expert_noise_scale,
+            expert_noise_scale=args.inheract_expert_noise_scale,
             compress_linear=compress_linear,
-            max_features_per_batch=args.hetero_max_features_per_batch,
-            second_moment_shrinkage=args.hetero_second_moment_shrinkage,
-            allocation_scale=args.hetero_allocation_scale,
+            max_features_per_batch=args.inheract_max_features_per_batch,
+            second_moment_shrinkage=args.inheract_second_moment_shrinkage,
+            allocation_scale=args.inheract_allocation_scale,
             research_protected_rank=research_protected_rank,
             allow_research_rank_probe=args.inheritance_diagnostics_only,
         )
-        if args.freeze_hetero_router:
+        if args.freeze_inheract_router:
             freeze_gating_routers(model)
         synchronize_device(device)
         inheritance_setup_seconds = time.perf_counter() - setup_start
@@ -822,9 +1121,9 @@ def run_single_method_smoke_test(
             "head_num": head_num,
             "size": resolve_capacity_size(args),
             "reference_inhernet_rank": reference_rank,
-            "hetero_allocation_scale": args.hetero_allocation_scale,
-            "freeze_hetero_router": args.freeze_hetero_router,
-            "achieved_ratio": model.hetero_report.get("achieved_ratio"),
+            "inheract_allocation_scale": args.inheract_allocation_scale,
+            "freeze_inheract_router": args.freeze_inheract_router,
+            "achieved_ratio": model.inheract_report.get("achieved_ratio"),
             "rank_min": min(rank_values) if rank_values else None,
             "rank_max": max(rank_values) if rank_values else None,
             "compressed_from": source_role,
@@ -924,7 +1223,7 @@ def run_training(args: argparse.Namespace) -> Path:
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Registry-driven Hetero runner for vision and GLUE tasks.")
+    parser = argparse.ArgumentParser(description="Registry-driven InherAct runner for vision and GLUE tasks.")
     parser.add_argument("--dataset", choices=sorted(DATASET_REGISTRY.keys()), required=True)
     parser.add_argument("--pair", required=True, help="Dataset-specific teacher/student pair name.")
     parser.add_argument("--method", choices=METHOD_CHOICES, required=True)
@@ -968,8 +1267,8 @@ def build_argparser() -> argparse.ArgumentParser:
         choices=["small", "large"],
         default=None,
         help=(
-            "Registered capacity preset. When omitted, direct Hetero runs use "
-            "the headline large preset and InherNet uses small. Hetero exactly "
+            "Registered capacity preset. When omitted, direct InherAct runs use "
+            "the headline large preset and InherNet uses small. InherAct exactly "
             "matches the corresponding InherNet rank and parameter count."
         ),
     )
@@ -980,7 +1279,7 @@ def build_argparser() -> argparse.ArgumentParser:
         choices=["distillation", "supervised"],
         default=None,
         help=(
-            "Training objective for compressed InherNet/Hetero models after decomposition. "
+            "Training objective for compressed InherNet/InherAct models after decomposition. "
             "Defaults come from the pair."
         ),
     )
@@ -992,29 +1291,29 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-calib-batches", type=int, default=16)
     parser.add_argument("--aux-loss-weight", type=float, default=0.01)
-    parser.add_argument("--hetero-expert-noise-scale", type=float, default=0.01)
-    parser.add_argument("--hetero-max-features-per-batch", type=int, default=4096)
-    parser.add_argument("--hetero-second-moment-shrinkage", type=float, default=0.01)
+    parser.add_argument("--inheract-expert-noise-scale", type=float, default=0.01)
+    parser.add_argument("--inheract-max-features-per-batch", type=int, default=4096)
+    parser.add_argument("--inheract-second-moment-shrinkage", type=float, default=0.01)
     parser.add_argument(
-        "--hetero-allocation-scale",
-        choices=HETERO_ALLOCATION_SCALES,
-        default=FINAL_HETERO_ALLOCATION,
+        "--inheract-allocation-scale",
+        choices=INHERACT_ALLOCATION_SCALES,
+        default=FINAL_INHERACT_ALLOCATION,
         help=(
-            "Hetero decomposition policy. weighted_uniform is the maintained method: "
+            "InherAct decomposition policy. weighted_uniform is the maintained method: "
             "activation-aware decomposition at InherNet's registered rank. "
             "unweighted_uniform is its weight-only ablation; research_* policies are "
             "explicit pre-study diagnostics and never formal/HPO settings."
         ),
     )
     parser.add_argument(
-        "--hetero-recipe-id",
+        "--inheract-recipe-id",
         default=None,
-        help="Reviewed recipe identifier recorded for formal, confirmation, and ablation runs.",
+        help="Reviewed recipe identifier recorded for formal and ablation runs.",
     )
     parser.add_argument(
-        "--freeze-hetero-router",
+        "--freeze-inheract-router",
         action="store_true",
-        help="Ablation control: keep the zero-initialized uniform Hetero routers fixed.",
+        help="Ablation control: keep the zero-initialized uniform InherAct routers fixed.",
     )
     parser.add_argument(
         "--inheritance-diagnostics",

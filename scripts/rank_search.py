@@ -33,10 +33,9 @@ EXPECTED_EVAL_SPLIT = {
     "glue_stsb": "train_holdout",
 }
 STAGE_CONFIG = {
-    "mechanism": PROJECT_DIR / "configs/hetero_search_candidates.csv",
+    "mechanism": PROJECT_DIR / "configs/inheract_search_candidates.csv",
     "optimization": PROJECT_DIR / "configs/lr_scale_search_candidates.csv",
     "distillation": PROJECT_DIR / "configs/distillation_search_candidates.csv",
-    "confirmation": PROJECT_DIR / "configs/hetero_confirmation_candidates.csv",
 }
 STAGE_TARGETS = {
     "mechanism": (
@@ -59,13 +58,6 @@ STAGE_TARGETS = {
         ("glue_sst2", "bert4_to_bert2"),
         ("glue_stsb", "bert4_to_bert2"),
     ),
-    "confirmation": (
-        ("cifar10", "resnet50_to_resnet18"),
-        ("cifar100", "resnet56_to_resnet20"),
-        ("oxford_pets", "resnet34_to_resnet18"),
-        ("glue_sst2", "bert4_to_bert2"),
-        ("glue_stsb", "bert4_to_bert2"),
-    ),
 }
 
 
@@ -81,7 +73,7 @@ def validate_search_protocol_rows(rows: list[dict[str, object]]) -> None:
     for row in rows:
         dataset = str(row["dataset"])
         if row.get("size") != "large":
-            raise ValueError(f"Search row is not headline Hetero capacity: {row.get('log')}")
+            raise ValueError(f"Search row is not headline InherAct capacity: {row.get('log')}")
         if int(row.get("epochs_completed") or 0) != EXPECTED_EPOCHS[dataset]:
             raise ValueError(f"Wrong search horizon for {row.get('log')}")
         if row.get("eval_split") != EXPECTED_EVAL_SPLIT[dataset]:
@@ -165,7 +157,7 @@ def main() -> None:
     if not targets:
         raise SystemExit("No prespecified targets match the dataset filter.")
     target_set = set(targets)
-    methods = ("hetero",)
+    methods = ("inheract",)
 
     all_rows = build_rows(args.log_root)
     seeds = args.seed or list(DEFAULT_SEARCH_SEEDS)

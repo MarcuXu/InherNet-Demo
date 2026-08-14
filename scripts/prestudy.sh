@@ -69,6 +69,12 @@ for target_spec in "${targets[@]}"; do
     fi
     validation_args=()
     [[ "$dataset" == "cifar100" ]] && validation_args+=(--search-validation)
+    if [[ "${DRY_RUN:-0}" != "1" ]]; then
+        prestudy_search_validation=0
+        [[ "$dataset" == "cifar100" ]] && prestudy_search_validation=1
+        validate_compatible_teacher_checkpoint \
+            "$checkpoint" "$dataset" "$pair" "$seed" "$prestudy_search_validation"
+    fi
     common=(--dataset "$dataset" --pair "$pair" --seed "$seed" --device "$DEVICE" \
         --plot-mode none --no-final-test --inheritance-diagnostics-only \
         --teacher-checkpoint "$checkpoint" "${validation_args[@]}" "${extra[@]}")
@@ -80,30 +86,30 @@ for target_spec in "${targets[@]}"; do
             --compressed-train-mode supervised --search-candidate prestudy_inhernet
 
         for allocation in unweighted_uniform weighted_uniform; do
-            run_diagnostic "$dataset Hetero allocation=$allocation" "$log_root/${allocation}.log" \
-                "${common[@]}" --method hetero --size large \
+            run_diagnostic "$dataset InherAct allocation=$allocation" "$log_root/${allocation}.log" \
+                "${common[@]}" --method inheract --size large \
                 --compressed-train-mode supervised --search-candidate "prestudy_${allocation}" \
-                --hetero-allocation-scale "$allocation" \
-                --hetero-expert-noise-scale 0 --aux-loss-weight 0
+                --inheract-allocation-scale "$allocation" \
+                --inheract-expert-noise-scale 0 --aux-loss-weight 0
         done
 
-        run_diagnostic "$dataset Hetero mean-preserving conditional lift" \
+        run_diagnostic "$dataset InherAct mean-preserving conditional lift" \
             "$log_root/weighted_uniform_noise_001.log" \
-            "${common[@]}" --method hetero --size large \
+            "${common[@]}" --method inheract --size large \
             --compressed-train-mode supervised \
             --search-candidate prestudy_weighted_uniform_noise_001 \
-            --hetero-allocation-scale weighted_uniform \
-            --hetero-expert-noise-scale 0.01 --aux-loss-weight 0
+            --inheract-allocation-scale weighted_uniform \
+            --inheract-expert-noise-scale 0.01 --aux-loss-weight 0
     fi
 
     if [[ "$scope" == "research" || "$scope" == "all" ]]; then
         for allocation in research_relative research_nested_relative research_total_output; do
-            run_diagnostic "$dataset Hetero research allocation=$allocation" \
+            run_diagnostic "$dataset InherAct research allocation=$allocation" \
                 "$log_root/${allocation}.log" \
-                "${common[@]}" --method hetero --size large \
+                "${common[@]}" --method inheract --size large \
                 --compressed-train-mode supervised --search-candidate "prestudy_${allocation}" \
-                --hetero-allocation-scale "$allocation" \
-                --hetero-expert-noise-scale 0 --aux-loss-weight 0
+                --inheract-allocation-scale "$allocation" \
+                --inheract-expert-noise-scale 0 --aux-loss-weight 0
         done
     fi
 done

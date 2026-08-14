@@ -27,7 +27,7 @@ PROGRESSION_DATA = {
             "InherNet": {"relative_sse": 0.8477581888307537, "task_metric": 18.157894736842103},
             "Weight SVD": {"relative_sse": 0.8477418906401061, "task_metric": 18.293029871977236},
             "Activation-aware": {"relative_sse": 0.28378891885026997, "task_metric": 77.46799431009957},
-            "Hetero": {"relative_sse": 0.28384779482539896, "task_metric": 77.46799431009957},
+            "InherAct": {"relative_sse": 0.28384779482539896, "task_metric": 77.46799431009957},
         },
     },
     "cifar100": {
@@ -39,12 +39,12 @@ PROGRESSION_DATA = {
             "InherNet": {"relative_sse": 1.0155290510783406, "task_metric": 2.54},
             "Weight SVD": {"relative_sse": 1.0155332510683595, "task_metric": 2.54},
             "Activation-aware": {"relative_sse": 0.8368906319195847, "task_metric": 7.42},
-            "Hetero": {"relative_sse": 0.8368925308302901, "task_metric": 7.42},
+            "InherAct": {"relative_sse": 0.8368925308302901, "task_metric": 7.42},
         },
     },
 }
 
-METHODS = ("InherNet", "Weight SVD", "Activation-aware", "Hetero")
+METHODS = ("InherNet", "Weight SVD", "Activation-aware", "InherAct")
 
 
 def normalized_sse(dataset: dict[str, object], method: str) -> float:
@@ -56,7 +56,7 @@ def validate_data() -> None:
     for dataset in PROGRESSION_DATA.values():
         assert tuple(dataset["methods"]) == METHODS
         assert normalized_sse(dataset, "Activation-aware") < normalized_sse(dataset, "Weight SVD")
-        assert dataset["methods"]["Hetero"]["task_metric"] == dataset["methods"]["Activation-aware"]["task_metric"]
+        assert dataset["methods"]["InherAct"]["task_metric"] == dataset["methods"]["Activation-aware"]["task_metric"]
 
 
 def plot(output: Path) -> None:

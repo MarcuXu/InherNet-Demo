@@ -23,6 +23,7 @@ from experiment_registry import (
     validate_args,
 )
 from scripts.summarize_search import parse_structured_log
+from scripts.inheract_artifacts import canonicalize_metadata
 
 
 def option_value(arguments: list[str], option: str) -> str | None:
@@ -43,6 +44,20 @@ def expected_evaluation_split(dataset: str, arguments: list[str]) -> str:
     return DATASET_REGISTRY[dataset].eval_split_name
 
 
+def expected_final_test_split(resolved_args) -> str | None:
+    """Return the held-out split produced by this command, if any."""
+    if not resolved_args.final_test:
+        return None
+    dataset_spec = DATASET_REGISTRY[resolved_args.dataset]
+    if dataset_spec.task_type == "text":
+        return dataset_spec.eval_split_name if resolved_args.search_validation else None
+    uses_validation = (
+        resolved_args.dataset in {"cifar10", "cifar100"}
+        and resolved_args.search_validation
+    ) or dataset_spec.validation_fraction > 0
+    return (dataset_spec.test_split or "test") if uses_validation else None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("log", type=Path)
@@ -60,6 +75,7 @@ def main() -> None:
     diagnostics = records.get("INHERITANCE_DIAGNOSTICS")
     if metadata is None or (summary is None and not (args.diagnostics_only and diagnostics is not None)):
         raise SystemExit(f"Incomplete structured log: {args.log}")
+    metadata = canonicalize_metadata(metadata)
     recorded_argv = metadata.get("argv")
     if not isinstance(recorded_argv, list) or recorded_argv[1:] != expected:
         raise SystemExit(
@@ -101,7 +117,7 @@ def main() -> None:
             raise SystemExit(f"Completed log has malformed inheritance diagnostics: {args.log}") from exc
         if examples <= 0 or router_count < 0 or not math.isfinite(relative_error):
             raise SystemExit(f"Completed log has invalid inheritance diagnostics: {args.log}")
-        if metadata.get("method") == "hetero":
+        if metadata.get("method") == "inheract":
             try:
                 local_probe = diagnostics["local_operator_probe"]
                 local_error = float(local_probe["relative_squared_error"])
@@ -114,12 +130,12 @@ def main() -> None:
                 local_aggregation = str(local_probe["aggregation"])
                 router_split = str(router_probe["evaluation_split"])
                 router_batch_index = int(router_probe["batch_index"])
-                lift_probe = metadata["hetero_report"]["conditional_lift_probe"]
+                lift_probe = metadata["inheract_report"]["conditional_lift_probe"]
                 lift_layers = int(lift_probe["factorized_layer_count"])
                 mean_shift = float(lift_probe["mean_relative_expert_mean_shift"])
             except (KeyError, TypeError, ValueError) as exc:
                 raise SystemExit(
-                    f"Completed Hetero log predates the causal diagnostics: {args.log}. "
+                    f"Completed InherAct log predates the causal diagnostics: {args.log}. "
                     "Move the stale log before rerunning this cell."
                 ) from exc
             if (
@@ -143,7 +159,7 @@ def main() -> None:
                 or not math.isfinite(mean_shift)
                 or mean_shift < 0
             ):
-                raise SystemExit(f"Completed Hetero log has invalid causal diagnostics: {args.log}")
+                raise SystemExit(f"Completed InherAct log has invalid causal diagnostics: {args.log}")
         return
     if summary is None:
         raise SystemExit(f"Completed log has no training summary: {args.log}")
@@ -158,6 +174,25 @@ def main() -> None:
         raise SystemExit(f"Completed log has no numeric selected metric: {args.log}") from exc
     if not math.isfinite(metric):
         raise SystemExit(f"Completed log has a non-finite selected metric: {args.log}")
+
+    final_test_split = expected_final_test_split(resolved_args)
+    if final_test_split is None:
+        return
+    final_test = records.get("RUN_FINAL_TEST")
+    if final_test is None:
+        raise SystemExit(f"Completed log is missing held-out final-test results: {args.log}")
+    if final_test.get("split") != final_test_split:
+        raise SystemExit(f"Completed log has the wrong final-test split: {args.log}")
+    if final_test.get("primary_metric_name") != summary.get("primary_metric_name"):
+        raise SystemExit(f"Completed log has the wrong final-test metric: {args.log}")
+    try:
+        selection_epoch = int(final_test["selection_epoch"])
+        expected_epoch = int(summary["best_eval_epoch"])
+        final_metric = float(final_test[str(summary["primary_metric_name"])])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SystemExit(f"Completed log has malformed held-out final-test results: {args.log}") from exc
+    if selection_epoch != expected_epoch or not math.isfinite(final_metric):
+        raise SystemExit(f"Completed log has invalid held-out final-test results: {args.log}")
 
 
 if __name__ == "__main__":

@@ -1,9 +1,9 @@
-# Hetero
+# InherAct: Activation-Aware Conditional Experts for Fixed-Capacity Model Inheritance
 
 Research implementation of activation-aware conditional-expert neural-network inheritance.
 The repository extends **Beyond Student: An Asymmetric Network for Neural
 Network Inheritance** ([arXiv:2602.09509](https://arxiv.org/abs/2602.09509)).
-`inhernet` is the fixed-rank reference method. `hetero` keeps that registered
+`inhernet` is the fixed-rank reference method. `inheract` keeps that registered
 rank and exact parameter contract, but makes the decomposition activation-aware
 and initializes conditionable experts without changing their mean reconstruction.
 
@@ -37,7 +37,7 @@ reproduction. For the same reason, paper tables should use parameter counts
 measured from each constructed model; some published pair/rank counts are not
 consistent with the shared-down formula.
 
-Hetero estimates the uncentered input second moment
+InherAct estimates the uncentered input second moment
 
 ```text
 M_x = E[x x^T] = C C^T
@@ -52,7 +52,7 @@ E ||(W - W_hat) x||^2
 ```
 
 Thus, at the registered InherNet rank, truncated SVD of `W C` minimizes a local
-empirical output-reconstruction objective. Hetero then writes each up expert as
+empirical output-reconstruction objective. InherAct then writes each up expert as
 the inherited mean factor plus a deviation whose sum across experts is zero.
 Under the initially uniform router, those deviations preserve the inherited
 rank-truncated reconstruction while exposing conditional first-order tangent
@@ -60,15 +60,15 @@ directions. This is one constrained **preserve-then-adapt initialization**:
 select the best local mean operator under the empirical activation metric, then
 make its conditional degrees of freedom learnable without changing that mean.
 
-Formal Hetero uses this `weighted_uniform` policy for every eligible layer: it
+Formal InherAct uses this `weighted_uniform` policy for every eligible layer: it
 does not search for or allocate layer-specific ranks. The resulting
 construction has the same rank and parameter count as the corresponding
 InherNet model, isolating the initialization principle from a capacity change.
 
-Heterogeneous-rank policies were useful during method development but were less
+Layer-varying rank policies were useful during method development but were less
 stable than the registered-rank construction. They remain available only under
 explicit `research_*` names for the validation-only pre-study. They are not
-formal Hetero variants, HPO candidates, or alternative solutions presented by
+formal InherAct variants, HPO candidates, or alternative solutions presented by
 the method.
 
 For convolutions with patch dimension at most 256, calibration uses exact
@@ -83,7 +83,7 @@ Inherited layers remain trainable after initialization.
 
 Both inherited methods use the same `--size small|large` interface. The size
 selects a registered uniform rank: paper-printed for the seven covered
-CIFAR-100 pairs and repository-defined for extensions. Hetero applies exactly
+CIFAR-100 pairs and repository-defined for extensions. InherAct applies exactly
 that rank to the same eligible layers as InherNet. Controlled ablations isolate
 activation weighting, expert perturbation, learned routing, the auxiliary
 objective, and calibration budget without introducing a rank-allocation
@@ -171,10 +171,41 @@ replication of the paper's T5 protocol.
 The CIFAR-100 InherNet baseline is frozen to the paper-listed hyperparameters: SGD with
 learning rate 0.05, momentum 0.9, weight decay `5e-4`, batch size 64, 240
 epochs, learning-rate drops at 150/180/210, three heads, and the printed
-pair-specific ranks. Formal InherNet uses supervised task loss as the clean
-InherNet-only baseline and is not part of Hetero HPO; the paper does not state
-one unambiguous objective for every Small/Large table cell, so this objective
-choice is disclosed rather than called an exact reproduction. The public repository describes its script as a basic runtime
+pair-specific ranks. Formal InherNet follows the paper's scale-dependent
+comparison: InherNet-Small retains its registered KD objective, while
+InherNet-Large uses supervised task loss. This keeps the Small baseline
+paper-faithful rather than introducing a separately tuned diagnostic variant.
+The formal core is teacher, compact student, student KD, InherNet-Small + KD,
+InherNet-Large, and InherAct. Direct-SVD inheritance is a useful static
+single-expert mechanism control, but belongs to the ablation study rather than
+the main comparison.
+InherNet is not part of InherAct HPO. The CIFAR-100 matrix adds external
+baselines only for architecture pairs covered by their released recipes:
+standalone KD with Logit Standardization and SimKD on seven standard pairs;
+CTKD, DKD, and CAT-KD on six; ReviewKD on five; and CRD on seven. The
+standalone Logit-Standardized KD row is a useful plug-in control, but it is not
+misrepresented as the paper's 480-epoch MLKD + Logit Standardization row.
+DKD uses CE=1, alpha=1, temperature=4, a 20-epoch warm-up, and the published
+pair-specific beta 8, 6, or 2. CIFAR-10 adds explicitly labeled CTKD and DKD
+repository adaptations derived from the methods' released ImageNet ResNet
+recipes; they are not claimed as published CIFAR-10 reproductions. No
+unreviewed classification-only distiller is transplanted to Oxford, GLUE, or
+STS-B. ReviewKD discards its training-only adapters; CRD discards its
+projection heads and memory banks; SimKD retains its projector and the frozen
+teacher classifier, so its effective deployment parameters are logged
+separately. CAT-KD uses the released CAM objective/configuration with the
+repository's native classifier head and is labeled as an adaptation rather
+than an exact code reproduction. This dataset-specific coverage strengthens the vision matrix
+without pretending that one loss or feature interface is valid everywhere.
+The implementations follow the released repositories for
+[CTKD](https://github.com/zhengli97/CTKD),
+[DKD/MDistiller](https://github.com/megvii-research/mdistiller),
+[CAT-KD](https://github.com/GzyAftermath/CAT-KD),
+[SimKD](https://github.com/DefangChen/SimKD),
+[ReviewKD](https://github.com/JIA-Lab-research/ReviewKD),
+[CRD](https://github.com/HobbitLong/RepDistiller), and
+[Logit Standardization](https://github.com/sunshangquan/logit-standardization-KD).
+The public repository describes its script as a basic runtime
 demo and supplies only a didactic CIFAR-10 Adam/rank-32 example, so it is not
 used to override the paper's CIFAR-100 protocol. Settings for CIFAR-10,
 Oxford, and compact-BERT GLUE are labeled adaptations rather than attributed
@@ -206,7 +237,7 @@ profile and must be regenerated before search or formal reporting.
 
 `small` and `large` are the two registered capacity settings for every model
 pair. InherNet applies the selected fixed rank uniformly to every
-eligible layer. Hetero applies the same rank to the same layers, including the
+eligible layer. InherAct applies the same rank to the same layers, including the
 same decision to leave a layer dense when the registered rank is not a
 truncation. Consequently, the two constructions have the same measured
 parameter count. This definition is identical for vision and text and does not
@@ -217,26 +248,26 @@ and each method's accuracy and efficiency. Dense-model and eligible-layer
 ratios remain useful diagnostics in structured logs, but they are outputs
 rather than user-selected hyperparameters.
 
-The public method names are **Hetero** for internal size `large` and
-**Hetero-Lite** for internal size `small`. Hetero is the headline method for
-formal baseline comparisons. Hetero-Lite is retained as a capacity/efficiency
-ablation and, after selection is complete, must use the Hetero-selected
-hyperparameters without a second search. The stable CLI and structured-artifact
-values remain `--method hetero --size large|small` for compatibility. A direct
-Hetero command with no `--size` now resolves to headline `large`; direct
-InherNet retains the historical `small` default. Hetero rejects custom
+The public method names are **InherAct** for internal size `large` and
+**InherAct-Lite** for internal size `small`. InherAct is the headline method for
+formal baseline comparisons. InherAct-Lite is retained as a capacity/efficiency
+ablation and, after selection is complete, must use the InherAct-selected
+hyperparameters without a second search. The canonical CLI and structured-artifact
+values are `--method inheract --size large|small`. A direct
+InherAct command with no `--size` now resolves to headline `large`; direct
+InherNet retains the historical `small` default. InherAct rejects custom
 `--rank` values so its public name cannot be attached to an unregistered
 capacity.
 
-The main Hetero options are:
+The main InherAct options are:
 
 ```bash
---size large                        # headline Hetero; small is Hetero-Lite
+--size large                        # headline InherAct; small is InherAct-Lite
 --max-calib-batches 16
---hetero-max-features-per-batch 4096
---hetero-second-moment-shrinkage 0.01
---hetero-allocation-scale weighted_uniform
---hetero-expert-noise-scale 0.01
+--inheract-max-features-per-batch 4096
+--inheract-second-moment-shrinkage 0.01
+--inheract-allocation-scale weighted_uniform
+--inheract-expert-noise-scale 0.01
 --aux-loss-weight 0.01
 ```
 
@@ -248,7 +279,7 @@ formal methods or search candidates.
 `--inheritance-diagnostics` logs teacher/inherited task metrics, per-example
 summed output squared error,
 cosine similarity, prediction agreement, and KL before the first optimizer
-step. For Hetero it also logs a four-batch held-out local-operator probe using
+step. For InherAct it also logs a four-batch held-out local-operator probe using
 dense-teacher inputs and a ratio of summed squared errors. Construction
 metadata records the per-layer conditional-expert mean shift and diversity;
 router diagnostics record their evaluation split and batch index.
@@ -270,29 +301,43 @@ Training is deliberately split into two process stages:
    decomposition.
 
 Teacher and inherited parameters are therefore not optimized simultaneously.
-Missing or incompatible artifacts fail rather than silently retraining a
-teacher. The default path is
+A formal launcher first trains its run-scoped teacher, then starts every
+dependent method in a new process with that frozen artifact. A direct dependent
+command requires its requested teacher artifact; it never substitutes or
+co-trains a teacher. The direct-run default path is
 
 ```text
 checkpoints/<dataset>/<pair>/teacher_seed_<seed>.pt
 ```
 
+Formal runs instead write
+
+```text
+checkpoints/formal/<run-id>/<dataset>/<pair>/teacher_seed_<seed>.pt
+```
+
 Checkpoint compatibility is validated against the teacher-training settings
 stored inside the artifact. Target-only optimizer overrides (for example a
-Hetero learning-rate search candidate) do not alter teacher provenance or
+InherAct learning-rate search candidate) do not alter teacher provenance or
 make the frozen checkpoint unloadable. Architecture, dataset, pair, seed,
 model/data profiles, recorded split, and the checkpoint's own training
 integrity metadata remain strict.
 
 Registry-maintenance teachers use `checkpoints/search/...`; HPO selection
-teachers use `checkpoints/search/selection/...` because their training-holdout
-protocol and seeds differ. Checkpoints
-and logs are runtime artifacts and are ignored by Git: the current teachers
-occupy hundreds of MiB and should live in durable experiment/object storage,
-not ordinary source history. `teacher_checkpoints.json` is the small tracked
-manifest of their paths, selected metrics, and semantic provenance. Internal
-integrity fields are used only by checkpoint save/load validation; they are not
-an experimental result or a reporting key. Run
+teachers use `checkpoints/search/selection/...`. These maintenance and HPO
+launchers may snapshot an exact same-seed compatible artifact after matching
+dataset, pair, architecture, registered teacher settings, model/data profiles,
+selection policy, and split protocol. A new formal run deliberately does not
+import these artifacts: it creates a self-contained teacher lineage. Different
+seeds are never substituted. GLUE registry teachers selected directly on
+official validation cannot replace HPO teachers selected on a training
+holdout. Checkpoints and logs are runtime artifacts and are ignored by Git: the
+current teachers occupy hundreds of MiB and should live in durable
+experiment/object storage, not ordinary source history.
+`teacher_checkpoints.json` is the small tracked manifest of registry teacher
+paths, selected metrics, and semantic provenance. Internal integrity fields are
+used only by checkpoint save/load validation; they are not an experimental
+result or a reporting key. Run
 
 ```bash
 python scripts/audit_teachers.py --json > /tmp/teacher_checkpoints.json
@@ -312,7 +357,7 @@ scripts/search.sh teachers oxford_pets resnet34_to_resnet18 --download --num-wor
 The compact-BERT and GLUE dataset revisions are pinned. Checkpoints record
 semantic split provenance. The loader explicitly transfers the BERT
 pretraining encoder into a newly initialized task-classification head and
-tokenizes only the required splits. Hetero calibration uses a fixed seed-2027
+tokenizes only the required splits. InherAct calibration uses a fixed seed-2027
 subset of at most 512 training examples, stratified for classification, rather
 than whichever examples happen to occupy the first batches. Public downloads work without
 authentication; `hf auth login` removes the Hub rate-limit advisory on a fresh
@@ -332,9 +377,12 @@ optimization horizon was weakly justified. The maintained compact-BERT
 protocol now follows Google's architecture-matched setup more closely: four
 epochs, initial LR `5e-5`, 10% step-wise linear warmup followed by linear
 decay, gradient clipping at 1.0, and no AdamW decay on bias or LayerNorm
-parameters. The eight teachers have been regenerated under this protocol;
-dependent GLUE runs must use these regenerated checkpoints rather than
-historical artifacts.
+parameters. The eight registry teachers have been regenerated under this
+protocol. Formal GLUE runs instead use a deterministic 90/10 training holdout
+for epoch selection, restore the selected state, and evaluate the public GLUE
+validation split exactly once as `RUN_FINAL_TEST`. Public GLUE test labels are
+unavailable. The different selection provenance is intentional, so registry
+teachers cannot be reused as formal artifacts.
 
 The paper's GLUE numbers are not targets for this compact track. The paper uses
 T5-Base/T5-Small (222M/60M), AdamW LR `3e-4` for teacher training, weight decay
@@ -351,7 +399,7 @@ scripts/run.sh --dataset cifar100 --pair resnet56_to_resnet20 --method teacher \
   --teacher-checkpoint checkpoints/cifar100/resnet56_to_resnet20/teacher_seed_42.pt \
   --seed 42 --download --device cuda --plot-mode none --search-validation
 
-scripts/run.sh --dataset cifar100 --pair resnet56_to_resnet20 --method hetero \
+scripts/run.sh --dataset cifar100 --pair resnet56_to_resnet20 --method inheract \
   --size large \
   --teacher-checkpoint checkpoints/cifar100/resnet56_to_resnet20/teacher_seed_42.pt \
   --seed 42 --download --device cuda --plot-mode none --search-validation
@@ -366,29 +414,42 @@ the intended experiment matrices.
 
 - `scripts/run.sh` runs one foreground `demo_code.py` command. If no log path is set,
   it creates a unique `logs/run_<UTC timestamp>.log`.
-- `scripts/formal.sh DATASET PAIR` runs teacher, student, student KD, both
-  registered supervised InherNet capacities, and the headline Hetero method.
-  When the selected Hetero recipe uses distillation, it also runs an
-  objective-matched InherNet-Large and a supervised Hetero control. It defaults to seeds
-  `7,17,27,37`, which are disjoint from search and confirmation, CUDA, and a
+- `scripts/formal.sh DATASET PAIR` runs the formal core: teacher, student,
+  student KD, paper-configured InherNet-Small + KD, supervised InherNet-Large,
+  and headline InherAct. CIFAR-100 conditionally adds Logit-Standardized KD,
+  CTKD, DKD, CAT-KD, SimKD, ReviewKD, and CRD only on their registered source
+  pairs; CIFAR-10 adds explicitly labeled CTKD and DKD adaptations. Direct-SVD
+  inheritance is available through the ablation workflow, not the main matrix.
+  When the selected InherAct recipe uses distillation, it also runs an
+  objective- and optimizer-matched InherNet-Large and a supervised InherAct
+  control. It defaults to seeds
+  `7,17,27,37`, which are disjoint from HPO selection, CUDA, and a
   detached `nohup` job. CIFAR formal runs use the fixed training holdout
   for model selection and touch the official test set only after selection.
-  Existing matching teacher artifacts are reused.
+  Formal GLUE similarly selects on a fixed training holdout and reports the
+  public validation split only after restoring the selected epoch.
+  A normal invocation creates a fresh, run-scoped experimental record. Resume
+  is explicit and validates/skips completed cells only within that same run;
+  it is not used to merge in historical formal results.
+- `scripts/formal_all.sh [all|vision|cifar100|glue]` is the safe full-suite
+  entry point. It starts one detached parent and runs target matrices
+  sequentially, avoiding multiple formal jobs contending for one GPU.
 - `scripts/prestudy.sh [oxford_pets|cifar100|all]` performs initialization-only
   diagnostics for the fixed-rank methods and the explicitly named research
   allocators. It never trains or evaluates the held-out final test.
 - `scripts/ablation.sh DATASET PAIR` compares the two InherNet capacities,
-  Hetero-Lite, full Hetero, and Hetero without activation weighting, expert
+  InherAct-Lite, full InherAct, and InherAct without activation weighting, expert
   perturbation, balance loss, both perturbation and balance, or learned routing,
   plus 4- and 8-batch calibration-budget controls against the 16-batch reference.
-  It disables held-out final-test evaluation and writes variant-tagged logs
+  It uses the three paired formal seeds `7,17,27`, their exact formal teacher
+  checkpoints, and validation-only evaluation; it writes variant-tagged logs
   below `logs/ablation/` for paired analysis.
 - `scripts/smoke.sh DATASET PAIR` performs construction and forward checks. It does
   not train on the dataset and is not empirical evidence.
 - `scripts/search.sh PHASE [DATASET PAIR]` is the single hyperparameter-search
   entry point. Supplying a dataset and pair runs one target; omitting both runs
   the prespecified development representatives. `PHASE` is `teachers`,
-  `mechanism`, `optimization`, `distillation`, `confirmation`, or `all`. A global `all` run
+  `mechanism`, `optimization`, `distillation`, or `all`. A global `all` run
   prepares the required development teachers before the search stages.
   Search defaults to distinct seeds `42,123,2026`, CUDA, detached execution, and skipping completed
   candidate logs.
@@ -411,36 +472,148 @@ the adjacent `stdout.log`. The individual structured run logs remain under
 
 `scripts/formal.sh` intentionally rejects optimizer, epoch, rank, size, and method
 hyperparameter overrides: a common override would otherwise change teacher and
-target semantics inconsistently when a teacher artifact is reused. Its Hetero
+target semantics inconsistently when a teacher artifact is reused. Its InherAct
 run resolves the dataset's reviewed row from
-`configs/hetero_selected_recipes.csv`; Hetero-Lite ablations resolve that same
-row. After manual HPO analysis, replace the reviewed profile rows with the
-confirmed recipes. No launcher writes or selects this file automatically.
-Formal evaluation runs exactly one headline Hetero recipe per seed; any
-supervised Hetero control is derived from that same recipe and differs only in
+`configs/inheract_selected_recipes.csv`; InherAct-Lite ablations resolve that same
+row. The reviewed screen-selected profile rows are committed explicitly; no
+launcher writes or selects this file automatically.
+Formal evaluation runs exactly one headline InherAct recipe per seed; any
+supervised InherAct control is derived from that same recipe and differs only in
 the training objective.
+
+The seed sets have distinct roles: HPO selects recipes on `42,123,2026`, formal
+results use the four disjoint seeds `7,17,27,37`, and the expensive component
+ablation uses the paired subset `7,17,27`. Within each matrix, every compared
+method uses the same seed and its matching teacher checkpoint.
 
 Examples:
 
 ```bash
 scripts/formal.sh cifar100 resnet56_to_resnet20 --download --num-workers 4
+scripts/formal_all.sh all --download --num-workers 4
 scripts/prestudy.sh all --num-workers 4
 scripts/ablation.sh cifar100 resnet56_to_resnet20
 scripts/smoke.sh oxford_pets resnet34_to_resnet18 --svd-backend device
 FOREGROUND=1 scripts/formal.sh oxford_pets resnet34_to_resnet18 --download
 ```
 
-`OVERWRITE_TEACHER=1` permits intentional replacement of a formal/search
-teacher artifact. Without it, formal teacher training refuses to overwrite an
-existing artifact; search reuses its dedicated existing teacher. Search skips
-candidate logs that already contain a complete `RUN_SUMMARY` by default. An
-incomplete log is never overwritten and must be inspected before retrying.
+### Completed CIFAR-100 ResNet-56-to-ResNet-20 reference results
+
+The completed reference matrix contains four disjoint final seeds
+(`7,17,27,37`). Values are official-test top-1 accuracy, reported as mean $\pm$
+sample standard deviation. Parameters are measured from the models constructed
+by this repository.
+
+The fresh formal suite retains these core recipes and adds the finalized
+dataset-specific baseline matrix in a new run namespace; it will provide the
+single unified result table for reporting.
+
+| Method | Parameters | Test accuracy (%) |
+|---|---:|---:|
+| Teacher (ResNet-56) | 861,620 | 71.56 $\pm$ 0.44 |
+| Student (ResNet-20) | 278,324 | 68.49 $\pm$ 0.20 |
+| Student + KD | 278,324 | 69.92 $\pm$ 0.58 |
+| Student + DKD | 278,324 | 70.19 $\pm$ 0.15 |
+| InherNet-Small + KD | 205,663 | 47.90 $\pm$ 14.50 |
+| InherNet-Large | 383,507 | 70.74 $\pm$ 0.34 |
+| **InherAct** | **383,507** | **71.87 $\pm$ 0.51** |
+
+InherAct improves over the exactly capacity-matched InherNet-Large in every
+seed by 1.13 points on average, and improves over DKD by 1.68 points. It exceeds
+its paired teacher in three of four seeds and has a 0.31-point higher mean while
+using 44.5% as many parameters. With only four paired trials, the teacher
+comparison is encouraging rather than an established superiority claim; the
+consistent equal-capacity InherNet comparison is the stronger result.
+
+Under their selected formal recipes, InherAct has mean epoch-1 validation
+accuracy 42.34% versus 31.54% for InherNet-Large and reaches 50% validation
+accuracy in 4.25 versus 26.5 epochs on average. This is useful evidence of
+faster early adaptation, but not a controlled rate-of-convergence result:
+InherAct uses its HPO-selected learning rate 0.025, while frozen InherNet uses
+0.05.
+
+The mechanism gives a precise local optimization prediction. At InherAct's
+uniform initialization, the zero-sum lift preserves the inherited mean map
+while adding router directions with derivative $H^{-1}E_jz$. Relative to the
+function-equivalent activation-aware base, its tangent kernel gains the
+positive-semidefinite term
+$K_{\mathrm{gate}}=J_{\mathrm{gate}}J_{\mathrm{gate}}^\top$. The added
+first-order descent is $r^\top K_{\mathrm{gate}}r$ for squared
+teacher-matching residual $r$, so residual-aligned conditional directions give
+a testable route to faster local adaptation. Original InherNet has zero gate
+derivative initially because its experts are duplicated, although its random
+gate probabilities can separate their factor gradients after the first update;
+InherAct makes this conditional tangent accessible immediately.
+
+A causal convergence study will pair the activation-aware base ($E_h=0$) with
+InherAct at the selected lift scale 0.005, fixing teacher, calibration data,
+split, seed, rank, objective, optimizer, learning rate, and schedule. It will
+record the actual objective by update, router-gradient RMS, gate-kernel trace,
+residual-aligned kernel energy, and early validation accuracy. The complete
+derivation, existing three-tier evidence, and matched protocol are given in
+`ideas/summary_academic.md`.
+
+The InherNet-Small KD row is technically complete but unstable: its four test
+values are 50.47, 54.21, 59.95, and 26.95. The factorization is correct under
+the maintained shared-down, normalized-softmax implementation: every checked
+factorized layer reconstructs its rank-truncated SVD to relative error at most
+`1.27e-7`. Rather, rank 8 is a materially more aggressive construction than
+rank 16—it factorizes all 57 convolutional layers rather than 37 and retains
+substantially less spectral energy in the deeper stages. Its paper-style
+`0.1 CE + 36 KL` objective is also much stiffer than Large's supervised loss,
+and the traces contain transient collapses around the learning-rate schedule.
+It is therefore retained as a paper-configured aggressive-compression baseline,
+not the headline InherNet comparison. The result is a reproducibility gap and
+an informative low-rank-sensitivity observation, not evidence of a detected
+implementation defect.
+
+### Complete main-experiment commands
+
+Activate the maintained environment and run the full suite sequentially on one
+GPU with:
+
+```bash
+cd /root/nas/mingjing/InherNet-Demo
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate inherdemo
+scripts/formal_all.sh all --download --num-workers 4
+```
+
+This covers the CIFAR-10 pair, all eight CIFAR-100 pairs, Oxford Pets, and all
+eight compact-BERT GLUE tasks. By default it starts a new, self-contained
+formal run; it does not silently reuse or skip historical formal results. The
+fresh suite contains 158 one-seed cells and 632 runs over four seeds: 8 for
+CIFAR-10, 92 for CIFAR-100, 8 for Oxford Pets, and 50 for GLUE per seed. The
+larger CIFAR-100 count primarily reflects eight architecture pairs versus one
+CIFAR-10 pair, plus source-backed pair-specific distillers; it is not 92
+different baselines on one model pair. These
+are the full planned counts, not a count remaining after an earlier run.
+Selective groups and representative single targets are:
+
+```bash
+scripts/formal_all.sh vision --download --num-workers 4
+scripts/formal_all.sh cifar100 --download --num-workers 4
+scripts/formal_all.sh glue --num-workers 4
+scripts/formal.sh oxford_pets resnet34_to_resnet18 --download --num-workers 4
+scripts/formal.sh glue_sst2 bert4_to_bert2 --num-workers 4
+```
+
+Do not paste all 18 individual `formal.sh` commands at once: each detaches by
+default and they would contend for the same GPU. `formal_all.sh` keeps all inner
+targets sequential.
+
+Use `RESUME=1 FORMAL_RUN_ID=<run-id>` only to validate and skip completed cells
+in that exact namespace. A partially written cell is deliberately not
+overwritten or resumed from an epoch; move that incomplete log aside before
+rerunning the cell. Search keeps its separate resume and teacher-reuse policy:
+completed candidate logs are skipped by default, while incomplete logs are
+never overwritten.
 
 ## Initialization Pre-Study
 
 The pre-study is a mechanism diagnostic, not hyperparameter search. It uses an
 existing seed-matched teacher and stops before optimizer construction. Its
-default maintained scope compares registered-rank InherNet with three Hetero
+default maintained scope compares registered-rank InherNet with three InherAct
 cells on Oxford Pets and CIFAR-100: weight-only decomposition, the
 activation-aware registered-rank base, and the base plus its fixed zero-mean
 conditional lift. The failed `research_*` rank-allocation controls run only
@@ -478,7 +651,7 @@ finding for the motivation or appendix. Because these are single-seed,
 zero-step diagnostics, the plots show exact observations and layerwise dots
 rather than statistical error bars.
 The `research_*` allocators are rejected controls, not HPO candidates or
-competing Hetero solutions.
+competing InherAct solutions.
 
 ## Full-Epoch Hyperparameter Search
 
@@ -487,9 +660,9 @@ rejects epoch overrides. This is slower than low-fidelity screening but avoids
 changing the learning-rate schedule or selecting candidates from a different
 training horizon.
 
-Search is exclusively for Hetero (`hetero --size large`). InherNet retains its
-registered/paper settings as a formal baseline; Hetero-Lite receives the final
-Hetero-selected recipe without separate tuning and is reported as a capacity
+Search is exclusively for InherAct (`inheract --size large`). InherNet retains its
+registered/paper settings as a formal baseline; InherAct-Lite receives the final
+InherAct-selected recipe without separate tuning and is reported as a capacity
 ablation. Search sets `--no-final-test` and selects only on validation:
 
 - CIFAR automatically uses a fixed, class-stratified 90/10 holdout from the
@@ -509,7 +682,7 @@ The search is deliberately shared rather than pair-specific:
   STS-B. Every row uses `weighted_uniform`, explicitly fixes `lr_scale=1.0`,
   and uses the objective registered for its dataset profile; rank policy is not
   searched.
-- `optimization` evaluates LR scales `0.5, 1, 2` for Hetero on the same
+- `optimization` evaluates LR scales `0.5, 1, 2` for InherAct on the same
   five targets, with the complete non-searched mechanism passed explicitly from
   the registered reference and the profile-registered objective passed
   explicitly.
@@ -521,25 +694,42 @@ The search is deliberately shared rather than pair-specific:
   KD-plus-label coefficient sum, reducing a trivial coefficient-scaling confound.
   The complete registered mechanism and reference `lr_scale=1.0` are likewise
   passed explicitly to every distillation candidate; only the objective fields
-  change. Static reference fields are read from the committed confirmation
-  registry rather than post-HPO selected recipes, and each controlled argument
-  occurs exactly once in every generated Hetero command.
+  change. Static reference fields are read from the committed
+  `configs/inheract_reference_recipes.csv` registry rather than screen-selected
+  recipes, and each controlled argument
+  occurs exactly once in every generated InherAct command.
 
 Across three distinct seeds this produces 135 mechanism, 45 optimization, and
-69 distillation runs: **249 full-epoch Hetero runs**. The five targets
+69 distillation runs: **249 full-epoch InherAct runs**. The five targets
 cover scratch vision, supervised inheritance, transfer vision, text
 classification, and regression; the remaining architectures/tasks are held
 out for transfer tests.
-The stages are independent sensitivity screens; the launcher does not select,
-propagate, or combine winners. Analyze the complete logs after all runs finish,
-then test manually assembled complete recipes jointly before freezing the
-formal configuration. InherNet is not assigned Hetero-selected settings.
-Auxiliary-loss weights are absolute coefficients, while the scale of the base
-objective differs across transfer profiles. Interpret that screen within each
-profile and confirm complete recipes per profile; a globally averaged auxiliary
-weight is not evidence of a universally optimal trade-off.
-The `all` phase deliberately excludes `confirmation` because its finalist rows
-must be written manually after inspecting the three screens.
+The stages are independent sensitivity screens. Their completed results support
+a compact profile-specific default recipe under this lightweight selection
+protocol, rather than a joint factorial search. The launcher never propagates
+screen winners; reviewed rows are committed manually. InherNet is not assigned
+InherAct-selected settings. Auxiliary-loss weights are absolute coefficients,
+so the screen is interpreted within each transfer profile rather than by a
+global raw-loss average.
+
+The manually committed `screen_selected` rows in
+`configs/inheract_selected_recipes.csv` use the globally strongest shared
+mechanism setting (auxiliary weight `0.01`, second-moment shrinkage `0.01`,
+expert-noise scale `0.005`, and `weighted_uniform` allocation), then apply the
+screen-selected optimization/objective settings below.
+
+| Profile | LR scale | Objective |
+|---|---:|---|
+| CIFAR-10 | 0.5 | supervised |
+| CIFAR-100 | 0.5 | supervised |
+| Oxford Pets | 1.0 | distillation, temperature 2, KD fraction 0.50 |
+| GLUE classification | 2.0 | supervised |
+| GLUE regression | 2.0 | distillation, temperature 2, KD fraction 0.25 |
+
+The five fixed screen controls remain in
+`configs/inheract_reference_recipes.csv`, so each screen remains reproducible
+without reading settings selected by a preceding stage. Formal multi-seed
+experiments are the independent validation of the chosen defaults.
 
 Search outputs are stored under
 
@@ -552,7 +742,10 @@ Search teachers are kept separately under
 silently replace a formal teacher. `scripts/summarize_search.py` writes
 `summary.csv` with candidate identity, size, reference InherNet rank and
 parameter count, primary metric, all registered metrics at the primary-selected
-epoch, epoch count, achieved diagnostic ratios, and actual parameter count.
+epoch, epoch count, achieved diagnostic ratios, and actual parameter count. For
+formal runs, it also indexes the held-out final-test split, selection epoch,
+primary metric, and full final-test metric payload; search and ablation rows
+leave those fields empty by design.
 `scripts/rank_search.py` aggregates candidates by
 within-target validation rank so accuracy, MCC, and correlation are never
 averaged on incompatible raw scales.
@@ -590,7 +783,7 @@ python scripts/rank_search.py logs/search/selection --stage distillation \
 The following starts the complete development search sequentially on the first
 visible GPU. The launcher selects the repository's `inherdemo` Python,
 trains/reuses the required seed-matched teachers, then runs the mechanism,
-optimization, and distillation families for Hetero. The built-in detached launcher leaves
+optimization, and distillation families for InherAct. The built-in detached launcher leaves
 a console log and PID under `logs/jobs/`:
 
 ```bash
@@ -602,12 +795,16 @@ scripts/search.sh all --download --num-workers 4
 post-hoc and manual; the launcher never rewrites later commands from an earlier
 result. Here `all` means all 249 runs in the prespecified shared-development
 screen, not separate tuning of all 18 registered teacher/model pairs.
+The completed 249-run matrix remains valid after this name-only migration and
+does not need to be rerun. The command above remains the standard entry point
+for a fresh checkout or for resuming an incomplete screen.
 `--download` permits missing torchvision datasets to be downloaded,
-and `--num-workers 4` uses four data-loader worker processes. Optional overrides
+and `--num-workers 4` uses four training-data worker processes; deterministic
+evaluation and calibration use the training process. Optional overrides
 include `SEARCH_SEEDS=42`, `CUDA_VISIBLE_DEVICES=1`, `DEVICE=cpu`, and
 `FOREGROUND=1`; none is required for the normal run.
 
-On the current A6000, one-epoch Hetero pilots took 53.5 seconds for
+On the current A6000, one-epoch InherAct pilots took 53.5 seconds for
 CIFAR-10 and 34.1 seconds for CIFAR-100; extrapolating their full 200/240-epoch
 runs gives approximately 3.0 and 2.3 hours before setup. Runtime for the
 complete 249-run screen depends strongly on modality, cache state, and missing
@@ -621,27 +818,22 @@ each size would make comparisons optimistic. Full epochs improve search
 fidelity, but do not replace independent seeds or held-out final evaluation.
 
 Repeating one deterministic seed is not an independent trial. Seeds 42, 123,
-and 2026 form the multi-seed selection set. After analysis, add complete
-finalist recipes beside the committed `weighted_uniform` reference in
-`configs/hetero_confirmation_candidates.csv`. Each candidate must provide one
-complete row for `cifar10`, `cifar100`, `oxford_pets`,
-`glue_classification`, and `glue_regression`. Evaluate those profiles jointly
-on confirmation seed 3407. The launcher never writes this file or chooses
-finalists:
+and 2026 form the multi-seed selection set. The completed screen has already
+selected and committed the five `screen_selected` profile rows; no extra
+hold-out seed is required for this lightweight protocol. Review the
+three completed stage summaries with:
 
 ```bash
-SEARCH_SEEDS=3407 scripts/search.sh teachers --download
-SEARCH_SEEDS=3407 scripts/search.sh confirmation --download
-
 python scripts/rank_search.py logs/search/selection --stage mechanism \
   --seed 42 --seed 123 --seed 2026
-python scripts/rank_search.py logs/search/selection --stage confirmation --seed 3407
+python scripts/rank_search.py logs/search/selection --stage optimization \
+  --dataset oxford_pets --seed 42 --seed 123 --seed 2026
+python scripts/rank_search.py logs/search/selection --stage distillation \
+  --dataset glue_stsb --seed 42 --seed 123 --seed 2026
 ```
 
-After choosing a finalist manually, copy its five reviewed profile rows to
-`configs/hetero_selected_recipes.csv`. Formal evaluation then uses the disjoint
-seeds `7,17,27,37`. The selection and confirmation logs are evidence for model
-choice, not part of the headline final-seed mean.
+Formal evaluation uses the disjoint seeds `7,17,27,37`. The selection logs are
+evidence for model choice, not part of the headline final-seed mean.
 
 ### Search and ablation figures
 
@@ -650,9 +842,9 @@ completed structured logs. Search plots show every within-cell normalized rank
 and its mean: the ranking cell is dataset, pair, method, size, and seed. Thus
 accuracy, Matthews correlation, and Pearson correlation are never averaged as
 raw values. The script requires the complete prespecified search matrix and
-labels each candidate's coverage. Ablation plots pair each Hetero
-component variant with full Hetero for the same dataset, pair, size, and seed;
-they show validation-metric point changes separately by target. Hetero-Lite and
+labels each candidate's coverage. Ablation plots pair each InherAct
+component variant with full InherAct for the same dataset, pair, size, and seed;
+they show validation-metric point changes separately by target. InherAct-Lite and
 the two InherNet capacities are capacity references rather than paired
 component removals. Thin ranges show observed minima and maxima, not confidence
 intervals.
@@ -674,9 +866,9 @@ python scripts/plot_experiments.py search logs/search/selection \
   --stage optimization --dataset oxford_pets \
   --output results/paper/search_optimization_oxford.png
 
-SEED=42 scripts/ablation.sh cifar100 resnet56_to_resnet20
+scripts/ablation.sh cifar100 resnet56_to_resnet20
 python scripts/plot_experiments.py ablation logs/ablation \
-  --dataset cifar100 --seed 42 \
+  --dataset cifar100 --seed 7 --seed 17 --seed 27 \
   --output results/paper/ablation_cifar100.png
 ```
 
@@ -731,7 +923,7 @@ Each structured run log contains:
   compression data.
 - `RUN_METRICS`: training objective/loss and task metrics plus evaluation
   metrics and timing for every epoch. Distillation runs also record KD and
-  router auxiliary-loss components; supervised Hetero records its auxiliary
+  router auxiliary-loss components; supervised InherAct records its auxiliary
   component when enabled.
 - `INHERITANCE_DIAGNOSTICS`: optional teacher-relative measurements made before
   the first optimizer update.
@@ -760,13 +952,14 @@ pip install -r requirements.txt
 python -m py_compile demo_code.py experiment_registry.py training_utils.py \
   checkpointing.py plotting_utils.py cifar10_models.py cifar100_models.py \
   pet_models.py glue_models.py glue_data.py model_wrappers.py \
+  vision_distillation.py contrastive_distillation.py \
   scripts/audit_teachers.py scripts/summarize_search.py \
   scripts/rank_search.py scripts/plot_experiments.py scripts/summarize_prestudy.py \
   scripts/plot_prestudy_progression.py scripts/plot_prestudy_router_activity.py \
   scripts/plot_prestudy_allocation.py scripts/plot_prestudy_local_operator.py \
   tests/test_registry_and_wrappers.py tests/test_plot_experiments.py
 python -m unittest discover -s tests -t .
-bash -n scripts/run.sh scripts/formal.sh scripts/prestudy.sh scripts/ablation.sh scripts/smoke.sh \
+bash -n scripts/run.sh scripts/formal.sh scripts/formal_all.sh scripts/prestudy.sh scripts/ablation.sh scripts/smoke.sh \
   scripts/search.sh scripts/train_teachers.sh scripts/common.sh
 scripts/smoke.sh cifar100 resnet56_to_resnet20 --svd-backend device
 scripts/smoke.sh oxford_pets resnet34_to_resnet18 --svd-backend device
@@ -778,12 +971,14 @@ scripts/smoke.sh glue_sst2 bert4_to_bert2 --svd-backend device
 - `demo_code.py`: maintained CLI and experiment orchestration.
 - `checkpointing.py`: atomic, validated teacher artifact persistence.
 - `experiment_registry.py`: datasets, pairs, splits, defaults, and run tags.
-- `model_wrappers.py`: InherNet and Hetero factorization/routing modules.
+- `model_wrappers.py`: InherNet and InherAct factorization/routing modules.
 - `training_utils.py`: supervised/KD loops, metrics, logging, and checks.
+- `vision_distillation.py`, `contrastive_distillation.py`: source-scoped
+  vision distillers and their training-only or retained auxiliary modules.
 - `cifar10_models.py`, `cifar100_models.py`, `pet_models.py`,
   `glue_models.py`: model registries.
 - `glue_data.py`: GLUE tokenization and dataloaders.
-- `scripts/run.sh`, `scripts/formal.sh`, `scripts/prestudy.sh`, `scripts/ablation.sh`,
+- `scripts/run.sh`, `scripts/formal.sh`, `scripts/formal_all.sh`, `scripts/prestudy.sh`, `scripts/ablation.sh`,
   `scripts/smoke.sh`, `scripts/search.sh`, `scripts/train_teachers.sh`: launchers
   grouped by purpose.
 - `configs/`: committed search candidate tables.
@@ -812,15 +1007,18 @@ itself. A strong submission still requires:
 
 - multi-seed means, standard deviations or confidence intervals, and a
   prespecified model-selection protocol;
-- teacher, compact student, student KD, fixed-rank InherNet, and
-  competitive contemporary compression/inheritance baselines;
+- teacher, compact student, student KD, fixed-rank InherNet, InherAct, and
+  competitive contemporary compression/inheritance baselines where published
+  implementations cover the target; use Direct-SVD as a mechanism ablation;
 - results across multiple CIFAR-100 architecture families plus the Oxford and
   GLUE extensions, without treating alias pairs as independent evidence;
 - parameter, FLOP, measured latency, throughput, peak-memory, decomposition,
   and training-cost comparisons on declared hardware;
 - ablations for activation weighting, conditional routing, load balancing,
   calibration size, shrinkage, expert perturbation, and objective;
-- sensitivity and failure analysis, including the diagnostic heterogeneous-rank
+- a matched-optimizer, multi-seed early-adaptation study that records router
+  gradients and teacher-matching loss before making a rate-of-convergence claim;
+- sensitivity and failure analysis, including the diagnostic layer-varying rank
   policies and the gap between local reconstruction error and downstream quality;
 - strictly validation-only tuning and untouched final-test evaluation.
 
@@ -843,7 +1041,7 @@ the claimed method.
 
 ## Citation
 
-The Hetero citation will be added if a paper is released. Cite the
+The InherAct citation will be added if a paper is released. Cite the
 InherNet baseline as:
 
 ```bibtex

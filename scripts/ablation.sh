@@ -1,40 +1,57 @@
 #!/usr/bin/env bash
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/common.sh"
-if maybe_launch_background ablation "$@"; then exit 0; fi
+original_args=("$@")
 require_dataset_pair "$@"
 
 dataset="$1"
 pair="$2"
 shift 2
-seed="${SEED:-42}"
-selection_checkpoint="$PROJECT_DIR/checkpoints/search/selection/$dataset/$pair/teacher_seed_${seed}.pt"
-checkpoint="${TEACHER_CHECKPOINT:-$selection_checkpoint}"
-if [[ ! -f "$checkpoint" && "${DRY_RUN:-0}" != "1" ]]; then
-    echo "Missing teacher checkpoint: $checkpoint" >&2
-    echo "Run SEARCH_SEEDS=$seed scripts/search.sh teachers $dataset $pair first." >&2
-    exit 1
-fi
 extra=("$@")
 reject_identity_overrides "${extra[@]}"
 reject_formal_training_overrides "${extra[@]}"
 export RESUME="${RESUME:-1}"
-load_hetero_recipe "$dataset"
-hetero_recipe_id="${HETERO_RECIPE_ARGS[1]}"
-common=(--dataset "$dataset" --pair "$pair" --seed "$seed" --device "${DEVICE:-cuda}" --plot-mode none \
-    --teacher-checkpoint "$checkpoint" --no-final-test "${extra[@]}")
-if [[ "$dataset" == "cifar10" || "$dataset" == "cifar100" || "$dataset" == glue_* ]]; then
-    common+=(--search-validation)
-fi
+load_inheract_recipe "$dataset"
+inheract_recipe_id="${INHERACT_RECIPE_ARGS[1]}"
+mapfile -t INHERACT_OBJECTIVE_ARGS < <(
+    "$PYTHON_BIN" "$PROJECT_DIR/scripts/inheract_recipes.py" selected-objective "$dataset"
+)
+mapfile -t INHERACT_OPTIMIZER_ARGS < <(
+    "$PYTHON_BIN" "$PROJECT_DIR/scripts/inheract_recipes.py" selected-optimizer "$dataset"
+)
 
-log_root="$PROJECT_DIR/logs/ablation/$dataset/$pair/seed_${seed}/recipe_${hetero_recipe_id}"
+IFS=',' read -r -a ablation_seeds <<<"${ABLATION_SEEDS:-7,17,27}"
+if ((${#ablation_seeds[@]} == 0)); then
+    echo "ABLATION_SEEDS must contain at least one non-negative integer." >&2
+    exit 2
+fi
+declare -A seen_seeds=()
+for seed in "${ablation_seeds[@]}"; do
+    if [[ ! "$seed" =~ ^[0-9]+$ || -n "${seen_seeds[$seed]:-}" ]]; then
+        echo "ABLATION_SEEDS must contain distinct non-negative integers: ${ABLATION_SEEDS:-7,17,27}" >&2
+        exit 2
+    fi
+    seen_seeds[$seed]=1
+done
+if [[ -n "${TEACHER_CHECKPOINT:-}" && ${#ablation_seeds[@]} -ne 1 ]]; then
+    echo "TEACHER_CHECKPOINT requires exactly one ABLATION_SEEDS value." >&2
+    echo "The paired default matrix uses its seed-matched FORMAL_RUN_ID teacher artifacts." >&2
+    exit 2
+fi
+if [[ -z "${FORMAL_RUN_ID:-}" ]]; then
+    echo "Ablations require FORMAL_RUN_ID=<completed formal run namespace>." >&2
+    echo "Use the same identifier that produced the paired formal teacher checkpoints." >&2
+    exit 2
+fi
+validate_formal_run_id "$FORMAL_RUN_ID"
+if maybe_launch_background ablation "${original_args[@]}"; then exit 0; fi
+
 run_ablation_case() {
     local label="$1" size="$2" variant="$3"
     shift 3
     local log_path="$log_root/size_${size}/${variant}.log"
     local -a command=("${common[@]}" --size "$size" \
         --search-candidate "ablation_${variant}" "$@")
-    mkdir -p "$(dirname "$log_path")"
     if [[ -f "$log_path" ]]; then
         if [[ "${RESUME:-0}" == "1" ]] && rg -q '^RUN_SUMMARY ' "$log_path"; then
             "$PYTHON_BIN" "$PROJECT_DIR/scripts/validate_completed_log.py" "$log_path" -- \
@@ -45,13 +62,16 @@ run_ablation_case() {
         echo "Ablation log already exists: $log_path (set RESUME=1 to skip completed runs)" >&2
         exit 1
     fi
+    if [[ "${DRY_RUN:-0}" != "1" ]]; then
+        mkdir -p "$(dirname "$log_path")"
+    fi
     INHERNET_RUN_LOG="$log_path" run_case "$label" "${command[@]}"
 }
 
 resolve_ablation_recipe() {
     local variant="$1"
     shift
-    local -a resolved=("${HETERO_RECIPE_ARGS[@]}") filtered=()
+    local -a resolved=("${INHERACT_RECIPE_ARGS[@]}") filtered=()
     local option value argument index
     while (($# > 0)); do
         option="$1"
@@ -80,49 +100,88 @@ resolve_ablation_recipe() {
     filtered=()
     for ((index=0; index<${#resolved[@]}; index++)); do
         argument="${resolved[$index]}"
-        if [[ "$argument" == "--hetero-recipe-id" ]]; then
+        if [[ "$argument" == "--inheract-recipe-id" ]]; then
             ((index+=1))
         else
             filtered+=("$argument")
         fi
     done
-    ABLATION_RECIPE_ARGS=("${filtered[@]}" --hetero-recipe-id "${hetero_recipe_id}_${variant}")
+    ABLATION_RECIPE_ARGS=("${filtered[@]}" --inheract-recipe-id "${inheract_recipe_id}_${variant}")
 }
 
-for size in small large; do
-    run_ablation_case "InherNet size=$size" "$size" "inhernet_${size}" \
-        --method inhernet --compressed-train-mode supervised
+run_seed_matrix() {
+    local size inhernet_train_mode
+    for size in small large; do
+        if [[ "$size" == "small" ]]; then
+            inhernet_train_mode=distillation
+        else
+            inhernet_train_mode=supervised
+        fi
+        run_ablation_case "InherNet size=$size" "$size" "inhernet_${size}" \
+            --method inhernet --compressed-train-mode "$inhernet_train_mode"
+    done
+
+    # One head makes the softmax exactly one: a static rank-r SVD inheritance
+    # control at the headline rank, with the selected InherAct objective/step scale.
+    run_ablation_case "Direct SVD inheritance control (one head)" large direct_svd \
+        --method inhernet --head-num 1 \
+        "${INHERACT_OPTIMIZER_ARGS[@]}" "${INHERACT_OBJECTIVE_ARGS[@]}"
+
+    resolve_ablation_recipe full
+    run_ablation_case "InherAct-Lite capacity control" small inheract_lite \
+        --method inheract "${ABLATION_RECIPE_ARGS[@]}"
+    run_ablation_case "InherAct full" large full \
+        --method inheract "${ABLATION_RECIPE_ARGS[@]}"
+
+    resolve_ablation_recipe calibration_4_batches --max-calib-batches 4
+    run_ablation_case "InherAct with 4 calibration batches" large calibration_4_batches \
+        --method inheract "${ABLATION_RECIPE_ARGS[@]}"
+    resolve_ablation_recipe calibration_8_batches --max-calib-batches 8
+    run_ablation_case "InherAct with 8 calibration batches" large calibration_8_batches \
+        --method inheract "${ABLATION_RECIPE_ARGS[@]}"
+
+    resolve_ablation_recipe unweighted_uniform --inheract-allocation-scale unweighted_uniform
+    run_ablation_case "InherAct without activation weighting" large unweighted_uniform \
+        --method inheract "${ABLATION_RECIPE_ARGS[@]}"
+    resolve_ablation_recipe no_noise --inheract-expert-noise-scale 0
+    run_ablation_case "InherAct without expert perturbation" large no_noise \
+        --method inheract "${ABLATION_RECIPE_ARGS[@]}"
+    resolve_ablation_recipe no_balance --aux-loss-weight 0
+    run_ablation_case "InherAct without balance loss" large no_balance \
+        --method inheract "${ABLATION_RECIPE_ARGS[@]}"
+    resolve_ablation_recipe no_noise_no_balance \
+        --inheract-expert-noise-scale 0 --aux-loss-weight 0
+    run_ablation_case "InherAct without expert perturbation or balance" large no_noise_no_balance \
+        --method inheract "${ABLATION_RECIPE_ARGS[@]}"
+    resolve_ablation_recipe frozen_router --freeze-inheract-router __FLAG__
+    run_ablation_case "InherAct with fixed uniform routers" large frozen_router \
+        --method inheract "${ABLATION_RECIPE_ARGS[@]}"
+}
+
+for seed in "${ablation_seeds[@]}"; do
+    checkpoint="${TEACHER_CHECKPOINT:-$(formal_checkpoint_for "$FORMAL_RUN_ID" "$dataset" "$pair" "$seed")}"
+    if [[ ! -f "$checkpoint" && "${DRY_RUN:-0}" != "1" ]]; then
+        echo "Missing formal teacher checkpoint: $checkpoint" >&2
+        echo "Run FORMAL_RUN_ID=$FORMAL_RUN_ID scripts/formal.sh $dataset $pair first." >&2
+        exit 1
+    fi
+    ablation_search_validation=0
+    if [[ "$dataset" == "cifar10" || "$dataset" == "cifar100" || "$dataset" == glue_* ]]; then
+        ablation_search_validation=1
+    fi
+    if [[ "${DRY_RUN:-0}" != "1" ]]; then
+        validate_compatible_teacher_checkpoint \
+            "$checkpoint" "$dataset" "$pair" "$seed" "$ablation_search_validation"
+    fi
+    common=(--dataset "$dataset" --pair "$pair" --seed "$seed" --device "${DEVICE:-cuda}" --plot-mode none \
+        --teacher-checkpoint "$checkpoint" --no-final-test "${extra[@]}")
+    if [[ "$ablation_search_validation" == "1" ]]; then
+        common+=(--search-validation)
+    fi
+    log_root="$PROJECT_DIR/logs/ablation/$FORMAL_RUN_ID/$dataset/$pair/seed_${seed}/recipe_${inheract_recipe_id}"
+    run_seed_matrix
+    if [[ "${DRY_RUN:-0}" != "1" ]]; then
+        "$PYTHON_BIN" "$PROJECT_DIR/scripts/summarize_search.py" \
+            "$log_root" --output "$log_root/summary.csv"
+    fi
 done
-
-resolve_ablation_recipe full
-run_ablation_case "Hetero-Lite capacity control" small hetero_lite \
-    --method hetero "${ABLATION_RECIPE_ARGS[@]}"
-run_ablation_case "Hetero full" large full \
-    --method hetero "${ABLATION_RECIPE_ARGS[@]}"
-
-resolve_ablation_recipe calibration_4_batches --max-calib-batches 4
-run_ablation_case "Hetero with 4 calibration batches" large calibration_4_batches \
-    --method hetero "${ABLATION_RECIPE_ARGS[@]}"
-resolve_ablation_recipe calibration_8_batches --max-calib-batches 8
-run_ablation_case "Hetero with 8 calibration batches" large calibration_8_batches \
-    --method hetero "${ABLATION_RECIPE_ARGS[@]}"
-
-resolve_ablation_recipe unweighted_uniform --hetero-allocation-scale unweighted_uniform
-run_ablation_case "Hetero without activation weighting" large unweighted_uniform \
-    --method hetero "${ABLATION_RECIPE_ARGS[@]}"
-resolve_ablation_recipe no_noise --hetero-expert-noise-scale 0
-run_ablation_case "Hetero without expert perturbation" large no_noise \
-    --method hetero "${ABLATION_RECIPE_ARGS[@]}"
-resolve_ablation_recipe no_balance --aux-loss-weight 0
-run_ablation_case "Hetero without balance loss" large no_balance \
-    --method hetero "${ABLATION_RECIPE_ARGS[@]}"
-resolve_ablation_recipe no_noise_no_balance \
-    --hetero-expert-noise-scale 0 --aux-loss-weight 0
-run_ablation_case "Hetero without expert perturbation or balance" large no_noise_no_balance \
-    --method hetero "${ABLATION_RECIPE_ARGS[@]}"
-resolve_ablation_recipe frozen_router --freeze-hetero-router __FLAG__
-run_ablation_case "Hetero with fixed uniform routers" large frozen_router \
-    --method hetero "${ABLATION_RECIPE_ARGS[@]}"
-
-[[ "${DRY_RUN:-0}" == "1" ]] || "$PYTHON_BIN" "$PROJECT_DIR/scripts/summarize_search.py" \
-    "$log_root" --output "$log_root/summary.csv"

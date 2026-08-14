@@ -18,7 +18,7 @@ from plot_experiments import (
     prepare_ablation_deltas,
     prepare_search_scores,
 )
-from plotting_utils import build_plot_label
+from plotting_utils import build_plot_label, get_plot_method_key, get_plot_style
 
 
 def search_row(
@@ -28,7 +28,7 @@ def search_row(
         "stage": "mechanism",
         "dataset": dataset,
         "pair": "pair",
-        "method": "hetero",
+        "method": "inheract",
         "size": "small",
         "seed": 42,
         "candidate": candidate,
@@ -44,7 +44,7 @@ def ablation_row(
         "stage": "ablation",
         "dataset": "toy",
         "pair": "teacher_to_student",
-        "method": "inhernet" if candidate == "ablation_inhernet" else "hetero",
+        "method": "inhernet" if candidate == "ablation_inhernet" else "inheract",
         "size": size,
         "seed": seed,
         "candidate": candidate,
@@ -54,11 +54,69 @@ def ablation_row(
 
 
 class ExperimentFigureTests(unittest.TestCase):
-    def test_public_hetero_capacity_names_preserve_internal_sizes(self) -> None:
-        self.assertEqual(build_plot_label("hetero", {"size": "large"}, detailed=False), "Hetero")
+    def test_published_cifar100_kd_variants_have_distinct_public_plot_labels(self) -> None:
         self.assertEqual(
-            build_plot_label("hetero", {"size": "small"}, detailed=False),
-            "Hetero-Lite",
+            build_plot_label("student_kd_logit_standardized", {}, detailed=False),
+            "Student + Logit Std. KD",
+        )
+        self.assertEqual(
+            build_plot_label("student_dkd", {}, detailed=False),
+            "Student + DKD",
+        )
+        self.assertNotEqual(
+            get_plot_style("student_kd_logit_standardized"),
+            get_plot_style("student_kd"),
+        )
+        expected = {
+            "student_ctkd": "Student + CTKD",
+            "student_catkd": "Student + CAT-KD",
+            "student_simkd": "Student + SimKD",
+            "student_reviewkd": "Student + ReviewKD",
+            "student_crd": "Student + CRD",
+        }
+        for method, label in expected.items():
+            self.assertEqual(build_plot_label(method, {}, detailed=False), label)
+
+    def test_inhernet_labels_expose_the_registered_objective(self) -> None:
+        self.assertEqual(
+            build_plot_label(
+                "inhernet",
+                {"size": "small", "compressed_train_mode": "distillation"},
+                detailed=False,
+            ),
+            "InherNet-S + KD",
+        )
+        self.assertEqual(
+            build_plot_label(
+                "inhernet",
+                {"size": "large", "compressed_train_mode": "supervised"},
+                detailed=False,
+            ),
+            "InherNet-L (supervised)",
+        )
+
+    def test_public_inheract_capacity_names_preserve_internal_sizes(self) -> None:
+        self.assertEqual(build_plot_label("inheract", {"size": "large"}, detailed=False), "InherAct")
+        self.assertEqual(
+            build_plot_label("inheract", {"size": "small"}, detailed=False),
+            "InherAct-Lite",
+        )
+
+    def test_direct_svd_reference_has_a_distinct_public_plot_label(self) -> None:
+        metadata = {
+            "size": "large",
+            "rank": 16,
+            "head_num": 1,
+            "search_candidate": "ablation_direct_svd",
+        }
+        self.assertEqual(get_plot_method_key("inhernet", metadata), "direct_svd_inheritance")
+        self.assertEqual(
+            build_plot_label("inhernet", metadata, detailed=False),
+            "Direct SVD inheritance",
+        )
+        self.assertEqual(
+            build_plot_label("inhernet", metadata, detailed=True),
+            "Direct SVD inheritance - rank 16, one head",
         )
 
     def test_search_uses_within_cell_ranks_across_incompatible_metrics(self) -> None:
@@ -78,7 +136,7 @@ class ExperimentFigureTests(unittest.TestCase):
             plot_search_scores(scores, stage="mechanism", output=output)
             self.assertTrue(output.read_bytes().startswith(b"\x89PNG"))
 
-    def test_ablation_is_paired_with_full_hetero_by_size_and_seed(self) -> None:
+    def test_ablation_is_paired_with_full_inheract_by_size_and_seed(self) -> None:
         rows = [
             ablation_row(candidate="ablation_full", metric=80.0, size="small"),
             ablation_row(candidate="ablation_no_noise", metric=78.5, size="small"),

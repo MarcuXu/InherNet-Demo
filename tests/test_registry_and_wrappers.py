@@ -10,6 +10,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -24,12 +25,14 @@ from demo_code import (
     semantic_split_metadata,
     teacher_training_split_metadata,
 )
+from glue_data import build_glue_dataloaders
 from checkpointing import (
     load_teacher_checkpoint,
     save_teacher_checkpoint,
     teacher_training_fingerprint,
 )
 from experiment_registry import (
+    CURRICULUM_TEMPERATURE_DISTILLATION_REGISTRY,
     DATASET_REGISTRY,
     build_stratified_split_indices,
     build_method_tag,
@@ -39,6 +42,9 @@ from experiment_registry import (
     get_pair_spec,
     get_role_name,
     resolve_compressed_train_mode,
+    resolve_curriculum_temperature_distillation_settings,
+    resolve_decoupled_distillation_settings,
+    resolve_logit_standardized_kd_settings,
     resolve_compress_linear,
     resolve_capacity_size,
     resolve_fixed_rank,
@@ -47,7 +53,7 @@ from experiment_registry import (
 )
 from model_wrappers import (
     GatedSVDLinear,
-    GenericHeteroNet,
+    GenericInherActNet,
     GenericInherNet,
     freeze_gating_routers,
 )
@@ -56,7 +62,12 @@ from training_utils import (
     RunLogger,
     build_optimizer,
     build_scheduler,
+    GlobalCurriculumTemperature,
+    compute_curriculum_temperature_distillation_objective,
+    compute_decoupled_distillation_objective,
+    compute_logit_standardized_distillation_objective,
     count_parameters,
+    curriculum_temperature_gradient_scale,
     evaluate_inheritance_diagnostics,
     evaluate_router_gradient_probe,
     train_distillation,
@@ -108,28 +119,156 @@ class FixedHeavyLinearNet(nn.Module):
 
 
 class RegistryTests(unittest.TestCase):
-    def test_method_aware_capacity_defaults_and_hetero_custom_rank_rejection(self) -> None:
+    def test_published_dkd_recipe_is_scoped_to_the_cifar100_reference_pair(self) -> None:
+        settings = resolve_decoupled_distillation_settings(
+            "cifar100", "resnet56_to_resnet20"
+        )
+        self.assertEqual(
+            asdict(settings),
+            {
+                "ce_weight": 1.0,
+                "alpha": 1.0,
+                "beta": 2.0,
+                "temperature": 4.0,
+                "warmup_epochs": 20,
+                "source": "official_mdistiller_cifar100",
+            },
+        )
+        self.assertEqual(
+            resolve_decoupled_distillation_settings(
+                "cifar100", "resnet32x4_to_resnet8x4"
+            ).beta,
+            8.0,
+        )
+        self.assertEqual(
+            resolve_decoupled_distillation_settings(
+                "cifar100", "vgg13_to_vgg8"
+            ).beta,
+            6.0,
+        )
+        self.assertEqual(
+            resolve_decoupled_distillation_settings(
+                "cifar100", "resnet110_to_resnet32"
+            ).beta,
+            2.0,
+        )
+        c10_adaptation = resolve_decoupled_distillation_settings(
+            "cifar10", "resnet50_to_resnet18"
+        )
+        self.assertEqual(c10_adaptation.beta, 0.5)
+        self.assertEqual(c10_adaptation.temperature, 1.0)
+        self.assertTrue(c10_adaptation.source.startswith("repository_adaptation_"))
+
+    def test_logit_standardized_kd_recipe_is_scoped_to_the_seven_released_pairs(self) -> None:
+        released_pairs = {
+            "resnet32x4_to_resnet8x4",
+            "vgg13_to_vgg8",
+            "wrn40_2_to_wrn40_1",
+            "wrn40_2_to_wrn16_2",
+            "resnet56_to_resnet20",
+            "resnet110_to_resnet32",
+            "resnet110_to_resnet20",
+        }
+        for pair in released_pairs:
+            self.assertEqual(
+                asdict(resolve_logit_standardized_kd_settings("cifar100", pair)),
+                {
+                    "ce_weight": 0.1,
+                    "kd_weight": 9.0,
+                    "temperature": 2.0,
+                    "source": "official_logit_standardization_kd_plugin_cifar100",
+                },
+            )
+        with self.assertRaisesRegex(ValueError, "no recipe"):
+            resolve_logit_standardized_kd_settings("cifar100", "resnet32_to_resnet8")
+        with self.assertRaisesRegex(ValueError, "no recipe"):
+            resolve_logit_standardized_kd_settings("cifar10", "resnet50_to_resnet18")
+
+    def test_ctkd_recipe_scopes_published_cifar100_pairs_and_one_labeled_adaptation(self) -> None:
+        published_pairs = {
+            "vgg13_to_vgg8",
+            "wrn40_2_to_wrn40_1",
+            "wrn40_2_to_wrn16_2",
+            "resnet56_to_resnet20",
+            "resnet110_to_resnet32",
+            "resnet110_to_resnet20",
+        }
+        expected_cifar100 = {
+            "ce_weight": 0.1,
+            "kd_weight": 0.9,
+            "t_start": 1.0,
+            "t_end": 20.0,
+            "decay_max": 0.0,
+            "decay_min": -1.0,
+            "decay_loops": 10,
+            "source": "official_ctkd_cifar100",
+        }
+        for pair in published_pairs:
+            self.assertEqual(
+                asdict(resolve_curriculum_temperature_distillation_settings("cifar100", pair)),
+                expected_cifar100,
+            )
+        self.assertEqual(
+            asdict(
+                resolve_curriculum_temperature_distillation_settings(
+                    "cifar10", "resnet50_to_resnet18"
+                )
+            ),
+            {
+                "ce_weight": 1.0,
+                "kd_weight": 1.0,
+                "t_start": 1.0,
+                "t_end": 20.0,
+                "decay_max": 0.0,
+                "decay_min": -1.0,
+                "decay_loops": 5,
+                "source": "repository_adaptation_official_ctkd_imagenet_resnet",
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "no CTKD recipe"):
+            resolve_curriculum_temperature_distillation_settings(
+                "cifar100", "resnet32x4_to_resnet8x4"
+            )
+        args = build_argparser().parse_args(
+            [
+                "--dataset", "cifar100", "--pair", "resnet56_to_resnet20",
+                "--method", "student_ctkd",
+            ]
+        )
+        pair_spec = get_pair_spec(args.dataset, args.pair)
+        self.assertEqual(
+            build_method_tag(
+                args.method,
+                args,
+                pair_spec,
+                resolve_train_settings(DATASET_REGISTRY[args.dataset], args, pair_spec),
+            ),
+            "official_ctkd_cifar100_ce_0p1_kd_0p9_tstart_1_tend_20_"
+            "cosine_0_to_-1_loops_10",
+        )
+
+    def test_method_aware_capacity_defaults_and_inheract_custom_rank_rejection(self) -> None:
         parser = build_argparser()
         pair = get_pair_spec("cifar100", "resnet56_to_resnet20")
-        hetero_args = parser.parse_args(
-            ["--dataset", "cifar100", "--pair", "resnet56_to_resnet20", "--method", "hetero"]
+        inheract_args = parser.parse_args(
+            ["--dataset", "cifar100", "--pair", "resnet56_to_resnet20", "--method", "inheract"]
         )
         inhernet_args = parser.parse_args(
             ["--dataset", "cifar100", "--pair", "resnet56_to_resnet20", "--method", "inhernet"]
         )
-        self.assertEqual(resolve_capacity_size(hetero_args), "large")
-        self.assertEqual(resolve_fixed_rank(hetero_args, pair), pair["rank_presets"]["large"])
+        self.assertEqual(resolve_capacity_size(inheract_args), "large")
+        self.assertEqual(resolve_fixed_rank(inheract_args, pair), pair["rank_presets"]["large"])
         self.assertEqual(resolve_capacity_size(inhernet_args), "small")
         self.assertEqual(resolve_fixed_rank(inhernet_args, pair), pair["rank_presets"]["small"])
 
-        custom_hetero = parser.parse_args(
+        custom_inheract = parser.parse_args(
             [
                 "--dataset", "cifar100", "--pair", "resnet56_to_resnet20",
-                "--method", "hetero", "--rank", "13",
+                "--method", "inheract", "--rank", "13",
             ]
         )
         with self.assertRaisesRegex(ValueError, "registered"):
-            validate_args(custom_hetero, pair)
+            validate_args(custom_inheract, pair)
         custom_inhernet = parser.parse_args(
             [
                 "--dataset", "cifar100", "--pair", "resnet56_to_resnet20",
@@ -138,14 +277,34 @@ class RegistryTests(unittest.TestCase):
         )
         validate_args(custom_inhernet, pair)
 
+    def test_direct_svd_reference_uses_headline_rank_and_selected_optimizer(self) -> None:
+        args = build_argparser().parse_args(
+            [
+                "--dataset", "cifar100", "--pair", "resnet56_to_resnet20",
+                "--method", "inhernet", "--size", "large", "--head-num", "1",
+                "--lr-scale", "0.5", "--compressed-train-mode", "supervised",
+                "--search-candidate", "ablation_direct_svd",
+            ]
+        )
+        pair = get_pair_spec(args.dataset, args.pair)
+        validate_args(args, pair)
+        settings = resolve_train_settings(DATASET_REGISTRY[args.dataset], args, pair)
+        self.assertEqual(resolve_fixed_rank(args, pair), 16)
+        self.assertEqual(resolve_capacity_size(args), "large")
+        self.assertEqual(settings.lr, 0.025)
+        self.assertEqual(
+            build_method_tag("inhernet", args, pair, settings),
+            "search_ablation_direct_svd_large_rank_16_heads_1_supervised",
+        )
+
     def test_research_rank_policies_are_diagnostics_only(self) -> None:
         parser = build_argparser()
         args = parser.parse_args(
             [
                 "--dataset", "oxford_pets",
                 "--pair", "resnet34_to_resnet18",
-                "--method", "hetero",
-                "--hetero-allocation-scale", "research_nested_relative",
+                "--method", "inheract",
+                "--inheract-allocation-scale", "research_nested_relative",
             ]
         )
         with self.assertRaisesRegex(ValueError, "initialization-only"):
@@ -348,6 +507,43 @@ class RegistryTests(unittest.TestCase):
             any(not torch.equal(tensor, student_state[name]) for name, tensor in student.state_dict().items())
         )
 
+    def test_ctkd_distillation_keeps_the_teacher_frozen(self) -> None:
+        torch.manual_seed(9)
+        teacher = nn.Sequential(nn.Linear(4, 2))
+        student = nn.Sequential(nn.Linear(4, 2))
+        teacher_state = copy.deepcopy(teacher.state_dict())
+        inputs = torch.randn(12, 4)
+        labels = torch.randint(0, 2, (12,))
+        loader = DataLoader(TensorDataset(inputs, labels), batch_size=4, shuffle=False)
+        settings = replace(
+            DATASET_REGISTRY["cifar100"].train_settings,
+            epochs=1,
+            lr=0.01,
+            lr_milestones=(),
+        )
+        ctkd_settings = resolve_curriculum_temperature_distillation_settings(
+            "cifar100", "resnet56_to_resnet20"
+        )
+        history = train_distillation(
+            teacher,
+            student,
+            loader,
+            loader,
+            settings,
+            torch.device("cpu"),
+            logger=RunLogger(log_path="/dev/null", echo=False, store_info_to_file=False),
+            num_labels=2,
+            ctkd_settings=ctkd_settings,
+        )
+        for name, tensor in teacher.state_dict().items():
+            self.assertTrue(torch.equal(tensor, teacher_state[name]))
+        self.assertTrue(all(parameter.grad is None for parameter in teacher.parameters()))
+        self.assertEqual(
+            history["train_component_ctkd_gradient_scale"],
+            [curriculum_temperature_gradient_scale(1, ctkd_settings)],
+        )
+        self.assertEqual(len(history["train_component_ctkd_temperature"]), 1)
+
     def test_calibration_order_is_class_interleaved(self) -> None:
         labels = [class_id for class_id in range(37) for _ in range(100)]
         train_indices, validation_indices, calibration_indices = build_stratified_split_indices(
@@ -380,6 +576,143 @@ class RegistryTests(unittest.TestCase):
             )
         self.assertEqual(loaders.split_metadata["seed"], 99)
         self.assertEqual(loaders.split_metadata["calibration_seed"], 100)
+
+    def test_only_training_loader_uses_requested_worker_processes(self) -> None:
+        labels = torch.tensor([class_id for class_id in range(2) for _ in range(10)])
+        dataset = TensorDataset(torch.randn(20, 1), labels)
+        dataset.targets = labels.tolist()
+        with patch("experiment_registry.get_dataset", return_value=dataset), patch(
+            "experiment_registry.get_transforms", return_value=(object(), object())
+        ):
+            loaders = get_dataloaders(
+                "cifar10",
+                batch_size=4,
+                root="unused",
+                num_workers=4,
+                download=False,
+                validation_fraction=0.2,
+                validation_split_seed=99,
+            )
+
+        self.assertEqual(loaders.train.num_workers, 4)
+        self.assertEqual(loaders.evaluation.num_workers, 0)
+        self.assertEqual(loaders.final_test.num_workers, 0)
+        self.assertEqual(loaders.calibration.num_workers, 0)
+
+    def test_glue_uses_requested_workers_only_for_training(self) -> None:
+        class FakeSplit:
+            def __init__(self, rows):
+                self.rows = rows
+                self.column_names = list(rows[0])
+
+            def __len__(self):
+                return len(self.rows)
+
+            def __getitem__(self, index):
+                return self.rows[index]
+
+            def map(self, function, *, batched, remove_columns):
+                self.assert_batched = batched
+                batch = {
+                    name: [row[name] for row in self.rows]
+                    for name in self.column_names
+                }
+                encoded = function(batch)
+                rows = []
+                for index, source in enumerate(self.rows):
+                    row = {"label": source["label"]}
+                    row.update({name: values[index] for name, values in encoded.items()})
+                    rows.append(row)
+                return FakeSplit(rows)
+
+            def train_test_split(self, *, test_size, **_):
+                count = min(int(test_size), len(self.rows))
+                return {
+                    "train": FakeSplit(self.rows[:-count] or self.rows),
+                    "test": FakeSplit(self.rows[-count:]),
+                }
+
+        class FakeTokenizer:
+            def __call__(self, *texts, **_):
+                count = len(texts[0])
+                return {
+                    "input_ids": [[101, 102] for _ in range(count)],
+                    "attention_mask": [[1, 1] for _ in range(count)],
+                }
+
+        class FakeAutoTokenizer:
+            @staticmethod
+            def from_pretrained(*_, **__):
+                return FakeTokenizer()
+
+        class FakeCollator:
+            def __init__(self, **_):
+                pass
+
+        raw = {
+            "train": FakeSplit(
+                [{"sentence": f"train {index}", "label": index % 2} for index in range(20)]
+            ),
+            "validation": FakeSplit(
+                [{"sentence": f"eval {index}", "label": index % 2} for index in range(4)]
+            ),
+        }
+        with patch(
+            "glue_data._load_hf_dependencies",
+            return_value=(lambda *_, **__: raw, FakeAutoTokenizer, FakeCollator),
+        ):
+            train, evaluation, final_evaluation, calibration, _ = build_glue_dataloaders(
+                task_name="sst2",
+                eval_split_name="validation",
+                problem_type="classification",
+                root="/tmp",
+                batch_size=2,
+                num_workers=4,
+                seed=42,
+                pin_memory=False,
+                tokenizer_name="fake",
+                tokenizer_revision="fake",
+                max_length=8,
+            )
+            _, holdout, official_evaluation, _, provenance = build_glue_dataloaders(
+                task_name="sst2",
+                eval_split_name="validation",
+                problem_type="classification",
+                root="/tmp",
+                batch_size=2,
+                num_workers=4,
+                seed=42,
+                pin_memory=False,
+                tokenizer_name="fake",
+                tokenizer_revision="fake",
+                max_length=8,
+                search_validation=True,
+            )
+            _, _, no_final_evaluation, _, _ = build_glue_dataloaders(
+                task_name="sst2",
+                eval_split_name="validation",
+                problem_type="classification",
+                root="/tmp",
+                batch_size=2,
+                num_workers=4,
+                seed=42,
+                pin_memory=False,
+                tokenizer_name="fake",
+                tokenizer_revision="fake",
+                max_length=8,
+                search_validation=True,
+                include_final_evaluation=False,
+            )
+
+        self.assertEqual(train.num_workers, 4)
+        self.assertEqual(evaluation.num_workers, 0)
+        self.assertIsNone(final_evaluation)
+        self.assertEqual(calibration.num_workers, 0)
+        self.assertEqual(holdout.num_workers, 0)
+        self.assertIsNotNone(official_evaluation)
+        self.assertEqual(official_evaluation.num_workers, 0)
+        self.assertEqual(provenance["evaluation_split"], "train_holdout")
+        self.assertIsNone(no_final_evaluation)
 
     def test_teacher_checkpoint_round_trip_and_validation(self) -> None:
         model = RankOneConvNet().eval()
@@ -529,7 +862,7 @@ class RegistryTests(unittest.TestCase):
                 [
                     "--dataset", dataset,
                     "--pair", pair_name,
-                    "--method", "hetero",
+                    "--method", "inheract",
                     "--kd-fraction", "0.25",
                 ]
             )
@@ -551,7 +884,7 @@ class RegistryTests(unittest.TestCase):
                 "--pair",
                 "resnet34_to_resnet18",
                 "--method",
-                "hetero",
+                "inheract",
             ]
         )
         pet_spec = DATASET_REGISTRY[pet_args.dataset]
@@ -579,7 +912,7 @@ class RegistryTests(unittest.TestCase):
                 "--pair",
                 "bert4_to_bert2",
                 "--method",
-                "hetero",
+                "inheract",
             ]
         )
         glue_spec = DATASET_REGISTRY[glue_args.dataset]
@@ -601,7 +934,7 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(glue_settings.max_grad_norm, 1.0)
         self.assertTrue(glue_settings.exclude_bias_norm_from_weight_decay)
         self.assertTrue(resolve_compress_linear(glue_pair))
-        self.assertIn("_linear", build_method_tag("hetero", glue_args, glue_pair, glue_settings))
+        self.assertIn("_linear", build_method_tag("inheract", glue_args, glue_pair, glue_settings))
 
         offline_glue = build_pair_model(
             "glue_sst2", "bert4_to_bert2", "teacher", 2, initialize_pretrained=False
@@ -638,6 +971,121 @@ class RegistryTests(unittest.TestCase):
 
 
 class WrapperTests(unittest.TestCase):
+    def test_logit_standardized_kd_objective_matches_the_official_formula(self) -> None:
+        teacher = torch.tensor(
+            [[2.0, 0.5, -1.0], [0.1, 1.4, -0.2]], dtype=torch.float64
+        )
+        student = torch.tensor(
+            [[1.2, -0.3, 0.4], [-0.4, 0.9, 0.2]],
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        labels = torch.tensor([0, 1])
+        settings = resolve_logit_standardized_kd_settings(
+            "cifar100", "resnet56_to_resnet20"
+        )
+        ce_loss, kd_loss, aux_loss, total_loss = (
+            compute_logit_standardized_distillation_objective(
+                teacher,
+                student,
+                labels,
+                settings,
+                nn.CrossEntropyLoss(),
+            )
+        )
+        self.assertIsNone(aux_loss)
+        self.assertAlmostEqual(float(ce_loss), 0.5423878398018678)
+        self.assertAlmostEqual(float(kd_loss), 0.04059060823054403)
+        self.assertAlmostEqual(float(total_loss), 1.515500680279772)
+
+    def test_ctkd_global_temperature_matches_the_released_formula_and_reversal(self) -> None:
+        teacher = torch.tensor(
+            [[2.0, 0.5, -1.0], [0.1, 1.4, -0.2]], dtype=torch.float64
+        )
+        student = torch.tensor(
+            [[1.2, -0.3, 0.4], [-0.4, 0.9, 0.2]],
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        labels = torch.tensor([0, 1])
+        settings = resolve_curriculum_temperature_distillation_settings(
+            "cifar100", "resnet56_to_resnet20"
+        )
+        temperature_module = GlobalCurriculumTemperature(settings).double()
+        gradient_scale = curriculum_temperature_gradient_scale(1, settings)
+        ce_loss, kd_loss, aux_loss, total_loss = (
+            compute_curriculum_temperature_distillation_objective(
+                teacher,
+                student,
+                labels,
+                settings,
+                temperature_module,
+                gradient_scale,
+                nn.CrossEntropyLoss(),
+            )
+        )
+        expected_temperature = 1.0 + 20.0 * torch.sigmoid(torch.ones(1, dtype=torch.float64))
+        expected_kd = F.kl_div(
+            F.log_softmax(student / expected_temperature, dim=1),
+            F.softmax(teacher / expected_temperature, dim=1),
+            reduction="batchmean",
+        ) * expected_temperature.square()
+        expected_total = 0.1 * F.cross_entropy(student, labels) + 0.9 * expected_kd
+        self.assertIsNone(aux_loss)
+        self.assertTrue(torch.allclose(kd_loss, expected_kd))
+        self.assertTrue(torch.allclose(total_loss, expected_total))
+        self.assertAlmostEqual(float(ce_loss), 0.5423878398018678)
+        self.assertAlmostEqual(float(gradient_scale), -0.02447174185242318)
+        self.assertEqual(curriculum_temperature_gradient_scale(0, settings), 0.0)
+        self.assertEqual(curriculum_temperature_gradient_scale(10, settings), -1.0)
+        self.assertEqual(curriculum_temperature_gradient_scale(99, settings), -1.0)
+
+        total_loss.backward()
+        reversed_gradient = temperature_module.raw_temperature.grad.detach().clone()
+        direct_raw_temperature = torch.ones(1, dtype=torch.float64, requires_grad=True)
+        direct_temperature = 1.0 + 20.0 * torch.sigmoid(direct_raw_temperature)
+        direct_student = student.detach().clone().requires_grad_(True)
+        direct_kd = F.kl_div(
+            F.log_softmax(direct_student / direct_temperature, dim=1),
+            F.softmax(teacher / direct_temperature, dim=1),
+            reduction="batchmean",
+        ) * direct_temperature.square()
+        (0.1 * F.cross_entropy(direct_student, labels) + 0.9 * direct_kd).backward()
+        self.assertTrue(
+            torch.allclose(
+                reversed_gradient,
+                gradient_scale * direct_raw_temperature.grad,
+            )
+        )
+
+    def test_dkd_objective_matches_the_published_resnet56_resnet20_recipe(self) -> None:
+        teacher = torch.tensor(
+            [[2.0, 0.5, -1.0], [0.1, 1.4, -0.2]], dtype=torch.float64
+        )
+        student = torch.tensor(
+            [[1.2, -0.3, 0.4], [-0.4, 0.9, 0.2]],
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        labels = torch.tensor([0, 1])
+        settings = resolve_decoupled_distillation_settings(
+            "cifar100", "resnet56_to_resnet20"
+        )
+        ce_loss, dkd_loss, aux_loss, first_epoch = (
+            compute_decoupled_distillation_objective(
+                teacher,
+                student,
+                labels,
+                settings,
+                epoch=1,
+                criterion=nn.CrossEntropyLoss(),
+            )
+        )
+        self.assertIsNone(aux_loss)
+        self.assertAlmostEqual(float(ce_loss), 0.5423878398018678)
+        self.assertAlmostEqual(float(dkd_loss), 0.7781990817403472)
+        self.assertAlmostEqual(float(first_epoch), 0.5812977938888851)
+
     def test_inhernet_rank_one_conv_preserves_rank_one_weight(self) -> None:
         torch.manual_seed(7)
         dense_model = RankOneConvNet().eval()
@@ -669,7 +1117,7 @@ class WrapperTests(unittest.TestCase):
 
         self.assertFalse(torch.allclose(expert_grads[0], expert_grads[1]))
 
-    def test_hetero_can_optionally_compress_linear_layers(self) -> None:
+    def test_inheract_can_optionally_compress_linear_layers(self) -> None:
         torch.manual_seed(11)
         dense_model = TinyConvLinearNet().eval()
         sample = torch.randn(5, 2, 3, 3)
@@ -680,9 +1128,9 @@ class WrapperTests(unittest.TestCase):
             shuffle=False,
         )
 
-        hetero = GenericHeteroNet(copy.deepcopy(dense_model)).eval()
-        hetero.load_dense_state_dict(dense_model.state_dict())
-        rank_map, backend = hetero.apply_hetero_svd(
+        inheract = GenericInherActNet(copy.deepcopy(dense_model)).eval()
+        inheract.load_dense_state_dict(dense_model.state_dict())
+        rank_map, backend = inheract.apply_inheract_svd(
             calib_loader=calib_loader,
             head_num=3,
             reference_rank=1,
@@ -693,27 +1141,27 @@ class WrapperTests(unittest.TestCase):
         )
 
         with torch.no_grad():
-            actual = hetero(sample)
+            actual = inheract(sample)
 
         self.assertEqual(backend, "cpu")
         self.assertIn("fc", rank_map)
-        self.assertTrue(any(isinstance(module, GatedSVDLinear) for module in hetero.modules()))
+        self.assertTrue(any(isinstance(module, GatedSVDLinear) for module in inheract.modules()))
         self.assertEqual(tuple(actual.shape), (5, 30))
         self.assertEqual(
-            count_parameters(hetero), hetero.hetero_report["reference_inhernet_parameters"]
+            count_parameters(inheract), inheract.inheract_report["reference_inhernet_parameters"]
         )
-        self.assertEqual(hetero.hetero_report["selected_parameters"], count_parameters(hetero))
-        lift_probe = hetero.hetero_report["conditional_lift_probe"]
+        self.assertEqual(inheract.inheract_report["selected_parameters"], count_parameters(inheract))
+        lift_probe = inheract.inheract_report["conditional_lift_probe"]
         self.assertEqual(
             lift_probe["factorized_layer_count"],
-            hetero.hetero_report["factorized_layer_count"],
+            inheract.inheract_report["factorized_layer_count"],
         )
         self.assertLess(lift_probe["max_relative_expert_mean_shift"], 1e-6)
         self.assertGreater(lift_probe["mean_relative_expert_diversity"], 0.0)
-        routed = next(module for module in hetero.modules() if isinstance(module, GatedSVDLinear))
+        routed = next(module for module in inheract.modules() if isinstance(module, GatedSVDLinear))
         self.assertEqual(routed.gate.in_features, rank_map["fc"])
 
-    def test_text_hetero_matches_uniform_inhernet_parameter_count(self) -> None:
+    def test_text_inheract_matches_uniform_inhernet_parameter_count(self) -> None:
         token_ids = torch.randint(0, 1000, (12, 5))
         loader = DataLoader(
             TensorDataset(token_ids, torch.zeros(12, dtype=torch.long)),
@@ -722,8 +1170,8 @@ class WrapperTests(unittest.TestCase):
         )
         for reference_rank in (1, 2):
             dense_model = FixedHeavyLinearNet().eval()
-            hetero = GenericHeteroNet(copy.deepcopy(dense_model)).eval()
-            hetero.apply_hetero_svd(
+            inheract = GenericInherActNet(copy.deepcopy(dense_model)).eval()
+            inheract.apply_inheract_svd(
                 calib_loader=loader,
                 head_num=2,
                 reference_rank=reference_rank,
@@ -732,7 +1180,7 @@ class WrapperTests(unittest.TestCase):
                 compress_linear=True,
             )
 
-            report = hetero.hetero_report
+            report = inheract.inheract_report
             inhernet = GenericInherNet(copy.deepcopy(dense_model)).eval()
             inhernet.apply_svd(
                 rank=reference_rank,
@@ -743,7 +1191,7 @@ class WrapperTests(unittest.TestCase):
             self.assertEqual(report["reference_inhernet_rank"], reference_rank)
             self.assertEqual(report["reference_inhernet_parameters"], count_parameters(inhernet))
             self.assertEqual(report["selected_parameters"], report["reference_inhernet_parameters"])
-            self.assertEqual(report["selected_parameters"], count_parameters(hetero))
+            self.assertEqual(report["selected_parameters"], count_parameters(inheract))
             self.assertEqual(report["target_layer_count"], len(report["allocation_map"]))
             self.assertEqual(
                 report["target_layer_count"],
@@ -752,7 +1200,7 @@ class WrapperTests(unittest.TestCase):
             self.assertGreater(report["budget_utilization"], 0.0)
             self.assertLessEqual(report["budget_utilization"], 1.0)
 
-    def test_vision_hetero_matches_uniform_inhernet_parameter_count(self) -> None:
+    def test_vision_inheract_matches_uniform_inhernet_parameter_count(self) -> None:
         inputs = torch.randn(8, 2, 3, 3)
         loader = DataLoader(
             TensorDataset(inputs, torch.zeros(8, dtype=torch.long)),
@@ -760,8 +1208,8 @@ class WrapperTests(unittest.TestCase):
             shuffle=False,
         )
         dense_model = TinyConvLinearNet().eval()
-        hetero = GenericHeteroNet(copy.deepcopy(dense_model)).eval()
-        hetero.apply_hetero_svd(
+        inheract = GenericInherActNet(copy.deepcopy(dense_model)).eval()
+        inheract.apply_inheract_svd(
             calib_loader=loader,
             head_num=3,
             reference_rank=1,
@@ -777,10 +1225,10 @@ class WrapperTests(unittest.TestCase):
             include_linear=False,
         )
 
-        report = hetero.hetero_report
+        report = inheract.inheract_report
         self.assertEqual(report["reference_inhernet_parameters"], count_parameters(inhernet))
-        self.assertEqual(count_parameters(hetero), count_parameters(inhernet))
-        self.assertEqual(report["selected_parameters"], count_parameters(hetero))
+        self.assertEqual(count_parameters(inheract), count_parameters(inhernet))
+        self.assertEqual(report["selected_parameters"], count_parameters(inheract))
 
     def test_weighted_uniform_policy_uses_the_registered_rank(self) -> None:
         inputs = torch.randn(8, 8, 5, 5)
@@ -789,10 +1237,10 @@ class WrapperTests(unittest.TestCase):
             batch_size=4,
             shuffle=False,
         )
-        hetero = GenericHeteroNet(
+        inheract = GenericInherActNet(
             nn.Sequential(nn.Conv2d(8, 8, kernel_size=3, padding=1)).eval()
         ).eval()
-        rank_map, _ = hetero.apply_hetero_svd(
+        rank_map, _ = inheract.apply_inheract_svd(
             calib_loader=loader,
             head_num=3,
             reference_rank=1,
@@ -802,10 +1250,10 @@ class WrapperTests(unittest.TestCase):
             allocation_scale="weighted_uniform",
         )
         self.assertEqual(set(rank_map.values()), {1})
-        self.assertEqual(hetero.hetero_report["allocation_scale"], "weighted_uniform")
-        self.assertEqual(hetero.hetero_report["allocator"], "fixed_registered_rank")
+        self.assertEqual(inheract.inheract_report["allocation_scale"], "weighted_uniform")
+        self.assertEqual(inheract.inheract_report["allocator"], "fixed_registered_rank")
         self.assertEqual(
-            hetero.hetero_report["decomposition_metric"], "activation_weighted"
+            inheract.inheract_report["decomposition_metric"], "activation_weighted"
         )
 
     def test_weighted_uniform_matches_inhernet_parameter_count_for_linear_targets(self) -> None:
@@ -816,8 +1264,8 @@ class WrapperTests(unittest.TestCase):
             shuffle=False,
         )
         dense_model = FixedHeavyLinearNet().eval()
-        hetero = GenericHeteroNet(copy.deepcopy(dense_model)).eval()
-        rank_map, _ = hetero.apply_hetero_svd(
+        inheract = GenericInherActNet(copy.deepcopy(dense_model)).eval()
+        rank_map, _ = inheract.apply_inheract_svd(
             calib_loader=loader,
             head_num=2,
             reference_rank=2,
@@ -834,7 +1282,7 @@ class WrapperTests(unittest.TestCase):
             include_linear=True,
         )
         self.assertEqual(set(rank_map.values()), {2})
-        self.assertEqual(count_parameters(hetero), count_parameters(inhernet))
+        self.assertEqual(count_parameters(inheract), count_parameters(inhernet))
 
     def test_research_nested_policy_preserves_the_registered_lite_rank(self) -> None:
         inputs = torch.randn(8, 8, 5, 5)
@@ -843,10 +1291,10 @@ class WrapperTests(unittest.TestCase):
             batch_size=4,
             shuffle=False,
         )
-        hetero = GenericHeteroNet(
+        inheract = GenericInherActNet(
             nn.Sequential(nn.Conv2d(8, 8, kernel_size=3, padding=1)).eval()
         ).eval()
-        rank_map, _ = hetero.apply_hetero_svd(
+        rank_map, _ = inheract.apply_inheract_svd(
             calib_loader=loader,
             head_num=3,
             reference_rank=4,
@@ -858,8 +1306,8 @@ class WrapperTests(unittest.TestCase):
         )
         self.assertTrue(rank_map)
         self.assertGreaterEqual(min(rank_map.values()), 2)
-        self.assertEqual(hetero.hetero_report["protected_inheritance_rank"], 2)
-        self.assertEqual(hetero.hetero_report["protocol"], "research_rank_allocation")
+        self.assertEqual(inheract.inheract_report["protected_inheritance_rank"], 2)
+        self.assertEqual(inheract.inheract_report["protocol"], "research_rank_allocation")
 
     def test_research_relative_policy_is_explicit(self) -> None:
         inputs = torch.randn(8, 8, 5, 5)
@@ -868,11 +1316,11 @@ class WrapperTests(unittest.TestCase):
             batch_size=4,
             shuffle=False,
         )
-        hetero = GenericHeteroNet(
+        inheract = GenericInherActNet(
             nn.Sequential(nn.Conv2d(8, 8, kernel_size=3, padding=1)).eval()
         ).eval()
         with self.assertRaisesRegex(ValueError, "explicit diagnostics-only opt-in"):
-            hetero.apply_hetero_svd(
+            inheract.apply_inheract_svd(
                 calib_loader=loader,
                 head_num=3,
                 reference_rank=4,
@@ -880,7 +1328,7 @@ class WrapperTests(unittest.TestCase):
                 svd_backend="cpu",
                 allocation_scale="research_relative",
             )
-        hetero.apply_hetero_svd(
+        inheract.apply_inheract_svd(
             calib_loader=loader,
             head_num=3,
             reference_rank=4,
@@ -890,20 +1338,20 @@ class WrapperTests(unittest.TestCase):
             allow_research_rank_probe=True,
         )
         self.assertEqual(
-            hetero.hetero_report["allocation_scale"], "research_relative"
+            inheract.inheract_report["allocation_scale"], "research_relative"
         )
 
-    def test_default_auto_backend_supports_cpu_hetero(self) -> None:
+    def test_default_auto_backend_supports_cpu_inheract(self) -> None:
         inputs = torch.randn(8, 8, 5, 5)
         loader = DataLoader(
             TensorDataset(inputs, torch.zeros(8, dtype=torch.long)),
             batch_size=4,
             shuffle=False,
         )
-        hetero = GenericHeteroNet(
+        inheract = GenericInherActNet(
             nn.Sequential(nn.Conv2d(8, 8, kernel_size=3, padding=1)).eval()
         ).eval()
-        rank_map, backend = hetero.apply_hetero_svd(
+        rank_map, backend = inheract.apply_inheract_svd(
             calib_loader=loader,
             head_num=3,
             reference_rank=4,
@@ -936,7 +1384,7 @@ class WrapperTests(unittest.TestCase):
         self.assertTrue(model.training)
         self.assertFalse(inherited.training)
 
-    def test_hetero_diagnostics_include_held_out_local_operator_probe(self) -> None:
+    def test_inheract_diagnostics_include_held_out_local_operator_probe(self) -> None:
         torch.manual_seed(19)
         teacher = TinyConvLinearNet().train()
         inputs = torch.randn(8, 2, 3, 3)
@@ -944,8 +1392,8 @@ class WrapperTests(unittest.TestCase):
         loader = DataLoader(
             TensorDataset(inputs, labels), batch_size=2, shuffle=False
         )
-        inherited = GenericHeteroNet(copy.deepcopy(teacher)).eval()
-        inherited.apply_hetero_svd(
+        inherited = GenericInherActNet(copy.deepcopy(teacher)).eval()
+        inherited.apply_inheract_svd(
             calib_loader=loader,
             head_num=3,
             reference_rank=1,
@@ -1007,11 +1455,11 @@ class WrapperTests(unittest.TestCase):
             initialize_pretrained=False,
         )
         inhernet = GenericInherNet(copy.deepcopy(dense_model))
-        hetero = GenericHeteroNet(copy.deepcopy(dense_model))
+        inheract = GenericInherActNet(copy.deepcopy(dense_model))
 
         self.assertIsInstance(dense_model.fc, nn.Linear)
         self.assertNotIn("fc", inhernet._collect_target_layers(include_linear=False))
-        self.assertNotIn("fc", hetero._collect_hetero_target_layers(include_linear=False))
+        self.assertNotIn("fc", inheract._collect_inheract_target_layers(include_linear=False))
 
     def test_inhernet_text_profile_can_target_linear_layers(self) -> None:
         dense_model = TinyConvLinearNet().eval()
@@ -1020,7 +1468,7 @@ class WrapperTests(unittest.TestCase):
 
         self.assertIsInstance(inhernet.backbone.fc, nn.Sequential)
 
-    def test_hetero_uses_uncentered_second_moment(self) -> None:
+    def test_inheract_uses_uncentered_second_moment(self) -> None:
         linear_model = nn.Sequential(nn.Linear(2, 2, bias=False)).eval()
         inputs = torch.tensor([[10.0, 0.0], [12.0, 0.0], [11.0, 0.0], [9.0, 0.0]])
         loader = DataLoader(
@@ -1028,8 +1476,8 @@ class WrapperTests(unittest.TestCase):
             batch_size=4,
             shuffle=False,
         )
-        hetero = GenericHeteroNet(linear_model).eval()
-        moments, metadata = hetero._estimate_input_second_moments(
+        inheract = GenericInherActNet(linear_model).eval()
+        moments, metadata = inheract._estimate_input_second_moments(
             loader,
             max_batches=1,
             include_linear=True,
@@ -1045,8 +1493,8 @@ class WrapperTests(unittest.TestCase):
         linear_model = nn.Sequential(nn.Linear(513, 8, bias=False)).eval()
         inputs = torch.randn(4, 513)
         loader = DataLoader(TensorDataset(inputs, torch.zeros(4, dtype=torch.long)), batch_size=4)
-        hetero = GenericHeteroNet(linear_model).eval()
-        moments, metadata = hetero._estimate_input_second_moments(
+        inheract = GenericInherActNet(linear_model).eval()
+        moments, metadata = inheract._estimate_input_second_moments(
             loader,
             max_batches=1,
             include_linear=True,
@@ -1054,7 +1502,7 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(tuple(moments["0"].shape), (513,))
         self.assertEqual(metadata["0"]["mode"], "diagonal")
 
-    def test_hetero_balance_loss_is_zero_for_uniform_router(self) -> None:
+    def test_inheract_balance_loss_is_zero_for_uniform_router(self) -> None:
         down = nn.Linear(2, 1, bias=False)
         experts = nn.ModuleList([nn.Linear(1, 2) for _ in range(3)])
         expert_weight = torch.cat([expert.weight for expert in experts], dim=0)
@@ -1164,8 +1612,8 @@ class WrapperTests(unittest.TestCase):
             conditional_probe["mean_normalized_route_entropy"], 1.0, places=6
         )
 
-    def test_hetero_conv_statistics_use_local_patches(self) -> None:
-        model = GenericHeteroNet(nn.Sequential(nn.Conv2d(1, 2, kernel_size=3, padding=1)))
+    def test_inheract_conv_statistics_use_local_patches(self) -> None:
+        model = GenericInherActNet(nn.Sequential(nn.Conv2d(1, 2, kernel_size=3, padding=1)))
         checkerboard = torch.tensor(
             [[[[1.0, -1.0, 1.0], [-1.0, 1.0, -1.0], [1.0, -1.0, 1.0]]]]
         )
@@ -1183,9 +1631,9 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(metadata["0"]["mode"], "exact_patch")
         self.assertGreater(float(torch.trace(moments["0"])), 0.0)
 
-    def test_hetero_calibration_restores_mode_and_removes_hooks_on_error(self) -> None:
+    def test_inheract_calibration_restores_mode_and_removes_hooks_on_error(self) -> None:
         backbone = RaisingConvNet().train()
-        model = GenericHeteroNet(backbone).train()
+        model = GenericInherActNet(backbone).train()
         loader = DataLoader(
             TensorDataset(torch.randn(2, 2, 3, 3), torch.zeros(2, dtype=torch.long)),
             batch_size=1,
@@ -1199,7 +1647,7 @@ class WrapperTests(unittest.TestCase):
 
     def test_wide_stride_conv_uses_output_application_count(self) -> None:
         convolution = nn.Conv2d(32, 8, kernel_size=3, stride=2, padding=1)
-        model = GenericHeteroNet(nn.Sequential(convolution))
+        model = GenericInherActNet(nn.Sequential(convolution))
         features, mode, applications = model._extract_input_features(
             convolution,
             torch.randn(2, 32, 8, 8),

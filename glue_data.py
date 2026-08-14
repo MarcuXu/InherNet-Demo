@@ -83,9 +83,10 @@ def build_glue_dataloaders(
     tokenizer_revision: str,
     max_length: int,
     search_validation: bool = False,
+    include_final_evaluation: bool = True,
     validation_fraction: float = 0.1,
     validation_split_seed: int = 2026,
-) -> tuple[DataLoader, DataLoader, DataLoader, Mapping[str, Any]]:
+) -> tuple[DataLoader, DataLoader, DataLoader | None, DataLoader, Mapping[str, Any]]:
     load_dataset, AutoTokenizer, DataCollatorWithPadding = _load_hf_dependencies()
 
     if task_name not in GLUE_TEXT_FIELDS:
@@ -145,6 +146,11 @@ def build_glue_dataloaders(
         evaluation_split_label = eval_split_name
     encoded_train = encode_split(raw_train)
     encoded_evaluation = encode_split(raw_evaluation)
+    encoded_official_evaluation = (
+        encode_split(raw_official_evaluation)
+        if search_validation and include_final_evaluation
+        else None
+    )
     calibration_count = min(16 * batch_size, len(raw_train))
     calibration_kwargs: dict[str, Any] = {
         "test_size": calibration_count,
@@ -198,20 +204,38 @@ def build_glue_dataloaders(
         generator=generator,
         collate_fn=collate_batch,
     )
+    # Keep deterministic evaluation and calibration in the training process;
+    # this avoids repeatedly forking after the model has initialized CUDA.
     validation_loader = DataLoader(
         GlueTextDataset(encoded_evaluation, problem_type=problem_type),
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=0,
         pin_memory=pin_memory,
         collate_fn=collate_batch,
     )
+    final_evaluation_loader = None
+    if encoded_official_evaluation is not None:
+        final_evaluation_loader = DataLoader(
+            GlueTextDataset(encoded_official_evaluation, problem_type=problem_type),
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=pin_memory,
+            collate_fn=collate_batch,
+        )
     calibration_loader = DataLoader(
         GlueTextDataset(encoded_calibration, problem_type=problem_type),
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=0,
         pin_memory=pin_memory,
         collate_fn=collate_batch,
     )
-    return train_loader, validation_loader, calibration_loader, provenance
+    return (
+        train_loader,
+        validation_loader,
+        final_evaluation_loader,
+        calibration_loader,
+        provenance,
+    )

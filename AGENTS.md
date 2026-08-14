@@ -1,6 +1,6 @@
 # Repository guidance
 
-This is an ML research repository for Hetero and its InherNet baseline. Prioritize algorithmic correctness, reproducibility, and comparable experiments over broad refactoring.
+This is an ML research repository for InherAct and its InherNet baseline. Prioritize algorithmic correctness, reproducibility, and comparable experiments over broad refactoring.
 
 ## Source of truth
 
@@ -28,7 +28,7 @@ Do not install packages into system Python. If the environment is unavailable, r
 - Preserve experiment comparability: seeds, data splits, preprocessing, model defaults, optimizer/scheduler behavior, checkpoint compatibility, metric definitions, and structured log fields must not drift accidentally.
 - For tensor code, verify shapes, dtypes, devices, train/eval state, gradient flow, and numerical stability. Avoid hidden detaches or in-place operations that alter optimization.
 - For algorithmic changes, test the relevant invariant (for example reconstruction, rank budget, routing, or expert gradient flow), not only that execution completes.
-- Preserve the shared `--size small|large` comparison: Hetero uses the same registered rank and exactly the same parameter count as the corresponding InherNet construction. Do not reintroduce user-facing ratio or budget-scope controls.
+- Preserve the shared `--size small|large` comparison: InherAct uses the same registered rank and exactly the same parameter count as the corresponding InherNet construction. Do not reintroduce user-facing ratio or budget-scope controls.
 - Clearly report any intentional change that can alter metrics or invalidate comparison with earlier logs.
 
 ## Change discipline

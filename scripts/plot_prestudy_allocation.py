@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot allocation fidelity and task retention relative to fixed-rank Hetero."""
+"""Plot allocation fidelity and task retention relative to fixed-rank InherAct."""
 
 from __future__ import annotations
 

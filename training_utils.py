@@ -13,8 +13,15 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from experiment_registry import TrainSettings
+from contrastive_distillation import CRDDistiller
+from experiment_registry import (
+    CurriculumTemperatureDistillationSettings,
+    DecoupledDistillationSettings,
+    LogitStandardizedKDSettings,
+    TrainSettings,
+)
 from model_wrappers import clear_gating_router_cache, compute_gating_load_balance_loss
+from vision_distillation import CATKDDistiller, ReviewKDDistiller, SimKDDistiller
 
 
 RUN_LOG_ENV_VAR = "INHERNET_RUN_LOG"
@@ -23,6 +30,39 @@ RUN_METRICS_PREFIX = "RUN_METRICS"
 RUN_SUMMARY_PREFIX = "RUN_SUMMARY"
 RUN_FINAL_TEST_PREFIX = "RUN_FINAL_TEST"
 INHERITANCE_DIAGNOSTICS_PREFIX = "INHERITANCE_DIAGNOSTICS"
+
+
+class _CTKDGradientReversal(torch.autograd.Function):
+    """Identity in the forward pass; multiply the temperature gradient by lambda."""
+
+    @staticmethod
+    def forward(ctx, value: torch.Tensor, gradient_scale: float) -> torch.Tensor:
+        ctx.gradient_scale = float(gradient_scale)
+        return value.clone()
+
+    @staticmethod
+    def backward(ctx, gradient: torch.Tensor) -> tuple[torch.Tensor, None]:
+        return gradient * ctx.gradient_scale, None
+
+
+class GlobalCurriculumTemperature(nn.Module):
+    """CTKD's released one-parameter global-temperature module."""
+
+    def __init__(self, settings: CurriculumTemperatureDistillationSettings) -> None:
+        super().__init__()
+        self.raw_temperature = nn.Parameter(torch.ones(1))
+        self.t_start = float(settings.t_start)
+        self.t_end = float(settings.t_end)
+
+    def forward(self, gradient_scale: float) -> torch.Tensor:
+        raw_temperature = _CTKDGradientReversal.apply(
+            self.raw_temperature,
+            gradient_scale,
+        )
+        return self.t_start + self.t_end * torch.sigmoid(raw_temperature)
+
+    def current_temperature(self) -> torch.Tensor:
+        return self.t_start + self.t_end * torch.sigmoid(self.raw_temperature)
 
 
 class RunLogger:
@@ -480,7 +520,7 @@ def evaluate_local_operator_probe(
     """Compare dense and inherited local operators on held-out teacher inputs."""
     if max_batches <= 0:
         raise ValueError("local-operator diagnostics require max_batches > 0.")
-    report = getattr(inherited_model, "hetero_report", None)
+    report = getattr(inherited_model, "inheract_report", None)
     backbone = getattr(inherited_model, "backbone", None)
     if not isinstance(report, Mapping) or not isinstance(backbone, nn.Module):
         return None
@@ -782,6 +822,116 @@ def compute_distillation_objective(
     elif student_model is not None:
         clear_gating_router_cache(student_model)
     return ce_loss, kd_loss, aux_loss, total_loss
+
+
+def compute_logit_standardized_distillation_objective(
+    teacher_logits: torch.Tensor,
+    student_logits: torch.Tensor,
+    labels: torch.Tensor,
+    settings: LogitStandardizedKDSettings,
+    criterion: nn.Module,
+) -> tuple[torch.Tensor, torch.Tensor, None, torch.Tensor]:
+    """Compute the published CVPR 2024 logit-standardized KD objective."""
+    labels = labels.long().reshape(-1)
+    student_standardized = (student_logits - student_logits.mean(dim=1, keepdim=True)) / (
+        student_logits.std(dim=1, keepdim=True) + 1e-7
+    )
+    teacher_standardized = (teacher_logits - teacher_logits.mean(dim=1, keepdim=True)) / (
+        teacher_logits.std(dim=1, keepdim=True) + 1e-7
+    )
+    kd_loss = F.kl_div(
+        F.log_softmax(student_standardized / settings.temperature, dim=1),
+        F.softmax(teacher_standardized / settings.temperature, dim=1),
+        reduction="batchmean",
+    )
+    ce_loss = criterion(student_logits, labels)
+    total_loss = (
+        settings.ce_weight * ce_loss
+        + settings.kd_weight * settings.temperature**2 * kd_loss
+    )
+    return ce_loss, kd_loss, None, total_loss
+
+
+def curriculum_temperature_gradient_scale(
+    epoch: int,
+    settings: CurriculumTemperatureDistillationSettings,
+) -> float:
+    """Return CTKD's released cosine multiplier for the global-temperature GRL."""
+    position = min(max(int(epoch), 0), settings.decay_loops)
+    cosine = (math.cos(position * math.pi / settings.decay_loops) + 1.0) * 0.5
+    return cosine * (settings.decay_max - settings.decay_min) + settings.decay_min
+
+
+def compute_curriculum_temperature_distillation_objective(
+    teacher_logits: torch.Tensor,
+    student_logits: torch.Tensor,
+    labels: torch.Tensor,
+    settings: CurriculumTemperatureDistillationSettings,
+    temperature_module: GlobalCurriculumTemperature,
+    gradient_scale: float,
+    criterion: nn.Module,
+) -> tuple[torch.Tensor, torch.Tensor, None, torch.Tensor]:
+    """Compute the released global-CTKD objective for a registered vision pair."""
+    labels = labels.long().reshape(-1)
+    temperature = temperature_module(gradient_scale)
+    kd_loss = F.kl_div(
+        F.log_softmax(student_logits / temperature, dim=1),
+        F.softmax(teacher_logits / temperature, dim=1),
+        reduction="batchmean",
+    ) * temperature.square().squeeze()
+    ce_loss = criterion(student_logits, labels)
+    total_loss = settings.ce_weight * ce_loss + settings.kd_weight * kd_loss
+    return ce_loss, kd_loss, None, total_loss
+
+
+def compute_decoupled_distillation_objective(
+    teacher_logits: torch.Tensor,
+    student_logits: torch.Tensor,
+    labels: torch.Tensor,
+    settings: DecoupledDistillationSettings,
+    epoch: int,
+    criterion: nn.Module,
+) -> tuple[torch.Tensor, torch.Tensor, None, torch.Tensor]:
+    """Compute the published DKD objective for a registered vision baseline."""
+    labels = labels.long().reshape(-1)
+    gt_mask = torch.zeros_like(student_logits, dtype=torch.bool).scatter_(
+        1, labels.unsqueeze(1), True
+    )
+    other_mask = ~gt_mask
+    student_prob = F.softmax(student_logits / settings.temperature, dim=1)
+    teacher_prob = F.softmax(teacher_logits / settings.temperature, dim=1)
+    student_binary = torch.cat(
+        [
+            (student_prob * gt_mask).sum(dim=1, keepdim=True),
+            (student_prob * other_mask).sum(dim=1, keepdim=True),
+        ],
+        dim=1,
+    )
+    teacher_binary = torch.cat(
+        [
+            (teacher_prob * gt_mask).sum(dim=1, keepdim=True),
+            (teacher_prob * other_mask).sum(dim=1, keepdim=True),
+        ],
+        dim=1,
+    )
+    temperature_scale = settings.temperature**2 / labels.shape[0]
+    target_class_kd = F.kl_div(
+        torch.log(student_binary), teacher_binary, reduction="sum"
+    ) * temperature_scale
+    teacher_non_target = F.softmax(
+        teacher_logits / settings.temperature - 1000.0 * gt_mask, dim=1
+    )
+    student_non_target = F.log_softmax(
+        student_logits / settings.temperature - 1000.0 * gt_mask, dim=1
+    )
+    non_target_kd = F.kl_div(
+        student_non_target, teacher_non_target, reduction="sum"
+    ) * temperature_scale
+    dkd_loss = settings.alpha * target_class_kd + settings.beta * non_target_kd
+    ce_loss = criterion(student_logits, labels)
+    warmup = min(epoch / settings.warmup_epochs, 1.0)
+    total_loss = settings.ce_weight * ce_loss + warmup * dkd_loss
+    return ce_loss, dkd_loss, None, total_loss
 
 
 def build_optimizer(model: nn.Module, settings: TrainSettings) -> optim.Optimizer:
@@ -1300,9 +1450,22 @@ def train_distillation(
     final_test_loader: DataLoader | None = None,
     final_test_split_name: str = "test",
     restore_best_state: bool = False,
+    dkd_settings: DecoupledDistillationSettings | None = None,
+    logit_standardized_kd_settings: LogitStandardizedKDSettings | None = None,
+    ctkd_settings: CurriculumTemperatureDistillationSettings | None = None,
 ) -> dict[str, list[float]]:
     hard_loss = build_task_criterion(problem_type)
-    optimizer = build_optimizer(student_model, settings)
+    ctkd_temperature = (
+        GlobalCurriculumTemperature(ctkd_settings).to(device)
+        if ctkd_settings is not None
+        else None
+    )
+    trainable_model = (
+        nn.ModuleList([student_model, ctkd_temperature])
+        if ctkd_temperature is not None
+        else student_model
+    )
+    optimizer = build_optimizer(trainable_model, settings)
     scheduler = build_scheduler(optimizer, settings, steps_per_epoch=len(train_loader))
     history = create_history_template()
     logger = logger or build_run_logger()
@@ -1310,11 +1473,17 @@ def train_distillation(
     best_eval_metric = -math.inf
     best_epoch = 0
     best_state: dict[str, torch.Tensor] | None = None
-
     teacher_model.eval()
     for epoch in range(settings.epochs):
         epoch_start = time.perf_counter()
         student_model.train()
+        if ctkd_temperature is not None:
+            ctkd_temperature.train()
+        ctkd_gradient_scale = (
+            curriculum_temperature_gradient_scale(epoch + 1, ctkd_settings)
+            if ctkd_settings is not None
+            else None
+        )
         running_objective = 0.0
         running_ce_loss = torch.zeros((), device=device)
         running_kd_loss = torch.zeros((), device=device)
@@ -1331,23 +1500,55 @@ def train_distillation(
             with torch.no_grad():
                 teacher_logits = forward_logits(teacher_model, inputs)
             student_logits = forward_logits(student_model, inputs)
-            ce_loss, kd_loss, aux_loss, loss = compute_distillation_objective(
-                teacher_logits,
-                student_logits,
-                labels,
-                settings,
-                student_model=student_model,
-                aux_loss_weight=aux_loss_weight,
-                criterion=hard_loss,
-                problem_type=problem_type,
-            )
+            if ctkd_settings is not None:
+                ce_loss, kd_loss, aux_loss, loss = (
+                    compute_curriculum_temperature_distillation_objective(
+                        teacher_logits,
+                        student_logits,
+                        labels,
+                        ctkd_settings,
+                        ctkd_temperature,
+                        ctkd_gradient_scale,
+                        hard_loss,
+                    )
+                )
+            elif dkd_settings is not None:
+                ce_loss, kd_loss, aux_loss, loss = compute_decoupled_distillation_objective(
+                    teacher_logits,
+                    student_logits,
+                    labels,
+                    dkd_settings,
+                    epoch + 1,
+                    hard_loss,
+                )
+            elif logit_standardized_kd_settings is not None:
+                ce_loss, kd_loss, aux_loss, loss = (
+                    compute_logit_standardized_distillation_objective(
+                        teacher_logits,
+                        student_logits,
+                        labels,
+                        logit_standardized_kd_settings,
+                        hard_loss,
+                    )
+                )
+            else:
+                ce_loss, kd_loss, aux_loss, loss = compute_distillation_objective(
+                    teacher_logits,
+                    student_logits,
+                    labels,
+                    settings,
+                    student_model=student_model,
+                    aux_loss_weight=aux_loss_weight,
+                    criterion=hard_loss,
+                    problem_type=problem_type,
+                )
             loss_value = ensure_finite_scalar(
                 float(loss.detach()),
                 f"{run_label} epoch {epoch + 1} batch {batch_idx}",
             )
             loss.backward()
             if settings.max_grad_norm > 0:
-                nn.utils.clip_grad_norm_(student_model.parameters(), settings.max_grad_norm)
+                nn.utils.clip_grad_norm_(trainable_model.parameters(), settings.max_grad_norm)
             optimizer.step()
             if scheduler is not None and scheduler_steps_per_batch(settings):
                 scheduler.step()
@@ -1411,6 +1612,15 @@ def train_distillation(
             best_state = _copy_state_dict_to_cpu(student_model)
         epoch_time_seconds = time.perf_counter() - epoch_start
         avg_train_batch_ms = _average_train_batch_ms(train_time_seconds, batch_count)
+        train_components = {
+            "kd_loss": float(running_kd_loss) / max(total_examples, 1),
+            "aux_loss": float(running_aux_loss) / max(total_examples, 1),
+        }
+        if ctkd_temperature is not None:
+            train_components["ctkd_temperature"] = float(
+                ctkd_temperature.current_temperature().detach()
+            )
+            train_components["ctkd_gradient_scale"] = float(ctkd_gradient_scale)
         _record_epoch_metrics(
             history,
             logger,
@@ -1427,10 +1637,7 @@ def train_distillation(
             avg_train_batch_ms=avg_train_batch_ms,
             eval_split_name=eval_split_name,
             primary_metric_name=primary_metric_name,
-            train_components={
-                "kd_loss": float(running_kd_loss) / max(total_examples, 1),
-                "aux_loss": float(running_aux_loss) / max(total_examples, 1),
-            },
+            train_components=train_components,
         )
     _log_training_summary(
         history,
@@ -1449,6 +1656,192 @@ def train_distillation(
         logger,
         phase=phase,
         problem_type=problem_type,
+        num_labels=num_labels,
+        metric_names=metric_names,
+        primary_metric_name=primary_metric_name,
+        final_test_split_name=final_test_split_name,
+    )
+    if final_metrics is not None:
+        history["final_test_loss"] = [float(final_metrics["loss"])]
+        history["final_test_accuracy"] = [float(final_metrics[primary_metric_name])]
+    return history
+
+
+def train_vision_distillation(
+    teacher_model: nn.Module,
+    distiller: CATKDDistiller | SimKDDistiller | ReviewKDDistiller | CRDDistiller,
+    train_loader: DataLoader,
+    test_loader: DataLoader,
+    settings: TrainSettings,
+    device: torch.device,
+    *,
+    logger: RunLogger | None = None,
+    phase: str = "target",
+    run_label: str = "feature_distillation",
+    eval_split_name: str = "test",
+    primary_metric_name: str = "accuracy",
+    primary_metric_display: str = "Accuracy (%)",
+    metric_names: tuple[str, ...] = ("accuracy",),
+    num_labels: int = 0,
+    final_test_loader: DataLoader | None = None,
+    final_test_split_name: str = "test",
+    restore_best_state: bool = False,
+) -> dict[str, list[float]]:
+    """Train a released vision feature-distillation baseline.
+
+    All method-specific mathematics lives in the distiller.  This loop owns
+    only the repository's shared optimizer, selection, logging, and final-test
+    protocol, so feature baselines are evaluated identically to other formal
+    cells.
+    """
+
+    if num_labels <= 1:
+        raise ValueError("Vision distillation requires a classification task.")
+    criterion = nn.CrossEntropyLoss()
+    optimizer = build_optimizer(distiller, settings)
+    scheduler = build_scheduler(optimizer, settings, steps_per_epoch=len(train_loader))
+    history = create_history_template()
+    logger = logger or build_run_logger()
+    best_eval_metric = -math.inf
+    best_epoch = 0
+    best_state: dict[str, torch.Tensor] | None = None
+    selection_model = distiller if isinstance(distiller, SimKDDistiller) else distiller.student
+
+    teacher_model.eval()
+    for parameter in teacher_model.parameters():
+        parameter.requires_grad_(False)
+    distiller.to(device)
+    for epoch in range(settings.epochs):
+        if hasattr(train_loader.dataset, "set_epoch"):
+            train_loader.dataset.set_epoch(epoch)
+        epoch_start = time.perf_counter()
+        distiller.train()
+        running_objective = 0.0
+        running_ce_loss = 0.0
+        running_transfer_loss = 0.0
+        total_examples = 0
+        batch_count = 0
+        train_predictions: list[torch.Tensor] = []
+        train_labels: list[torch.Tensor] = []
+        for batch_idx, batch in enumerate(train_loader, start=1):
+            batch_count = batch_idx
+            if isinstance(distiller, CRDDistiller):
+                inputs, labels, sample_indices, contrast_indices = batch
+                sample_indices = sample_indices.to(device)
+                contrast_indices = contrast_indices.to(device)
+            else:
+                inputs, labels = batch
+                sample_indices = contrast_indices = None
+            inputs = move_batch_to_device(inputs, device)
+            labels = labels.to(device, non_blocking=True).long()
+            optimizer.zero_grad(set_to_none=True)
+            if isinstance(distiller, CRDDistiller):
+                output = distiller.training_objective(
+                    teacher_model,
+                    inputs,
+                    labels,
+                    sample_indices,
+                    contrast_indices,
+                    epoch + 1,
+                    criterion,
+                )
+                transfer_loss = output.contrastive
+                loss = output.total
+                logits = output.logits
+                ce_loss = output.classification
+            else:
+                output = distiller.training_objective(
+                    teacher_model, inputs, labels, epoch, criterion
+                )
+                transfer_loss = output.feature_loss
+                loss = output.total_loss
+                logits = output.logits
+                ce_loss = output.ce_loss
+            loss_value = ensure_finite_scalar(
+                float(loss.detach()),
+                f"{run_label} epoch {epoch + 1} batch {batch_idx}",
+            )
+            loss.backward()
+            if settings.max_grad_norm > 0:
+                nn.utils.clip_grad_norm_(distiller.parameters(), settings.max_grad_norm)
+            optimizer.step()
+            if scheduler is not None and scheduler_steps_per_batch(settings):
+                scheduler.step()
+            batch_size = labels.size(0)
+            running_objective += loss_value * batch_size
+            running_ce_loss += float(ce_loss.detach()) * batch_size
+            running_transfer_loss += float(transfer_loss.detach()) * batch_size
+            total_examples += batch_size
+            train_predictions.append(logits.argmax(dim=1).detach().cpu())
+            train_labels.append(labels.detach().cpu())
+        if scheduler is not None and not scheduler_steps_per_batch(settings):
+            scheduler.step()
+        train_time_seconds = time.perf_counter() - epoch_start
+        train_metrics = compute_task_metric_values(
+            torch.cat(train_predictions),
+            torch.cat(train_labels),
+            problem_type="classification",
+            num_labels=num_labels,
+            metric_names=metric_names,
+        )
+        eval_start = time.perf_counter()
+        test_metrics = _finalize_test_metrics(
+            distiller,
+            test_loader,
+            device,
+            criterion,
+            phase,
+            epoch + 1,
+            problem_type="classification",
+            num_labels=num_labels,
+            metric_names=metric_names,
+            primary_metric_name=primary_metric_name,
+        )
+        eval_time_seconds = time.perf_counter() - eval_start
+        current_metric = float(test_metrics[primary_metric_name])
+        if (restore_best_state or final_test_loader is not None) and current_metric > best_eval_metric:
+            best_eval_metric = current_metric
+            best_epoch = epoch + 1
+            best_state = _copy_state_dict_to_cpu(selection_model)
+        _record_epoch_metrics(
+            history,
+            logger,
+            epoch=epoch + 1,
+            settings=settings,
+            phase=phase,
+            train_objective=running_objective / max(total_examples, 1),
+            train_loss=running_ce_loss / max(total_examples, 1),
+            train_metrics=train_metrics,
+            test_metrics=test_metrics,
+            epoch_time_seconds=time.perf_counter() - epoch_start,
+            train_time_seconds=train_time_seconds,
+            eval_time_seconds=eval_time_seconds,
+            avg_train_batch_ms=_average_train_batch_ms(train_time_seconds, batch_count),
+            eval_split_name=eval_split_name,
+            primary_metric_name=primary_metric_name,
+            train_components={
+                "transfer_loss": running_transfer_loss / max(total_examples, 1)
+            },
+        )
+    _log_training_summary(
+        history,
+        logger,
+        eval_split_name=eval_split_name,
+        primary_metric_name=primary_metric_name,
+        primary_metric_display=primary_metric_display,
+    )
+    if best_state is not None:
+        selection_model.load_state_dict(best_state)
+    final_metrics = _restore_best_and_evaluate_final_test(
+        distiller,
+        None,
+        best_epoch,
+        final_test_loader,
+        device,
+        criterion,
+        logger,
+        phase=phase,
+        problem_type="classification",
         num_labels=num_labels,
         metric_names=metric_names,
         primary_metric_name=primary_metric_name,

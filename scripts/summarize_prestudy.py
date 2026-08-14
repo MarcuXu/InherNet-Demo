@@ -15,13 +15,14 @@ if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
 from scripts.summarize_search import parse_structured_log
+from scripts.inheract_artifacts import canonicalize_metadata
 
 
 DISPLAY_NAMES = {
     "prestudy_inhernet": "InherNet",
-    "prestudy_unweighted_uniform": "Hetero, weight-only",
+    "prestudy_unweighted_uniform": "InherAct, weight-only",
     "prestudy_weighted_uniform": "Activation-aware base",
-    "prestudy_weighted_uniform_noise_001": "Hetero, conditional lift",
+    "prestudy_weighted_uniform_noise_001": "InherAct, conditional lift",
     "prestudy_research_relative": "Relative allocation",
     "prestudy_research_nested_relative": "Nested allocation",
     "prestudy_research_total_output": "Raw-output allocation",
@@ -43,7 +44,8 @@ def build_rows(root: Path) -> list[dict[str, Any]]:
         diagnostics = records.get("INHERITANCE_DIAGNOSTICS")
         if metadata is None or diagnostics is None:
             continue
-        report = metadata.get("hetero_report") or {}
+        metadata = canonicalize_metadata(metadata)
+        report = metadata.get("inheract_report") or {}
         router_probe = diagnostics.get("router_probe") or {}
         local_probe = diagnostics.get("local_operator_probe") or {}
         lift_probe = report.get("conditional_lift_probe") or {}
@@ -71,7 +73,7 @@ def build_rows(root: Path) -> list[dict[str, Any]]:
                 "seed": metadata.get("seed"),
                 "variant": candidate,
                 "display_name": DISPLAY_NAMES.get(candidate, candidate),
-                "allocation": metadata.get("hetero_allocation_scale") or "registered_rank_svd",
+                "allocation": metadata.get("inheract_allocation_scale") or "registered_rank_svd",
                 "decomposition_metric": report.get("decomposition_metric") or "weight_only",
                 "parameters": metadata.get("num_parameters"),
                 "inheritance_setup_seconds": metadata.get("inheritance_setup_seconds"),

@@ -3,7 +3,7 @@
 
 The search view aggregates only normalized ranks computed inside comparable
 dataset/pair/method/size/seed cells.  The ablation view reports paired changes
-from the full Hetero configuration; it never pools raw metrics across tasks.
+from the full InherAct configuration; it never pools raw metrics across tasks.
 """
 
 from __future__ import annotations
@@ -23,9 +23,9 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from plotting_utils import get_pyplot
+from scripts.inheract_artifacts import canonicalize_metadata
 from scripts.rank_search import (
     DEFAULT_SEARCH_SEEDS,
-    STAGE_CONFIG,
     STAGE_TARGETS,
     applicable_candidates,
     average_normalized_ranks,
@@ -39,6 +39,7 @@ BLUE = "#0072B2"
 ORANGE = "#D55E00"
 GRAY = "#7A7A7A"
 LIGHT_GRAY = "#C7CBD1"
+SEARCH_STAGES = ("mechanism", "optimization", "distillation")
 ABLATION_LABELS = {
     "ablation_unweighted_uniform": "No activation weighting",
     "ablation_no_noise": "No expert noise",
@@ -49,7 +50,7 @@ ABLATION_LABELS = {
 NON_COMPONENT_ROWS = {
     "ablation_inhernet_small",
     "ablation_inhernet_large",
-    "ablation_hetero_lite",
+    "ablation_inheract_lite",
 }
 
 
@@ -107,7 +108,7 @@ def prepare_search_scores(
     expected_cells: Iterable[tuple[Any, ...]] | None = None,
 ) -> tuple[dict[str, list[float]], dict[tuple[Any, ...], dict[str, float]]]:
     """Validate completed search rows and compute within-cell normalized ranks."""
-    if stage not in STAGE_CONFIG:
+    if stage not in SEARCH_STAGES:
         raise ValueError(f"Unknown search stage: {stage}")
     allowed_candidates = set(candidate_ids(stage))
     indexed: dict[tuple[Any, ...], dict[str, Any]] = {}
@@ -166,7 +167,7 @@ def _expected_search_cells(
     targets: Sequence[tuple[str, str]],
     seeds: Sequence[int],
 ) -> set[tuple[Any, ...]]:
-    methods = ("hetero",)
+    methods = ("inheract",)
     candidates = candidate_ids(stage)
     expected: set[tuple[Any, ...]] = set()
     for dataset, pair in targets:
@@ -205,11 +206,13 @@ def plot_search_scores(
     ax.set_xlim(-0.03, 1.09)
     ax.set_xticks([0, 0.25, 0.5, 0.75, 1.0])
     ax.set_xlabel("Normalized within-cell rank (higher is better)")
-    ax.set_title(f"Hetero {stage} search", loc="left", pad=10)
+    ax.set_title(f"InherAct {stage} search", loc="left", pad=10)
     ax.grid(True, axis="x", alpha=0.7)
     ax.grid(False, axis="y")
-    ax.legend(loc="lower right")
-    fig.subplots_adjust(left=0.31, right=0.91, bottom=0.16, top=0.89)
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.035))
+    fig.subplots_adjust(left=0.31, right=0.91, bottom=0.23, top=0.89)
     return _save_png(fig, output, plt)
 
 
@@ -304,7 +307,7 @@ def plot_ablation_deltas(
                 ax.scatter(
                     [mean], [y + offset], color=color, s=54, marker=marker,
                     edgecolor="white", linewidth=0.8,
-                    label=("Hetero-Lite mean" if size == "small" else "Hetero mean")
+                    label=("InherAct-Lite mean" if size == "small" else "InherAct mean")
                     if target_index == 0 and y == 0 else None,
                     zorder=4,
                 )
@@ -329,7 +332,8 @@ def _filter_rows(
     seeds: Sequence[int],
 ) -> list[dict[str, Any]]:
     return [
-        row for row in rows
+        canonicalize_metadata(row)
+        for row in rows
         if (not datasets or row.get("dataset") in datasets)
         and (not seeds or int(row.get("seed")) in seeds)
     ]
@@ -340,7 +344,7 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="figure", required=True)
     search_parser = subparsers.add_parser("search", help="Plot normalized hyperparameter-search ranks.")
     search_parser.add_argument("log_root", type=Path)
-    search_parser.add_argument("--stage", required=True, choices=tuple(STAGE_CONFIG))
+    search_parser.add_argument("--stage", required=True, choices=SEARCH_STAGES)
     search_parser.add_argument("--dataset", action="append", default=[], help="Restrict targets; repeat as needed.")
     search_parser.add_argument("--seed", action="append", type=int, default=[], help="Restrict seeds; repeat as needed.")
     search_parser.add_argument("--output", required=True, type=Path)
@@ -371,7 +375,7 @@ def main() -> None:
                 row for row in rows
                 if (row.get("dataset"), row.get("pair")) in set(targets)
                 and int(row.get("seed")) in seeds
-                and row.get("method") == "hetero"
+                and row.get("method") == "inheract"
                 and row.get("size") == "large"
             ]
             validate_search_protocol_rows(scoped_rows)

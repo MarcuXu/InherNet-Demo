@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from experiment_registry import sanitize_tag
+from scripts.inheract_artifacts import canonicalize_metadata
 from training_utils import (
     RUN_METADATA_PREFIX,
     RUN_METRICS_PREFIX,
@@ -109,8 +110,11 @@ def get_plot_metric_specs(
 
 
 def get_plot_method_key(method: str, metadata: Mapping[str, Any]) -> str:
+    method = str(canonicalize_metadata({"method": method})["method"])
     config_tag = str(metadata.get("config_tag", "default"))
     if method == "inhernet":
+        if metadata.get("search_candidate") == "ablation_direct_svd":
+            return "direct_svd_inheritance"
         size = str(metadata.get("size", metadata.get("rank_preset", "")))
         if size == "small" or config_tag.startswith("small_rank_"):
             return "inhernet_small"
@@ -125,10 +129,18 @@ def get_plot_style(method_key: str) -> dict[str, Any]:
         "teacher": {"color": "#111111", "linestyle": "-", "linewidth": 3.1, "alpha": 1.0, "zorder": 7},
         "student": {"color": "#8B8B8B", "linestyle": "--", "linewidth": 2.2, "alpha": 0.95, "zorder": 3},
         "student_kd": {"color": "#0072B2", "linestyle": "-", "linewidth": 2.7, "alpha": 0.98, "zorder": 5},
+        "student_kd_logit_standardized": {"color": "#56B4E9", "linestyle": "-.", "linewidth": 2.7, "alpha": 0.98, "zorder": 5},
+        "student_dkd": {"color": "#CC79A7", "linestyle": "--", "linewidth": 2.7, "alpha": 0.98, "zorder": 5},
+        "student_ctkd": {"color": "#6F4E9C", "linestyle": "-.", "linewidth": 2.7, "alpha": 0.98, "zorder": 5},
+        "student_catkd": {"color": "#E76F51", "linestyle": "--", "linewidth": 2.7, "alpha": 0.98, "zorder": 5},
+        "student_simkd": {"color": "#2A9D8F", "linestyle": "-.", "linewidth": 2.7, "alpha": 0.98, "zorder": 5},
+        "student_reviewkd": {"color": "#7A8F37", "linestyle": "--", "linewidth": 2.7, "alpha": 0.98, "zorder": 5},
+        "student_crd": {"color": "#3D5A80", "linestyle": ":", "linewidth": 2.7, "alpha": 0.98, "zorder": 5},
+        "direct_svd_inheritance": {"color": "#7B61A8", "linestyle": "--", "linewidth": 2.7, "alpha": 0.98, "zorder": 4},
         "inhernet_small": {"color": "#009E73", "linestyle": "-", "linewidth": 2.8, "alpha": 0.98, "zorder": 4},
         "inhernet_large": {"color": "#D55E00", "linestyle": "-", "linewidth": 2.8, "alpha": 0.98, "zorder": 4},
         "inhernet_custom": {"color": "#CC79A7", "linestyle": "-.", "linewidth": 2.6, "alpha": 0.97, "zorder": 4},
-        "hetero": {"color": "#E69F00", "linestyle": "-", "linewidth": 3.0, "alpha": 1.0, "zorder": 6},
+        "inheract": {"color": "#E69F00", "linestyle": "-", "linewidth": 3.0, "alpha": 1.0, "zorder": 6},
     }
     return styles.get(method_key, {"color": "#4C78A8", "linestyle": "-", "linewidth": 2.5, "alpha": 0.98, "zorder": 4})
 
@@ -305,25 +317,73 @@ def build_plot_label(
             teacher_arch = metadata.get("teacher_arch", "teacher")
             student_arch = metadata.get("student_arch", "student")
             label = f"Student + KD - {teacher_arch} -> {student_arch}"
+    elif method_key == "student_kd_logit_standardized":
+        label = "Student + Logit Std. KD"
+        if detailed:
+            label = "Student + Logit Std. KD - published CIFAR-100 protocol"
+    elif method_key == "student_dkd":
+        label = "Student + DKD"
+        if detailed:
+            scope = (
+                "repository CIFAR-10 adaptation"
+                if metadata.get("dataset") == "cifar10"
+                else "released CIFAR-100 recipe"
+            )
+            label = f"Student + DKD - {scope}"
+    elif method_key == "student_ctkd":
+        label = "Student + CTKD"
+        if detailed:
+            scope = (
+                "repository CIFAR-10 adaptation"
+                if metadata.get("dataset") == "cifar10"
+                else "released CIFAR-100 recipe"
+            )
+            label = f"Student + CTKD - {scope}"
+    elif method_key == "student_catkd":
+        label = "Student + CAT-KD"
+        if detailed:
+            label = "Student + CAT-KD - class-attention transfer"
+    elif method_key == "student_simkd":
+        label = "Student + SimKD"
+        if detailed:
+            label = "Student + SimKD - reused teacher classifier"
+    elif method_key == "student_reviewkd":
+        label = "Student + ReviewKD"
+        if detailed:
+            label = "Student + ReviewKD - multi-scale feature review"
+    elif method_key == "student_crd":
+        label = "Student + CRD"
+        if detailed:
+            label = "Student + CRD - contrastive representation distillation"
+    elif method_key == "direct_svd_inheritance":
+        label = "Direct SVD inheritance"
+        if detailed:
+            label = f"Direct SVD inheritance - rank {metadata.get('rank', '?')}, one head"
     elif method_key == "inhernet_small":
-        label = "InherNet-S"
+        train_mode = str(metadata.get("compressed_train_mode", "distillation"))
+        label = "InherNet-S + KD" if train_mode == "distillation" else "InherNet-S (supervised)"
         if detailed:
-            label = f"InherNet-S - rank {metadata.get('rank', '?')}, heads {metadata.get('head_num', '?')}"
+            label = f"{label} - rank {metadata.get('rank', '?')}, heads {metadata.get('head_num', '?')}"
     elif method_key == "inhernet_large":
-        label = "InherNet-L"
+        train_mode = str(metadata.get("compressed_train_mode", "supervised"))
+        label = (
+            "InherNet-L (supervised)"
+            if train_mode == "supervised"
+            else "InherNet-L + matched KD"
+        )
         if detailed:
-            label = f"InherNet-L - rank {metadata.get('rank', '?')}, heads {metadata.get('head_num', '?')}"
+            label = f"{label} - rank {metadata.get('rank', '?')}, heads {metadata.get('head_num', '?')}"
     elif method_key == "inhernet_custom":
         label = "InherNet"
         if detailed:
             label = f"InherNet - rank {metadata.get('rank', '?')}, heads {metadata.get('head_num', '?')}"
-    elif method_key == "hetero":
+    elif method_key == "inheract":
         rank_map = metadata.get("rank_map", {})
         avg_rank = None
         if isinstance(rank_map, Mapping) and rank_map:
             avg_rank = sum(int(value) for value in rank_map.values()) / len(rank_map)
         size = metadata.get("size")
-        label = "Hetero-Lite" if size == "small" else "Hetero"
+        label = "InherAct-Lite" if size == "small" else "InherAct"
         if detailed:
             label = f"{label} - heads {metadata.get('head_num', '?')}"
             if avg_rank is None and "avg_rank" in metadata:
@@ -346,6 +406,7 @@ def plot_single_history(
         return None
     dataset_name = str(metadata.get("dataset", "unknown_dataset"))
     pair_name = str(metadata.get("pair", "unknown_pair"))
+    metadata = canonicalize_metadata(metadata)
     method = str(metadata.get("method", "unknown_method"))
     config_tag = sanitize_tag(str(metadata.get("config_tag", "default")))
     method_key = get_plot_method_key(method, metadata)
@@ -430,7 +491,7 @@ def parse_run_log(log_path: Path, *, phase: str = "target") -> dict[str, Any] | 
                 continue
             metadata_payload = parse_structured_log_line(line, RUN_METADATA_PREFIX)
             if metadata_payload is not None:
-                metadata = metadata_payload
+                metadata = canonicalize_metadata(metadata_payload)
                 continue
             metrics_payload = parse_structured_log_line(line, RUN_METRICS_PREFIX)
             if metrics_payload is None:
@@ -468,10 +529,18 @@ def collect_suite_comparison_records(suite_log_dir: Path) -> list[dict[str, Any]
         "teacher": 0,
         "student": 1,
         "student_kd": 2,
-        "inhernet_small": 3,
-        "inhernet_large": 4,
-        "inhernet_custom": 5,
-        "hetero": 6,
+        "student_kd_logit_standardized": 3,
+        "student_ctkd": 4,
+        "student_dkd": 5,
+        "student_catkd": 6,
+        "student_simkd": 7,
+        "student_reviewkd": 8,
+        "student_crd": 9,
+        "direct_svd_inheritance": 10,
+        "inhernet_small": 11,
+        "inhernet_large": 12,
+        "inhernet_custom": 13,
+        "inheract": 14,
     }
     records: list[dict[str, Any]] = []
     for log_path in sorted(suite_log_dir.glob("[0-9][0-9]_*.log")):

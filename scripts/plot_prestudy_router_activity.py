@@ -60,7 +60,7 @@ ROUTER_DATA = {
                 3.3112898540173234e-09, 2.4127973955617994e-09, 1.3555152972094629e-08,
                 4.485939321541396e-09,
             ],
-            "Hetero": [
+            "InherAct": [
                 0.0005770007434177823, 0.0007561328995448814, 0.0023532153865590253,
                 0.0007066919733414512, 0.0011943948454730471, 0.00014961544715698418,
                 0.00277596394143164, 0.00030074756670228143, 0.003733929930589119,
@@ -123,7 +123,7 @@ ROUTER_DATA = {
                 3.03604796282382e-08, 1.3775567880046124e-08, 1.777448464421175e-08,
                 2.9878126046557297e-09,
             ],
-            "Hetero": [
+            "InherAct": [
                 0.0008298086633384856, 0.000995793606441881, 0.0006355851854489737,
                 0.000286894709220245, 0.0012156282300364342, 0.0006243667994630213,
                 0.0005829535619304263, 0.0001900060707497213, 0.0005970313041971265,
@@ -142,7 +142,7 @@ ROUTER_DATA = {
     },
 }
 
-METHODS = ("InherNet", "Weight SVD", "Activation-aware", "Hetero")
+METHODS = ("InherNet", "Weight SVD", "Activation-aware", "InherAct")
 ACTIVE_TOLERANCE = 1e-7
 
 
@@ -153,7 +153,7 @@ def validate_data() -> None:
         assert all(len(values) == count for values in dataset["methods"].values())
         assert all(value < ACTIVE_TOLERANCE for method in METHODS[:-1]
                    for value in dataset["methods"][method])
-        assert all(value >= ACTIVE_TOLERANCE for value in dataset["methods"]["Hetero"])
+        assert all(value >= ACTIVE_TOLERANCE for value in dataset["methods"]["InherAct"])
 
 
 def plot(output: Path) -> None:
